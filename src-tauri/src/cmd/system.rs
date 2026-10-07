@@ -4,16 +4,19 @@ use crate::config::Settings;
 use crate::error::{AppError, Result, E5001, E5002, E5003, E5004};
 use crate::os::hosts_file::HostsStats;
 use crate::os::privilege::{self, PrivilegeState};
-use crate::os::winapi::*;
-use crate::os::wininet::ProxyState;
+#[cfg(target_os = "windows")]
+use crate::os::winapi::{RegisterHotKey, UnregisterHotKey};
+use crate::os::system_proxy::ProxyState;
 use crate::state::{AppState, CrashInfo, RuntimeStatus, SharedState};
 use crate::tray::TrayStatus;
 use serde::Serialize;
 use std::io::Write;
+#[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State};
 
+#[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 // ---------------------------------------------------------------------------
@@ -93,7 +96,7 @@ pub async fn get_app_state(app: AppHandle) -> Result<AppStateView> {
             initialized: cfg.initialized,
             read_only: state.read_only.lock().ok().and_then(|g| g.clone()),
             prand: privilege::detect(),
-            proxy: crate::os::wininet::read().unwrap_or_default(),
+            proxy: crate::os::system_proxy::read().unwrap_or_default(),
             hosts: hosts_stats,
             hosts_pending: {
                 let mut file_lines: Vec<String> =
@@ -165,6 +168,7 @@ pub async fn settings_save(
 // 开机自启（计划任务，§5.2）
 // ---------------------------------------------------------------------------
 
+#[cfg(target_os = "windows")]
 fn safe_account_name() -> Result<String> {
     let user = std::env::var("USERNAME").map_err(|_| AppError::internal("无法获取当前用户名"))?;
     let domain = std::env::var("USERDOMAIN").unwrap_or_default();
@@ -184,11 +188,27 @@ fn safe_account_name() -> Result<String> {
 }
 
 pub fn set_autostart(app: &AppHandle, enable: bool) -> Result<()> {
+    platform_autostart(enable)?;
+    log::info!(target: "autostart", "开机自启动 → {enable}");
+    if let Some(s) = effective_state(app) {
+        let _ = s.with_cfg_mut(|c| {
+            c.settings.autostart.enabled = enable;
+            Ok(())
+        });
+        let _ = s.save_cfg();
+    }
+    crate::tray::refresh(app);
+    Ok(())
+}
+
+/// Windows：计划任务（schtasks），`/RL LIMITED` —— 主进程是 asInvoker，
+/// 用 HIGHEST 反而会让 UAC 弹回来。
+#[cfg(target_os = "windows")]
+fn platform_autostart(enable: bool) -> Result<()> {
     let mut cmd = std::process::Command::new("schtasks.exe");
     if enable {
         let exe = crate::paths::exe_path()?;
         let account = safe_account_name()?;
-        // 注意 /RL LIMITED —— 主进程是 asInvoker，用 HIGHEST 反而会让 UAC 弹回来
         cmd.args([
             "/Create",
             "/TN",
@@ -218,16 +238,112 @@ pub fn set_autostart(app: &AppHandle, enable: bool) -> Result<()> {
             .with_detail(format!("创建计划任务失败（退出码 {code}）：{msg}")));
     }
     // 关闭时"任务不存在"不算错误
-    log::info!(target: "autostart", "开机自启动 → {enable}（schtasks 退出码 {code}）");
-    if let Some(s) = effective_state(app) {
-        let _ = s.with_cfg_mut(|c| {
-            c.settings.autostart.enabled = enable;
-            Ok(())
-        });
-        let _ = s.save_cfg();
-    }
-    crate::tray::refresh(app);
+    log::info!(target: "autostart", "schtasks 退出码 {code}");
     Ok(())
+}
+
+/// macOS：LaunchAgent（登录时以**当前用户**启动，不弹密码）。
+///
+/// 不用 LaunchDaemon：那会以 root 常驻并全权限运行，与"主进程普通权限、
+/// helper 是唯一常驻 root 进程且只跑白名单任务"的安全边界冲突。
+#[cfg(target_os = "macos")]
+fn platform_autostart(enable: bool) -> Result<()> {
+    use crate::os::macos::net;
+
+    let plist = autostart_plist_path()?;
+    let uid = unsafe { libc::getuid() };
+    let service = format!("gui/{uid}/{}", crate::paths::AUTOSTART_LABEL);
+
+    if !enable {
+        // 本来就没装时 bootout 会失败，不算错误
+        if let Ok((ok, _, err)) = net::try_run(net::LAUNCHCTL, &["bootout".into(), service]) {
+            if !ok {
+                log::debug!(target: "autostart", "bootout 返回非零（可能本就没装）：{err}");
+            }
+        }
+        if plist.exists() {
+            std::fs::remove_file(&plist)?;
+        }
+        return Ok(());
+    }
+
+    let exe = crate::paths::exe_path()?;
+    if let Some(dir) = plist.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&plist, launch_agent_xml(&exe.to_string_lossy()))?;
+
+    // 先 bootout 旧实例再 bootstrap（重复启用时不会失败）
+    let _ = net::try_run(net::LAUNCHCTL, &["bootout".into(), service.clone()]);
+    let (ok, out, err) = net::try_run(
+        net::LAUNCHCTL,
+        &[
+            "bootstrap".into(),
+            format!("gui/{uid}"),
+            plist.to_string_lossy().to_string(),
+        ],
+    )?;
+    if !ok {
+        return Err(AppError::coded("E1002").with_detail(format!(
+            "注册 LaunchAgent 失败：{}",
+            first_line(&err).or_else(|| first_line(&out)).unwrap_or_default()
+        )));
+    }
+    log::info!(target: "autostart", "LaunchAgent 已注册：{}", plist.display());
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn autostart_plist_path() -> Result<std::path::PathBuf> {
+    Ok(crate::paths::launch_agents_dir().join(format!("{}.plist", crate::paths::AUTOSTART_LABEL)))
+}
+
+/// LaunchAgent plist（--minimized：登录后静默进托盘，不弹主窗口）
+#[cfg(target_os = "macos")]
+fn launch_agent_xml(exe: &str) -> String {
+    let exe = xml_escape(exe);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{exe}</string>
+    <string>--minimized</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+</dict>
+</plist>
+"#,
+        label = crate::paths::AUTOSTART_LABEL,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+#[cfg(target_os = "macos")]
+fn first_line(s: &str) -> Option<String> {
+    let l = s.trim().lines().next().unwrap_or("").trim();
+    if l.is_empty() {
+        None
+    } else {
+        Some(l.to_string())
+    }
 }
 
 #[tauri::command]
@@ -250,7 +366,15 @@ pub struct ShortcutStatus {
     pub reserved_combinations: Vec<String>,
 }
 
+#[cfg(target_os = "windows")]
 const PROBE_ID: i32 = 0x5F27;
+
+// 修饰键位标志。取值与 Win32 `MOD_*` 相同（Windows 的探测要按这个值传）。
+// macOS 侧只用于「规范名 ↔ 位标志」的转换与展示，真正的注册交给插件解析绑定串。
+const MOD_ALT: u32 = 0x0001;
+const MOD_CONTROL: u32 = 0x0002;
+const MOD_SHIFT: u32 = 0x0004;
+const MOD_WIN: u32 = 0x0008;
 
 /// 按键录制中标志（供 `shortcut_capture` 置位）。
 /// 录制期间全局热键是被**故意**从系统里摘掉的，此时 `runtime.shortcut_registered` 为 false。
@@ -450,6 +574,7 @@ fn normalize_binding(raw: &str) -> Result<String> {
 /// 试探性注册探测（§5.5.4）：Win32 没有查询接口，借 RegisterHotKey 的独占语义。
 /// 注意它分不出"被别的程序占用"和"被本程序自己占用"，所以调用方必须先排除
 /// "这个组合就是当前正在生效的那个"，否则同一个组合点两次应用就会莫名报 E5001。
+#[cfg(target_os = "windows")]
 fn probe_available(mods: u32, vk: u32) -> bool {
     unsafe {
         // 传 hWnd = NULL：不需要窗口，只探测系统热键表
@@ -460,6 +585,13 @@ fn probe_available(mods: u32, vk: u32) -> bool {
         }
         ok != 0
     }
+}
+
+/// macOS：系统不提供"查询组合是否被占用"的接口（Carbon 的 RegisterEventHotKey 也只有成败），
+/// 所以不做预判 —— 返回 true 交给真实注册判定（注册失败由 `map_plugin_error` 分 E5001/E5003）。
+#[cfg(target_os = "macos")]
+fn probe_available(_mods: u32, _vk: u32) -> bool {
+    true
 }
 
 fn map_plugin_error(e: &str) -> AppError {
@@ -766,10 +898,21 @@ fn open_folder(path: &std::path::Path) -> Result<()> {
     if !path.exists() {
         std::fs::create_dir_all(path)?;
     }
-    std::process::Command::new("explorer.exe")
-        .arg(path.as_os_str())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("explorer.exe");
+        c.arg(path.as_os_str());
+        c.creation_flags(CREATE_NO_WINDOW);
+        c
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        // Finder 的通用打开入口；打开自己的目录不需要任何权限
+        let mut c = std::process::Command::new("/usr/bin/open");
+        c.arg(path.as_os_str());
+        c
+    };
+    cmd.spawn()
         .map_err(|e| AppError::internal(format!("打开目录失败：{e}")))?;
     Ok(())
 }
@@ -793,6 +936,7 @@ pub async fn system_open_dir(kind: String) -> Result<()> {
     .await
 }
 
+#[cfg(target_os = "windows")]
 fn os_version() -> String {
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
     let hklm = winreg::RegKey::predef(HKEY_LOCAL_MACHINE);
@@ -805,6 +949,25 @@ fn os_version() -> String {
             format!("{product} {display} (Build {build})")
         }
         Err(_) => "未知".to_string(),
+    }
+}
+
+/// macOS：`sw_vers` 三个字段，比解析 `sysctl kern.osrelease` 可靠（诊断包要人看的）
+#[cfg(target_os = "macos")]
+fn os_version() -> String {
+    let field = |flag: &str| -> Option<String> {
+        std::process::Command::new("/usr/bin/sw_vers")
+            .arg(flag)
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let name = field("-productName").unwrap_or_else(|| "macOS".to_string());
+    let ver = field("-productVersion").unwrap_or_else(|| "未知".to_string());
+    match field("-buildVersion") {
+        Some(b) => format!("{name} {ver} (Build {b})"),
+        None => format!("{name} {ver}"),
     }
 }
 
@@ -846,7 +1009,7 @@ pub async fn logs_export(_app: AppHandle, state: State<'_, SharedState>) -> Resu
             zip.write_all(content.as_bytes())?;
         }
 
-        let proxy = crate::os::wininet::read().unwrap_or_default();
+        let proxy = crate::os::system_proxy::read().unwrap_or_default();
         let state_json = serde_json::json!({
             "active_profile_id": cfg.active_profile_id,
             "profiles": cfg.profiles.iter().map(|p| &p.name).collect::<Vec<_>>(),
@@ -1070,7 +1233,7 @@ pub async fn first_run_report(state: State<'_, SharedState>) -> Result<FirstRunR
                 .to_string(),
             hosts_custom_lines: custom,
             hosts_block_lines: block,
-            proxy: crate::os::wininet::read().unwrap_or_default(),
+            proxy: crate::os::system_proxy::read().unwrap_or_default(),
             dns,
             interfaces,
         })
@@ -1090,7 +1253,7 @@ pub async fn first_run_finish(
         s.assert_writable()?;
         // 1) 接管已有托管区块内容为手工条目
         let existing = crate::os::hosts_file::read_block_entries().unwrap_or_default();
-        let proxy = crate::os::wininet::read().unwrap_or_default();
+        let proxy = crate::os::system_proxy::read().unwrap_or_default();
 
         // 2) 采集首个已连接物理网卡的 DNS
         let mut alias = String::new();
@@ -1115,7 +1278,7 @@ pub async fn first_run_finish(
         let profile_name = name.unwrap_or_else(|| {
             format!("当前配置（{}）", chrono::Local::now().format("%Y-%m-%d"))
         });
-        let (host, port) = crate::os::wininet::parse_server(&proxy.server).unwrap_or_default();
+        let (host, port) = crate::os::system_proxy::parse_server(&proxy.server).unwrap_or_default();
         let new_profile = crate::config::Profile {
             id: uuid::Uuid::new_v4().to_string(),
             name: profile_name.clone(),

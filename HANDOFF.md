@@ -14,25 +14,36 @@ npm install
 npm run tauri -- dev            # 开发（先起 vite:5180，再起 Tauri）
 npm run tauri -- build          # 生产包（真正内嵌前端资源的构建，见 §4.8）
 npm run check                   # 前端类型检查
-cd src-tauri && cargo test      # 53 项单元测试（纯逻辑，不碰系统）
+cd src-tauri && cargo test      # 本机平台跑自己那份单测（Windows 55 项，纯逻辑，不碰系统）
+
+# macOS（需要 Xcode Command Line Tools）
+npm run tauri -- build -- --target universal-apple-darwin --bundles dmg
+
+# 发布：打 tag 即出包（Windows NSIS+MSI、macOS 通用 dmg，同一个 Release）
+git tag v0.1.0 && git push origin v0.1.0
 ```
 
 当前状态：**功能完整、可运行、已实测通过**（范围见 §5.1），未做代码签名与自动更新。
 > 2026-10-07 大修：快捷面板按钮全死的根因是 `bind()` 用 `getElementById("#…")`（永远 null），已改为 `querySelector`；DNS 网卡枚举从 PowerShell 换成 `GetAdaptersAddresses` FFI（3s → ~8ms）；全局热键语义改为「默认直连 ↔ 上一个方案」。细节见 §4.10–§4.12。
 > 2026-10-07 热键专项：快捷键从「手打文本框」改为**按键捕获控件**（新增 `shortcut_capture` 命令，录制时临时让出全局热键），统一三套互不相认的键名表并新增 `E5004`，修掉「改绑后旧组合残留」「自我占用误判 E5001」「保存回写旧 binding」「连按 N 次 = N 次同向切换」四个不稳定根因；主界面不再显示「未启用任何方案」。细节见 §4.16。
 > 2026-10-07 热键专项（续）：热键切换方案后**主窗口与快捷面板仍显示旧方案**（代理实际已清）——热键路径是唯一不推 `sunet://report` 的切换入口，前端因此收不到刷新信号；另加「快捷面板每次唤出即重拉状态」。版本号 `1.0.0` → **`0.0.1`**（package.json / tauri.conf.json / Cargo.toml，展示处由 `CARGO_PKG_VERSION` 自动跟随）。细节见 §4.17。
-> 2026-10-07 无边框：主界面隐藏 Windows 标题栏，改为自绘顶栏（右上角 `−` 最小化 / `×` 隐藏到托盘，新增 `window_minimize` 命令）；踩到 tao「首帧 `WM_NCCALCSIZE` 走 DefWindowProc → 残留系统标题栏」的坑，用 `force_frame_recalc`（`SetWindowPos(SWP_FRAMECHANGED)`）修掉。细节见 §4.18；macOS 最小可用移植已立项、本轮未动代码，见 §6.4。
+> 2026-10-07 无边框：主界面隐藏 Windows 标题栏，改为自绘顶栏（右上角 `−` 最小化 / `×` 隐藏到托盘，新增 `window_minimize` 命令）；踩到 tao「首帧 `WM_NCCALCSIZE` 走 DefWindowProc → 残留系统标题栏」的坑，用 `force_frame_recalc`（`SetWindowPos(SWP_FRAMECHANGED)`）修掉。细节见 §4.18；macOS 侧不用这套补丁（改用原生的 `titleBarStyle: "Overlay"`）。
+> 2026-10-07 macOS：新增 `src-tauri/src/os/macos/*`（7 文件）与常驻提权助手 `src-tauri/src/helper/*`（unix socket + root LaunchDaemon）；
+> 共用层按平台分叉（新增 `proxy_ops.rs`、`proxy_write_needs_root()`、`flush_needs_root()`、`critsec.rs` 的 flock 分支）；
+> 前端新增 `src/platform.ts`（唯一平台真源，给 `<html>` 打 `data-os`）；版本号 `0.0.1` → **`0.1.0`**；CI 加 macOS job。
+> Windows 侧逻辑未变。细节见 §4.19 与 §6.4。
 
 | 事实 | 值 |
 |---|---|
-| 后端 | Rust 33 文件 / 11 147 行；Tauri 2.12.1 + tauri-build 2.7.1 |
-| 前端 | 原生 TS + Vite 7（**无 UI 框架**）15 文件 / 6 322 行（TS + CSS） |
+| 后端 | Rust 47 文件 / 13 827 行（`os/windows` 8 + `os/macos` 7 + `helper` 4）；Tauri 2.12.1 + tauri-build 2.7.1 |
+| 前端 | 原生 TS + Vite 7（**无 UI 框架**）16 文件 / 6 439 行（TS + CSS） |
 | Tauri 命令 | **62 个**，全部在 `src-tauri/src/main.rs` 的 `invoke_handler` 注册 |
 | 错误码 | 26 个（`src-tauri/src/error.rs`，含中文文案表与退出码映射） |
 | 配置 schema | `schema_version = 1`（迁移表在 `migrate.rs`） |
-| 单测 | 53 个（`cargo test`，覆盖 hosts 编解码/幂等、预设地址、订阅校验、迁移、脱敏、hex、IPC 映射、热键直连切换目标选择、快捷键键名收敛与非法组合拒绝） |
+| 单测 | 源码共 **66** 个 `#[test]`（覆盖 hosts 编解码/幂等、预设地址、订阅校验、迁移、脱敏、hex、IPC 映射、热键直连切换目标选择、快捷键键名收敛与非法组合拒绝、DNS/代理解析与 `pick_in_use`）；其中平台专属 macOS 11 / Windows 7，各自只编译自己那份 → **Windows 实测 55**，macOS 预期 59 |
 | 前端产物 | index.html + quick.html 双入口，约 98 KB JS / 25 KB CSS（压缩后 gzip 约 31 KB） |
-| 生产包体积 | `SuNet.exe` 6.2 MB（不含 WebView2，用系统自带）；NSIS 安装包 `SuNet_<版本>_x64-setup.exe` 约 2.2 MB，产物在 `target/release/bundle/nsis/` |
+| 生产包体积 | Windows：`SuNet.exe` 6.2 MB（不含 WebView2，用系统自带）；NSIS 安装包 `SuNet_<版本>_x64-setup.exe` 约 2.2 MB（`target/release/bundle/nsis/`），MSI 在 `bundle/msi/`。macOS：`SuNet_<版本>_universal.dmg`（ad-hoc 签名，未公证） |
+| 发布流水线 | `.github/workflows/release.yml`：tag `v*` → `windows`（nsis+msi）→ `macos`（universal dmg）→ `readme`（把 CHANGELOG 对应段落与平台表写回 README 并提交）；三个 job 串行、共用同一个 Release |
 
 ---
 
@@ -46,6 +57,10 @@ cd src-tauri && cargo test      # 53 项单元测试（纯逻辑，不碰系统�
 | hosts | `C:\Windows\System32\drivers\etc\hosts`，备份写在**同目录** `hosts.bak.<时间戳>` |
 | 显示环境 | 3840×2160 @150%；面板几何分析依赖 `Monitor::work_area()`（物理像素） |
 | WebView2 | 已装 154.x；缺 WebView2 时 Tauri 会在建窗阶段报错退出 |
+| 配置目录（macOS） | `~/Library/Application Support/SuNet/`（同一批文件；日志落在 `~/Library/Logs/SuNet/`，IPC 载荷在 `~/Library/Caches/SuNet/ipc/`） |
+| hosts（macOS） | `/etc/hosts`（root 写：同目录 `.tmp` → `sync_all` → `rename` → `chown 0:0` + `chmod 0644`） |
+| 提权助手（macOS） | `--helper-install`（需 root）装到 `/Library/PrivilegedHelperTools/com.sunet.helper` + `/Library/LaunchDaemons/com.sunet.helper.plist`；socket `/var/run/sunet-helper.sock`（0666，按 peer uid 校验调用方）；日志 `/var/log/sunet-helper.log` |
+| 本机做不了的事 | **macOS 侧本地无法编译**：没有 `cc`，`cargo check --target aarch64-apple-darwin` 会死在 `objc2-exception-helper` 的 build script（`failed to find tool "cc"`）；macOS 能不能编译只能由 CI 回答 |
 
 ---
 
@@ -53,14 +68,17 @@ cd src-tauri && cargo test      # 53 项单元测试（纯逻辑，不碰系统�
 
 | 要改什么 | 去哪个文件 |
 |---|---|
-| hosts 读/写/解析/编码/区块渲染 | `src-tauri/src/os/hosts_file.rs`（**最核心**，改动必跑单测） |
-| 系统代理注册表 + 通知 | `src-tauri/src/os/wininet.rs` |
-| DNS 网卡枚举 / 分族设置 / 回读 | `src-tauri/src/os/dns_client.rs`（枚举=GetAdaptersAddresses FFI；写入/还原=netsh 分族命令；结构体 FFI 声明在 `os/winapi.rs`） |
+| hosts 解析/渲染/编码/回读校验（平台无关） | `src-tauri/src/os/hosts_file.rs`（**最核心**，改动必跑单测） |
+| hosts 落盘（平台相关） | `src-tauri/src/os/{windows,macos}/hosts_io.rs`（Windows=临时文件 + `ReplaceFileW` 回退；macOS=同目录 `.tmp` + `rename` + `chown/chmod`） |
+| 系统代理（读 + 平台实现） | `src-tauri/src/os/{windows,macos}/system_proxy.rs`（Windows=注册表 `Internet Settings` + `InternetSetOptionW`；macOS=`networksetup` × 活动服务 + `scutil --proxy`） |
+| 系统代理（**写**，唯一出口） | `src-tauri/src/proxy_ops.rs`：按 `system_proxy::proxy_write_needs_root()` 决定进程内直写（Windows）还是提权任务（macOS 的 `proxy_write` / `proxy_restore` / `proxy_clear`） |
+| DNS 网卡枚举 / 分族设置 / 回读 | `src-tauri/src/os/{windows,macos}/dns_client.rs`（Windows=GetAdaptersAddresses FFI + netsh 分族，FFI 声明在 `os/windows/winapi.rs`；macOS=`networksetup` 服务顺序 + `ifconfig`，2s 缓存 + `invalidate_cache()`） |
+| 提权助手（macOS） | `src-tauri/src/helper/{mod,client,daemon,install}.rs`（unix socket 协议、peer uid 校验、LaunchDaemon 安装/卸载/状态） |
 | 内置 DNS 清单 / 敏感域名表 | `src-tauri/src/os/dns_presets.rs`（编译进二进制，**不进配置文件**） |
 | 事务：快照→执行→回滚 | `src-tauri/src/apply.rs`（切换引擎，改动前先读 §3 的不变量） |
 | 快照存储 / 差异对比 | `src-tauri/src/backup.rs` |
-| 提权调用 / IPC 载荷 / 子进程任务表 | `elevation.rs` / `ipc.rs` / `task_runner.rs` |
-| 跨进程互斥体 | `critsec.rs` |
+| 提权调用 / IPC 载荷 / 子进程任务表 | `elevation.rs`（Windows=`ShellExecuteExW` runas；macOS=常驻助手 → `osascript` 回退）/ `ipc.rs` / `task_runner.rs` |
+| 跨进程锁 | `critsec.rs`（Windows=命名互斥体；macOS=`flock(/tmp/sunet-critsec.lock)`，都是 10s 超时） |
 | 配置结构 / 默认值 / 方案模型 | `config.rs`（加字段务必带 `#[serde(default)]`） |
 | 配置迁移 | `migrate.rs`（纯函数 + 单测，只增不减） |
 | 订阅拉取与校验 | `subscribe.rs` |
@@ -74,6 +92,7 @@ cd src-tauri && cargo test      # 53 项单元测试（纯逻辑，不碰系统�
 | 组件样式 | `src/app.css` |
 | 图标 | `src/icons.ts`（内联 SVG，`svg(name,size)`） |
 | 弹层/提示/忙碌态 | `src/ui.ts` |
+| **平台判定与文案/键名差异（前端）** | `src/platform.ts`（`IS_MACOS` / `AUTH_*` / `MOD_GLYPH` / `markPlatform()`）＋ `src/app.css` 末尾的 `[data-os="macos"]` 段 |
 
 ---
 
@@ -82,12 +101,12 @@ cd src-tauri && cargo test      # 53 项单元测试（纯逻辑，不碰系统�
 这些是设计文档的拓扑骨架，改动前先想清楚，别顺手"优化"掉：
 
 1. **`main()` 第一行必须是 `--task` 分流**。提权子进程不进 Tauri setup、不建托盘、**不加载 WebView2**、干完就退。这是模型 C 的核心安全边界。
-2. **代理恒不需要提权；hosts/DNS 必须提权**。别为了"省一次 UAC"把 hosts 写进主进程——主进程是 asInvoker。
-3. **提权只走 `ShellExecuteExW` + `runas`**。`CreateProcess` 不触发 UAC，会返回 740。
+2. **hosts/DNS 必须提权；代理是否提权按平台分叉**（Windows 代理写 HKCU，不需要提权；macOS 写网络服务代理需要 root，所以代理写统一走 `proxy_ops.rs` → 提权任务）。别为了"省一次 UAC"把 hosts 写进主进程——主进程是普通权限。
+3. **提权只走平台提权通道**：Windows = `ShellExecuteExW` + `runas`（`CreateProcess` 不触发 UAC，会返回 740）；macOS = 常驻助手（root LaunchDaemon + unix socket，按 peer uid 校验）或 `osascript … with administrator privileges`。
 4. **任何写入都必须回读校验**，不一致就报失败（`E2004` / `E4003`）。"调用没抛异常就当成功"是禁止的。
 5. **hosts 只动托管区块**（`# >>> SuNet BEGIN … # <<< SuNet END`）：区块外内容逐字节保留；条目为空时**整块删除**而不是写空区块。
 6. **回滚必须逆序**：dns → proxy → hosts。回滚失败必须 `recovery_required=true` 并落到界面上，不许吞。
-7. **命名互斥体 + 进程内锁双层**：跨进程冲突靠 `with_critical_section`（10s 超时 + `WAIT_ABANDONED` 接管），进程内靠 `AppState.apply_lock`。
+7. **跨进程锁 + 进程内锁双层**：跨进程冲突靠 `with_critical_section`（Windows 命名互斥体 + 10s 超时 + `WAIT_ABANDONED` 接管；macOS `flock` 同语义），进程内靠 `AppState.apply_lock`。
 8. **通知只对"用户没预期到的结果"**：在界面上刚点的成功操作不弹气泡；失败/后台发生的事/带撤销窗口的操作才提示。降级链：前端横幅 → 托盘 tooltip `⚠` 前缀 → 日志。
 9. **窗口 / 托盘 / 热键 / 提权全部由 Rust 驱动**，前端只调自研命令。capabilities 只开放 `core:default` + `core:window:allow-start-dragging`（面板拖动）。**不要给前端开放更多窗口权限**。
 10. **日志默认脱敏**（代理主机名打码、内网地址、用户目录、订阅 URL query）。协议内容不落盘。
@@ -276,6 +295,12 @@ Hyper-V 的 vEthernet 报 IfType=6（会被 if_type∈{6,71} 的物理近似误�
 顺带事实：无边框窗口在 tao 里缩放与拖动是两条路 —— 顶边由 tao 的 `WM_NCHITTEST` 分支自己处理，左右/底边/角落交给 DefWindowProc；客户区一律 `HTCLIENT`，所以自绘顶栏的拖动只能靠前端 `data-tauri-drag-region="deep"`（tauri `drag.js`：deep 让整棵子树都算拖动区，但 `a/button/input/[tabindex≠-1]` 等可交互元素除外；双击该区域触发 `plugin:window|internal_toggle_maximize`，在 `core:default` 默认权限集内，不必加 capability）。
 修复后实测：`top+3 → HTTOP`、`top+20 → HTCLIENT`、`left/right/bottom → HTLEFT/HTRIGHT/HTBOTTOM`、右下角 → `HTBOTTOMRIGHT`。
 
+### 4.19 macOS 平台层：三处"看着能共用、其实不能"（2026-10-07）
+
+1. **代理写入在 macOS 需要 root，Windows 不需要**。原来 `apply.rs` 直接调 `system_proxy::restore` / `hard_clear`，搬到 macOS 就是"回滚时静默失败"——最危险的那种 bug。现在代理写统一走 `proxy_ops.rs`，由 `proxy_write_needs_root()` 决定进程内直写还是提权任务（`proxy_write` / `proxy_restore` / `proxy_clear`）。
+2. **跨进程锁不能用数据目录里的文件**：助手以 root 运行、`HOME=/var/root`，锁文件放 `~/Library/…` 等于两个进程锁的不是同一个文件 → 改用 `/tmp/sunet-critsec.lock`（`flock` + 10s 超时，语义与命名互斥体对齐）。
+3. **提权子进程的 argv 不要经 shell**：`networksetup` 的服务名含空格（`iPhone USB`），macOS 侧的外部命令全部走 `Command::new(路径).args([...])` 直传；只有 `osascript` 那条必须拼字符串，用 POSIX 单引号转义（`sh_quote`）后再嵌进 AppleScript。
+
 ---
 
 ## 5. 怎么证明改动是对的
@@ -284,7 +309,7 @@ Hyper-V 的 vEthernet 报 IfType=6（会被 if_type∈{6,71} 的物理近似误�
 
 | 项 | 判据 |
 |---|---|
-| 单测 | `cargo test` → 53 passed |
+| 单测 | `cargo test` → **55 passed**（Windows；源码共 66 个 `#[test]`，macOS 专属 11 个不参与编译） |
 | 前端 | `npm run check` 零错误；`npm run build` 双入口产物 |
 | 后端 | `cargo build` 零警告 |
 | IPC 延迟 | CDP 实测 `get_app_state` ≈ 2–6ms；`dns_interfaces`（FFI）≈ 8ms；主窗口五个标签页切换全部 ≈ 110ms（DNS 页曾 3080ms） |
@@ -300,6 +325,7 @@ Hyper-V 的 vEthernet 报 IfType=6（会被 if_type∈{6,71} 的物理近似误�
 | 单实例 | 第二个实例立即退出码 0 退出，首实例存活 |
 | 提权通道 | 手工造载荷 + `--task probe` 端到端（见 §5.3） |
 | 配置容错 | 故意带 BOM 保存后仍能加载（`只读=false`） |
+| macOS 平台层语法 | `rustfmt --edition 2021 --check src/os/macos/*.rs src/helper/*.rs` 无语法错误（**只是语法**，不是编译，更不是实测） |
 
 ### 5.2 启动冒烟 + 日志判读（最常用）
 
@@ -412,6 +438,9 @@ $t.Contains("assets/main-") -and $t.Contains("quick.html")     # True
 
 10. **无边框自绘顶栏的实际手感**（§4.18）：拖顶栏移动窗口、双击顶栏最大化/还原、点 `−` 最小化、点 `×` 隐藏到托盘。
     （几何与命中测试已实测通过，缺的是真实鼠标拖拽/双击这一步。）
+11. **macOS 全套**（§6.4）：整个平台层从没在真机上跑过，按 §6.4 的实测清单逐条来。
+12. **macOS 代理关闭后的还原**：`scutil --proxy` 是否回到原值；有侧车文件（`proxy_prev.json`）应优先吃侧车，没有时把传入快照写到所有活动服务——两条路径都要看。
+13. **macOS 提权助手的边界**：`--helper-install` 是否被 BTM 拦、卸载是否干净（plist / 二进制 / socket 三样）、SSH 登录（非 console 用户）时 peer uid 校验是否按预期拒绝。
 
 ### 6.2 未实现（设计方案里标为 v2 或"不做"）
 WinHTTP 代理、PAC 代理模式、TUN/虚拟网卡、hosts 通配符规则、系统 DoH 写入（只提供端点参考表与测速）、
@@ -424,22 +453,42 @@ WinHTTP 代理、PAC 代理模式、TUN/虚拟网卡、hosts 通配符规则、�
 4. ~~DNS 走 PowerShell~~ → **读路径已完成**：枚举换 `GetAdaptersAddresses` FFI（2026-10-07）。剩余的写入路径也已离开 PowerShell：netsh 每次约 0.1–0.3s，仅在真实写入时发生。
 5. 面板目前每次操作后整页重绘（`render()` 重写 innerHTML）。对 372px 小窗足够快，但要加动画就得改成局部更新。
 
-### 6.4 macOS 移植（**已立项，本轮未动代码**）
+### 6.4 macOS（**已实现，未真机验证**）
 
-本轮只做 Windows 侧。界面部分 macOS 反而更简单（原生流量灯：`titleBarStyle: "Overlay"` / `hiddenTitle`，不需要 §4.18 那套 `WM_NCCALCSIZE` 补丁）；工作量集中在平台层
-（`src-tauri/src/os/` 与 `elevation.rs` / `critsec.rs` / `tray.rs` / `winapi.rs` —— 全项目共 11 个文件直接用了 Win32 或注册表）：
+平台层按 §2 的映射写完了：`src-tauri/src/os/macos/*`（`net.rs` / `dns_client.rs` / `system_proxy.rs` / `hosts_io.rs` / `fs_security.rs` / `privilege.rs` / `mod.rs`）+ `src-tauri/src/helper/*`（常驻提权助手）。共用层只动三处：代理写抽成 `proxy_ops.rs`、`critsec.rs` 分平台、`Cargo.toml` 把 `winreg` 挪进 `[target.'cfg(windows)'.dependencies]` 并加 `libc`。Windows 侧行为不变（`cargo test` 55 项仍全绿）。
 
-| 能力 | Windows 现状（本机） | macOS 对应做法（**未验证**） |
+| 能力 | Windows（已实测） | macOS（已实现，**未真机验证**） |
 |---|---|---|
-| 系统代理 | 注册表 `Internet Settings` + `InternetSetOptionW` 通知 | `networksetup -setwebproxy/-setsecurewebproxy <服务>`；读回 `scutil --proxy` |
-| DNS | `netsh` / `Set-DnsClientServerAddress`（走提权任务） | `networksetup -setdnsservers <服务> <ip…>`（需 root）；刷缓存 `dscacheutil -flushcache` + `killall -HUP mDNSResponder` |
-| hosts | `%SystemRoot%\System32\drivers\etc\hosts` + `ReplaceFileW` | `/etc/hosts`（root 写） |
-| 提权 | `ShellExecuteExW` runas + `--task` 子进程 IPC | `osascript -e 'do shell script "…" with administrator privileges'` |
-| 自启动 | 注册表 Run / 计划任务 | `~/Library/LaunchAgents/*.plist`（或 `SMAppService`） |
-| 网卡枚举 | `GetAdaptersAddresses` FFI（~8ms） | `networksetup -listallnetworkservices` + `ifconfig` |
-| 托盘 / 全局热键 | `tray-icon` + `global-shortcut` | 插件本身跨平台；主要改模板图标与「⌘」键名展示 |
+| 系统代理 | 注册表 `Internet Settings` + `InternetSetOptionW` 通知 | `networksetup -setwebproxy` / `-setsecurewebproxy` / `-setsocksfirewallproxy` × **全部活动服务**；读回 `scutil --proxy`；还原点 `~/Library/Application Support/SuNet/proxy_prev.json` |
+| DNS | `GetAdaptersAddresses` 枚举（~8ms）+ `netsh` 分族写 | `networksetup -listnetworkserviceorder` + `-listallhardwareports` + `ifconfig`（2s 缓存）；`-setdnsservers` 分族写、写后回读校验；刷缓存 `dscacheutil -flushcache` + `killall -HUP mDNSResponder`（走提权任务 `dns_flush`） |
+| hosts | `…\drivers\etc\hosts` + `ReplaceFileW` | `/etc/hosts` + 同目录 `.tmp` → `rename` → `chown 0:0` / `chmod 0644` |
+| 提权 | `ShellExecuteExW` runas + `--task` 子进程 IPC | ① 常驻助手：root LaunchDaemon（`launchctl bootstrap system`）+ `/var/run/sunet-helper.sock`，按 peer uid（root 或 console 用户）校验，`--helper-install` 装一次免密码；② 回退 `osascript … with administrator privileges`，弹一次系统授权框（这条路径**没有超时**——等用户输密码不算卡死；取消按 `-128` 或 "User canceled" 判 `E1001`） |
+| 自启动 | 计划任务（`/RL LIMITED` `/SC ONLOGON`） | `~/Library/LaunchAgents/com.sunet.desktop.autostart.plist` + `launchctl bootstrap gui/<uid>` |
+| 全局热键 | `global-shortcut`，展示 `Ctrl+Alt+S` | 同一个插件；⌘ 在录制里规范名为 `Super`（后端 `mods_of` → `MOD_WIN`，插件认识 `Super`），展示层由 `platform.ts` 的 `MOD_GLYPH` 渲染成 ⌃⌥⇧⌘ |
+| 窗口外观 | 无边框自绘顶栏（§4.18） | 原生交通灯：`tauri.macos.conf.json` 的 `titleBarStyle: "Overlay"` + `hiddenTitle` + `trafficLightPosition {x:14,y:18}`；CSS 隐藏自绘 `−` / `×` 并给 `.topbar` 留 78px 左内边距 |
+| 签名 | 未签名（SmartScreen） | `signingIdentity: "-"`（ad-hoc；没有开发者证书，因此不签名不公证 → 首次打开要在系统设置里放行） |
+| 界面文案 | UAC / 计划任务 / WinINET | 系统授权框 / 登录项 / 网络服务代理（`src/platform.ts` 按 `navigator.userAgent` 切） |
 
-未动原因：本机没有 macOS 环境，**既不能编译也无法验证**，所以本轮只在本文档立项。真开工时先把 Windows 专用依赖改成 `[target.'cfg(windows)'.dependencies]`，Win32 调用加 `cfg` 分流。
+**已知未验证点（按风险排序）**
+1. `osascript` 提权路径的取消/失败判定，以及"取消后不留半套配置"（靠 `apply.rs` 的回滚）。
+2. 常驻助手的安装/鉴权/卸载：BTM 是否拦 `bootstrap system`、socket peer uid 校验、卸载残留。
+3. `pick_in_use()` 的服务选择：只有 Wi-Fi、或 Wi-Fi + 有线同时在用时，写到的服务是否是用户实际在用的那个。
+4. 通用二进制（`--target universal-apple-darwin`）与 dmg 产物、ad-hoc 签名后的 Gatekeeper 提示。
+5. 前端 `data-os="macos"` 的样式/文案分支是否完整（自绘按钮隐藏、顶栏留白、授权文案）。
+
+**本机验证边界**：本机没有 macOS，交叉检查也做不了 —— 没有 `cc`，`cargo check --target aarch64-apple-darwin` 会死在 `objc2-exception-helper` 的 build script（`failed to find tool "cc"`）。所以"macOS 能不能编译"只能由 CI 回答；本地能保证的只有 `rustfmt --edition 2021 --check` 无语法错误 + Windows 侧 `cargo test` 不回归。
+
+**Mac 实测清单（拿到 mac 后按顺序跑）**
+1. `npm ci` → `npm run tauri -- build -- --target universal-apple-darwin --bundles dmg` → 装 dmg（首次要在「系统设置 → 隐私与安全性」放行）。
+2. `cd src-tauri && cargo test` → 预期 **59 项**（66 − 7 项 Windows 专属）。
+3. 启动三态冒烟：裸启 / `--minimized` / `--panel`；日志无 error；托盘菜单与 ⌘ 组合热键可用。
+4. hosts：写入 → `cat /etc/hosts` 看托管区块 → 还原 → 区块消失；`ls -l /etc/hosts` 应为 `root wheel` `0644`。
+5. 代理：开关各一次，对比 `scutil --proxy` 与「系统设置 → 网络 → 代理」；关闭后是否回到原值。
+6. DNS：`networksetup -getdnsservers Wi-Fi` 前后对比；切"自动(DHCP)"后应落回 `aren't any DNS Servers`；刷缓存无报错。
+7. 提权助手：`sudo /Applications/SuNet.app/Contents/MacOS/SuNet --helper-install` → `--helper-status`；之后写 hosts **不该**再弹授权框。
+8. 无助手路径：`--helper-uninstall` 后再写 hosts，应弹一次系统授权框；**取消**时应报 E1001 且配置回到操作前。
+9. 外观：无残留 Windows 标题栏、无重复的最小化/关闭按钮、交通灯不被顶栏内容压住、快捷面板贴边正常。
+10. 自启：开关各一次，检查 `~/Library/LaunchAgents/com.sunet.desktop.autostart.plist` 与 `launchctl list | grep sunet`。
 
 ---
 
@@ -452,6 +501,7 @@ WinHTTP 代理、PAC 代理模式、TUN/虚拟网卡、hosts 通配符规则、�
 - **前端颜色只准用 `tokens.css` 的变量**；间距用 `--sp-*`，圆角用 `--r-*`。写死十六进制 = 深色模式下必然出问题。
 - **面板与主窗口共用** `api.ts / ui.ts / theme.ts / icons.ts / tokens.css`，但**外壳各自独立**。
 - 改动 hosts / 事务 / 提权三者任一，**必须**跑 `cargo test` 并补一条单测。
+- **平台分叉原则**：能共用就共用（`ipc.rs` / `hosts_file.rs` / `apply.rs` / `cmd/*`），平台差异收敛到 `os/<plat>/*` 与 `proxy_ops.rs` 这类小函数（`proxy_write_needs_root()` / `flush_needs_root()` / `privilege::detect()`）。**前端不许自己判断平台**——一律走 `src/platform.ts`，样式则用 `<html data-os>` + CSS。
 - 提交前自检：`npm run check` + `cargo test` + `cargo build`（零警告）+ 启动冒烟（日志无 error）+ 涉及 UI 则截图看一眼。
 
 ---
@@ -474,6 +524,13 @@ WinHTTP 代理、PAC 代理模式、TUN/虚拟网卡、hosts 通配符规则、�
 **改快捷面板布局**
 只动 `src/quick.ts`（渲染 + 绑定）与 `app.css` 的 `.flyout-* / .tile*` 段。保持"瓦片 + 内联确认条"的语言，
 不要引入主窗口的 `.card` / `.tabs` / `.field-grid`。改完用 §5.4 探针确认 `tiles/chips` 数量，并截图。
+
+**改 macOS 平台层**
+1. 先确定改动属于哪一层：读/写系统状态 → `os/macos/*`；"要不要提权" → `proxy_ops.rs` / `flush_needs_root()`；任务形状 → `task_runner.rs` 的 `KNOWN_TASKS` + `execute()` 分支。
+2. 外部命令一律 `Command::new(绝对路径).args([...])` 直传（服务名含空格，别拼 shell）；要 root 的写操作走提权任务。
+3. 写完必须**回读校验**（`set` 里做完 `networksetup` 再 `read_dns` 对比，不一致报 `E4001` / `E4003`）。
+4. 本地只能验语法（`rustfmt --check`）与 Windows 不回归；**真正的编译与验证在 CI 的 `macos-latest`**。
+5. 真机验证按 §6.4 的实测清单走，改完把结论补回 §6.4 与 §5.1。
 
 **接入真机提权测试**
 把 `SuNet.exe` 复制到 `C:\Program Files\SuNet\`（避免从 `\\?\` 或用户目录启动），

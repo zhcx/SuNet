@@ -8,14 +8,16 @@
 //!      菜单弹出前重新读真实状态，保证"菜单说开着、实际已经关了"不可能出现
 
 use crate::error::AppError;
-use crate::os::wininet;
+use crate::os::system_proxy;
 use crate::state::AppState;
 use serde::Serialize;
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, WebviewWindow, Wry};
+#[cfg(target_os = "windows")]
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+#[cfg(target_os = "windows")]
 use winreg::RegKey;
 
 /// 供 UI 展示的聚合状态（§5.4.1）
@@ -39,7 +41,10 @@ pub struct TrayHandles {
     pub autostart: CheckMenuItem<Wry>,
 }
 
-/// 任务栏主题：0/不存在 → 深色任务栏；1 → 浅色任务栏（§4.5.5）
+/// 托盘/菜单栏背景主题：true = 浅色背景（§4.5.5）
+///
+/// Windows：`AppsUseLightTheme`（0/不存在 → 深色）
+#[cfg(target_os = "windows")]
 pub fn taskbar_is_light() -> bool {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let Ok(key) = hkcu.open_subkey_with_flags(
@@ -49,6 +54,23 @@ pub fn taskbar_is_light() -> bool {
         return false;
     };
     key.get_value::<u32, _>("AppsUseLightTheme").unwrap_or(0) == 1
+}
+
+/// macOS：`defaults read -g AppleInterfaceStyle` 在深色模式下输出 `Dark`，
+/// 浅色模式该键不存在（命令报错）→ 读不到就当作浅色。
+#[cfg(target_os = "macos")]
+pub fn taskbar_is_light() -> bool {
+    let out = std::process::Command::new("/usr/bin/defaults")
+        .args(["read", "-g", "AppleInterfaceStyle"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            !text.eq_ignore_ascii_case("dark")
+        }
+        // 键不存在 = 浅色外观
+        _ => true,
+    }
 }
 
 fn tray_image(light_taskbar: bool) -> tauri::Result<Image<'static>> {
@@ -174,7 +196,7 @@ fn tray_toggle_proxy(app: &AppHandle) -> Result<(), AppError> {
         return Ok(());
     };
     let cfg = state.cfg_clone()?;
-    let current = wininet::read().unwrap_or_default();
+    let current = system_proxy::read().unwrap_or_default();
     if current.enable && !current.pac_present {
         let report = crate::apply::apply(
             &state,
@@ -443,13 +465,13 @@ pub fn status_with_hosts(app: &AppHandle, hosts_enabled_entries: usize) -> TrayS
         out.dns_v6 = "自动(v6)".into();
     }
     out.hosts_count = hosts_enabled_entries;
-    match wininet::read() {
+    match system_proxy::read() {
         Ok(p) => {
             out.proxy_on = p.is_on();
             out.proxy = if p.pac_present {
                 "代理 PAC".into()
             } else if p.enable {
-                match wininet::parse_server(&p.server) {
+                match system_proxy::parse_server(&p.server) {
                     Some((_, port)) => format!("代理 已开启(***:{port})"),
                     None => "代理 已开启".into(),
                 }

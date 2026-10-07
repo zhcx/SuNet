@@ -2,7 +2,7 @@
 
 use crate::apply::{self, ApplyTargets, ProxyTarget};
 use crate::error::{AppError, Result};
-use crate::os::wininet::{self, ProxyState};
+use crate::os::system_proxy::{self, ProxyState};
 use crate::state::{SharedState, CLEAR_UNDO_WINDOW};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
@@ -35,7 +35,7 @@ pub struct ProxyView {
 pub async fn proxy_get(state: State<'_, SharedState>) -> Result<ProxyView> {
     let s = state.inner().clone();
     crate::cmd::blocking(move || {
-        let st = wininet::read()?;
+        let st = system_proxy::read()?;
         let cfg = s.cfg_clone().unwrap_or_default();
         let (can_undo, ms) = s
             .runtime
@@ -61,6 +61,9 @@ pub async fn proxy_get(state: State<'_, SharedState>) -> Result<ProxyView> {
 }
 
 /// §3.5 生效范围表（工具只承诺它承诺的）
+///
+/// Windows 走 WinINET（IE 系代理设置），macOS 走 SystemConfiguration。
+#[cfg(not(target_os = "macos"))]
 fn scope_table() -> Vec<(String, String)> {
     [
         ("Chrome / Edge / Firefox（Windows 版）", "跟随"),
@@ -71,6 +74,24 @@ fn scope_table() -> Vec<(String, String)> {
         ("UWP / 微软商店应用", "部分跟随"),
         ("部分游戏客户端", "不跟随（自带加速模块）"),
         ("curl / git / npm", "不跟随（需自行配置）"),
+    ]
+    .iter()
+    .map(|(a, b)| (a.to_string(), b.to_string()))
+    .collect()
+}
+
+/// macOS 版生效范围表（写到**所有网络服务**，即系统级代理）
+#[cfg(target_os = "macos")]
+fn scope_table() -> Vec<(String, String)> {
+    [
+        ("Safari / 系统 WebKit", "跟随"),
+        ("Chrome / Edge / Firefox（macOS 版）", "跟随（读系统代理设置）"),
+        ("Electron 应用（VS Code / Discord）", "跟随"),
+        ("大部分原生应用（App Store / 邮件 / 信息）", "跟随"),
+        ("软件更新 / 系统更新", "部分跟随"),
+        ("App Store 下载", "跟随（受系统设置约束）"),
+        ("curl / git / npm / Homebrew", "不跟随（需自行设环境变量）"),
+        ("部分游戏与自带网络栈的客户端", "不跟随（自带加速模块）"),
     ]
     .iter()
     .map(|(a, b)| (a.to_string(), b.to_string()))

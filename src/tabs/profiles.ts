@@ -11,6 +11,7 @@ import {
 import type { TabCtx } from "../main";
 import { svg } from "../icons";
 import * as ui from "../ui";
+import * as os from "../platform";
 
 export async function renderProfiles(root: HTMLElement, ctx: TabCtx): Promise<void> {
   const [profiles, snapshots, hosts, sources, proxyView] = await Promise.all([
@@ -119,7 +120,7 @@ export async function renderProfiles(root: HTMLElement, ctx: TabCtx): Promise<vo
 
     <div class="card">
       <h2>快照与回滚</h2>
-      <p class="hint">每次切换前都会采集 hosts 原始字节、代理注册表值与各网卡 DNS 状态。保留最近 ${ctx.state.settings.hosts_backup_keep} 份。</p>
+      <p class="hint">每次切换前都会采集 hosts 原始字节、${os.PROXY_SNAPSHOT_NAME}与各网卡 DNS 状态。保留最近 ${ctx.state.settings.hosts_backup_keep} 份。</p>
       <div class="table-wrap">
         <table>
           <thead>
@@ -263,7 +264,7 @@ export async function renderProfiles(root: HTMLElement, ctx: TabCtx): Promise<vo
       ctx.navigate("proxy");
       return;
     }
-    const ok = await ui.elevationNotice("即将开关系统代理（无需管理员权限）", false);
+    const ok = await ui.elevationNotice(os.PROXY_SWITCH_NOTICE, os.PROXY_NEEDS_ADMIN);
     if (!ok) return;
     try {
       const r = await api.proxySet(

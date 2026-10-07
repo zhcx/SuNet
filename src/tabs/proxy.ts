@@ -3,6 +3,7 @@
 import { api, errText, type ProxyView } from "../api";
 import type { TabCtx } from "../main";
 import * as ui from "../ui";
+import * as os from "../platform";
 
 export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void> {
   const view: ProxyView = await api.proxyGet();
@@ -15,8 +16,8 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
 
   root.innerHTML = `
     <div class="card">
-      <h2>系统代理（WinINET 全局代理）</h2>
-      <p class="hint">写入 HKCU\\...\\Internet Settings 并调用 InternetSetOptionW 通知系统，<b>全程不需要管理员权限</b>。</p>
+      <h2>${os.PROXY_TITLE}</h2>
+      <p class="hint">${os.PROXY_HINT}</p>
 
       <div class="row-between" style="margin-bottom:12px">
         <div>
@@ -76,9 +77,7 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
       <details class="help">
         <summary>为什么有的程序不跟随？</summary>
         <div style="margin-top:6px">
-          系统代理位于 WinINET 层，Chrome / Edge / Electron 应用 / 大部分办公软件都会读它；
-          而 Windows Update、部分系统服务走 WinHTTP（机器级，需 <code>netsh winhttp</code>），
-          <code>curl</code> / <code>git</code> / <code>npm</code> 默认不读系统代理（Git 可配 <code>http.proxy</code>）。
+          ${os.PROXY_SCOPE_WHY}
         </div>
       </details>
     </div>

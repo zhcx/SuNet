@@ -2,6 +2,7 @@
 
 import { api, errText, type Settings, type ShortcutStatus } from "./api";
 import * as ui from "./ui";
+import * as os from "./platform";
 
 export async function openSettingsModal(): Promise<void> {
   const { box, close } = ui.openModal("设置");
@@ -33,7 +34,7 @@ export async function openSettingsModal(): Promise<void> {
       <span>启动</span>
       <div class="actions" style="flex-direction:column;align-items:flex-start">
         <label class="row"><input type="checkbox" id="set-start-min" /> 启动后直接最小化到托盘（首次运行例外，会先显示主窗口）</label>
-        <label class="row"><input type="checkbox" id="set-restore-launch" /> 启动后自动恢复上次方案（含 hosts/DNS 时会弹一次 UAC）</label>
+        <label class="row"><input type="checkbox" id="set-restore-launch" /> 启动后自动恢复上次方案（含 hosts/DNS 时${os.AUTH_HINT}）</label>
       </div>
       <span>提权</span>
       <div class="actions">
@@ -41,7 +42,7 @@ export async function openSettingsModal(): Promise<void> {
       </div>
       <span>开机自启</span>
       <div class="actions">
-        <label class="row"><input type="checkbox" id="set-autostart" /> 通过计划任务在登录后静默启动（/RL LIMITED，不弹 UAC）</label>
+        <label class="row"><input type="checkbox" id="set-autostart" /> 通过${os.AUTOSTART_LABEL}在登录后静默启动（${os.AUTOSTART_HINT}）</label>
       </div>
     </div>
 
@@ -58,7 +59,7 @@ export async function openSettingsModal(): Promise<void> {
       <span>状态</span>
       <span id="set-hotkey-status" class="muted"></span>
     </div>
-    <p class="hint" id="set-hotkey-tip">点击左侧方框，然后直接按下组合键即可录制（至少包含一个 Ctrl / Alt / Shift / Win 修饰键，按 Esc 取消本次录制）。按一下切到「默认 · 直连」（关代理、清托管 hosts、DNS 还原自动），再按一下切回之前的方案；含 hosts / DNS 的切换会弹一次 UAC，结果以通知提示。托盘菜单与主界面始终可用。</p>
+    <p class="hint" id="set-hotkey-tip">点击左侧方框，然后直接按下组合键即可录制（至少包含一个 ${os.MOD_NAMES} 修饰键，按 Esc 取消本次录制）。按一下切到「默认 · 直连」（关代理、清托管 hosts、DNS 还原自动），再按一下切回之前的方案；含 hosts / DNS 的切换${os.AUTH_HINT}，结果以通知提示。托盘菜单与主界面始终可用。</p>
 
     <div class="section-title">代理</div>
     <label class="row"><input type="checkbox" id="set-probe" /> 开启代理前做连通性自检（强烈建议保持开启，否则代理软件没启动会造成全局断网）</label>
@@ -163,7 +164,7 @@ export async function openSettingsModal(): Promise<void> {
   const chips = (parts: string[]): string =>
     parts
       .filter(Boolean)
-      .map((p) => `<kbd class="kbd">${ui.esc(GLYPH[p] ?? p)}</kbd>`)
+      .map((p) => `<kbd class="kbd">${ui.esc(os.MOD_GLYPH[p] ?? GLYPH[p] ?? p)}</kbd>`)
       .join('<span class="hotkey-plus">+</span>');
 
   const renderKeys = (binding: string): void => {
@@ -179,7 +180,7 @@ export async function openSettingsModal(): Promise<void> {
   };
 
   // 录制期间要临时让出全局热键：全局注册是系统级的，按到当前生效的组合会真的切一次方案
-  // （含 hosts / DNS 还会弹 UAC）。让出/收回必须串行 —— 并发 await 会让“收回”先落地、
+  // （含 hosts / DNS 还会弹一次授权框）。让出/收回必须串行 —— 并发 await 会让“收回”先落地、
   // “让出”后落地，热键就永久处于释放状态了。
   let captureOp: Promise<unknown> = Promise.resolve();
   const queueCapture = (on: boolean): Promise<unknown> => {
@@ -260,7 +261,7 @@ export async function openSettingsModal(): Promise<void> {
     if (mods.length === 0) {
       // 没有修饰键的全局热键会把正常打字全部抢走，后端也会拒绝，这里先讲清楚
       tipEl.textContent =
-        "必须包含至少一个修饰键（Ctrl / Alt / Shift / Win），请重新按";
+        `必须包含至少一个修饰键（${os.MOD_NAMES}），请重新按`;
       held = [];
       renderKeys(pending);
       return;
@@ -285,7 +286,7 @@ export async function openSettingsModal(): Promise<void> {
     boxHotkey.classList.add("capturing");
     keysEl.innerHTML = '<span class="muted">按下组合键…</span>';
     tipEl.textContent =
-      "请按下组合键（至少含一个 Ctrl / Alt / Shift / Win；Esc 取消录制）";
+      `请按下组合键（至少含一个 ${os.MOD_NAMES}；Esc 取消录制）`;
     // 立即挂监听，避免漏掉紧接着的第一个按键
     document.addEventListener("keydown", onCaptureKey, true);
     document.addEventListener("keyup", onCaptureUp, true);

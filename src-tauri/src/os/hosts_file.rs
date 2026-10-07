@@ -1,9 +1,7 @@
 //! Hosts 文件读写：托管区块 + 编码兜底 + 原子替换 + 回读校验（设计方案 §2）
 
-use crate::error::{AppError, Result, E2001, E2002, E2003, E2004};
-use crate::os::winapi::{wide, ReplaceFileW, REPLACEFILE_IGNORE_MERGE_ERRORS};
+use crate::error::{AppError, Result, E2002, E2003, E2004};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -15,8 +13,17 @@ pub const END: &str = "# <<< SuNet END";
 const LEGACY_BEGIN: &str = "# >>> NetBox BEGIN";
 const LEGACY_END: &str = "# <<< NetBox END";
 
-pub fn hosts_path() -> PathBuf {
-    PathBuf::from(r"C:\Windows\System32\drivers\etc\hosts")
+/// hosts 路径由平台层决定（Windows: `%SystemRoot%\System32\drivers\etc\hosts`；macOS: `/etc/hosts`）
+pub use crate::os::hosts_io::hosts_path;
+
+/// 平台行尾：Windows 用 CRLF；macOS 必须用 LF
+/// —— /etc/hosts 里残留 `\r` 会被解析器当成主机名的一部分，条目静默失效。
+pub const fn line_ending() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "\r\n"
+    } else {
+        "\n"
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -146,11 +153,12 @@ fn normalize_newlines(s: &str) -> String {
     s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-fn to_crlf(lines: &[String]) -> String {
+/// 按平台行尾拼接（Windows = CRLF，macOS = LF）
+fn join_lines(lines: &[String]) -> String {
     let mut out = String::new();
     for l in lines {
         out.push_str(l);
-        out.push_str("\r\n");
+        out.push_str(line_ending());
     }
     out
 }
@@ -251,7 +259,7 @@ pub fn render(parsed: &ParsedHosts, lines: &[String]) -> String {
     while out_lines.last().map(|s| s.is_empty()).unwrap_or(false) {
         out_lines.pop();
     }
-    to_crlf(&out_lines)
+    join_lines(&out_lines)
 }
 
 /// 渲染时**删除**整个托管区块（条目为空 = 关闭方案，不是写一个空区块）
@@ -271,7 +279,7 @@ pub fn render_without_block(parsed: &ParsedHosts) -> String {
     while out_lines.last().map(|s| s.is_empty()).unwrap_or(false) {
         out_lines.pop();
     }
-    to_crlf(&out_lines)
+    join_lines(&out_lines)
 }
 
 /// 区块行 → 条目（读取用户/其他工具在区块内改过的内容）
@@ -530,50 +538,9 @@ pub fn apply(entries: &[HostsEntry]) -> Result<HostsWriteReport> {
         log::warn!(target: "hosts", "备份 hosts 失败，继续写入（备份路径可能无权限）");
     }
 
-    // 5. 写临时文件（必须同卷，保证 ReplaceFileW 原子性）
-    let tmp_path = path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("hosts.tmp");
-    {
-        let mut f = std::fs::File::create(&tmp_path)
-            .map_err(|e| AppError::coded(E2001).with_detail(format!("创建临时文件失败: {e}")))?;
-        f.write_all(output_bytes)
-            .map_err(|e| AppError::coded(E2001).with_detail(format!("写入临时文件失败: {e}")))?;
-        f.flush()?;
-    }
-
-    // 6. 原子替换：保留目标原有 ACL 与属性
-    let used_fallback = if path.exists() {
-        let replaced = unsafe {
-            let target = wide(&path.to_string_lossy());
-            let replacement = wide(&tmp_path.to_string_lossy());
-            ReplaceFileW(
-                target.as_ptr(),
-                replacement.as_ptr(),
-                std::ptr::null(),
-                REPLACEFILE_IGNORE_MERGE_ERRORS,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        if replaced == 0 {
-            let err = crate::os::winapi::last_error_text();
-            log::warn!(target: "hosts", "ReplaceFileW 失败（{err}），回退为截断写入");
-            // 7. 失败回退
-            fallback_write(&path, output_bytes)?;
-            true
-        } else {
-            false
-        }
-    } else {
-        std::fs::rename(&tmp_path, &path).map_err(|e| {
-            AppError::coded(E2001).with_detail(format!("重命名临时文件失败: {e}"))
-        })?;
-        false
-    };
-    let _ = std::fs::remove_file(&tmp_path);
+    // 5–6. 写同目录临时文件 + 原子替换（平台层：Windows = ReplaceFileW 保留 ACL；
+    //      macOS = 同目录 rename，见 `crate::os::hosts_io`）
+    let used_fallback = crate::os::hosts_io::replace_atomic(&path, output_bytes)?;
 
     // 8. 回读校验：不一致必须报失败，不允许"调用没抛异常就当成成功"
     let after = std::fs::read(&path).map_err(|e| {
@@ -616,22 +583,6 @@ pub fn apply(entries: &[HostsEntry]) -> Result<HostsWriteReport> {
     })
 }
 
-fn fallback_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::os::windows::fs::OpenOptionsExt;
-    const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .attributes(FILE_ATTRIBUTE_NORMAL)
-        .open(path)
-        .map_err(|e| AppError::coded(E2001).with_detail(format!("回退写入打开失败: {e}")))?;
-    f.write_all(bytes)
-        .map_err(|e| AppError::coded(E2001).with_detail(format!("回退写入失败: {e}")))?;
-    f.flush()?;
-    Ok(())
-}
-
 /// 逐字节还原（回滚用，§6.2：还原追求"逐字节回到原样"）
 pub fn restore_raw(bytes: &[u8]) -> Result<()> {
     let path = hosts_path();
@@ -644,33 +595,7 @@ pub fn restore_raw(bytes: &[u8]) -> Result<()> {
 }
 
 fn write_bytes_exact(path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("hosts.tmp");
-    {
-        let mut f = std::fs::File::create(&tmp)
-            .map_err(|e| AppError::coded(E2001).with_detail(format!("创建临时文件失败: {e}")))?;
-        f.write_all(bytes)?;
-        f.flush()?;
-    }
-    let ok = unsafe {
-        let target = wide(&path.to_string_lossy());
-        let replacement = wide(&tmp.to_string_lossy());
-        ReplaceFileW(
-            target.as_ptr(),
-            replacement.as_ptr(),
-            std::ptr::null(),
-            REPLACEFILE_IGNORE_MERGE_ERRORS,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    if ok == 0 {
-        fallback_write(path, bytes)?;
-    }
-    let _ = std::fs::remove_file(&tmp);
+    crate::os::hosts_io::replace_atomic(path, bytes)?;
     let after = std::fs::read(path)?;
     if after != bytes {
         return Err(AppError::coded(E2004).with_detail("还原后回读不一致"));
@@ -682,14 +607,15 @@ fn write_bytes_exact(path: &Path, bytes: &[u8]) -> Result<()> {
 /// 生成将要写入的托管区块预览文本（§9：写前预览是必做项）
 pub fn preview(entries: &[HostsEntry]) -> Result<String> {
     let mut out = String::new();
+    let eol = line_ending();
     out.push_str(BEGIN);
-    out.push_str("\r\n");
+    out.push_str(eol);
     for e in entries {
         out.push_str(&e.to_line());
-        out.push_str("\r\n");
+        out.push_str(eol);
     }
     out.push_str(END);
-    out.push_str("\r\n");
+    out.push_str(eol);
     Ok(out)
 }
 
@@ -712,7 +638,7 @@ mod tests {
         assert!(rendered.contains("1.1.1.1 a.com"));
         assert!(rendered.contains("# 尾部注释"));
         assert!(rendered.contains("# 本地注释"));
-        assert!(rendered.ends_with("\r\n"));
+        assert!(rendered.ends_with(line_ending()));
     }
 
     #[test]

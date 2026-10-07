@@ -4,7 +4,7 @@
 //   未安装为服务、无常驻提权进程、提权子进程不加载 WebView2
 // 分流放在 main() 的第一行 —— 提权子进程不进 Tauri setup、不建托盘、干完就退。
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 mod apply;
 mod backup;
@@ -13,6 +13,8 @@ mod config;
 mod critsec;
 mod elevation;
 mod error;
+#[cfg(target_os = "macos")]
+mod helper;
 mod ipc;
 mod logging;
 mod migrate;
@@ -20,6 +22,7 @@ mod notify;
 mod os;
 mod paths;
 mod probe;
+mod proxy_ops;
 mod state;
 mod subscribe;
 mod task_runner;
@@ -31,11 +34,52 @@ use tauri::{AppHandle, Manager};
 use tauri_plugin_global_shortcut::ShortcutState;
 
 fn main() {
+    // ⓪ helper 管理入口（macOS）：安装 / 卸载 / 以守护进程身份运行。
+    //    必须排在任务分流之前：这些入口由 launchd 或 osascript 直接调用。
+    #[cfg(target_os = "macos")]
+    if let Some(code) = helper_entry() {
+        std::process::exit(code);
+    }
     // ① 提权子进程分流（必须在最前面）
     if let Some(args) = task_runner::parse_task_arg() {
         std::process::exit(task_runner::run_and_exit(args));
     }
     run_gui();
+}
+
+/// macOS helper 相关命令行入口；返回 `Some(退出码)` 表示已处理完，不再进 GUI
+#[cfg(target_os = "macos")]
+fn helper_entry() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    if has("--helper-daemon") {
+        return Some(helper::daemon::daemon_main());
+    }
+    if has("--helper-install") {
+        return Some(report(helper::install::install()));
+    }
+    if has("--helper-uninstall") {
+        return Some(report(helper::install::uninstall()));
+    }
+    if has("--helper-status") {
+        println!("{}", helper::install::status());
+        return Some(0);
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn report(r: error::Result<String>) -> i32 {
+    match r {
+        Ok(msg) => {
+            println!("{msg}");
+            0
+        }
+        Err(e) => {
+            eprintln!("错误：{e}");
+            e.exit_code()
+        }
+    }
 }
 
 pub fn quit_app(app: &AppHandle) {
@@ -142,6 +186,8 @@ fn run_gui() {
             // 无边框窗口的第一帧修正（详见 os::winapi::force_frame_recalc）：
             // 系统在窗口刚创建时会按 WS_CAPTION 画一条真标题栏，必须主动触发
             // 一次框架重算，否则主窗口在首次移动/缩放前都会顶着系统标题栏。
+            // macOS 用 titleBarStyle=Overlay（见 tauri.macos.conf.json），无此问题。
+            #[cfg(target_os = "windows")]
             for label in ["main", "quick"] {
                 if let Some(w) = handle.get_webview_window(label) {
                     if let Ok(h) = w.hwnd() {

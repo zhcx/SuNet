@@ -2,6 +2,7 @@
 
 import { api, type ApplyReport, type ApplyStep } from "./api";
 import { icon, type IconName } from "./icons";
+import * as os from "./platform";
 
 export function esc(s: unknown): string {
   return String(s ?? "")
@@ -291,15 +292,18 @@ export function isElevated(): boolean | null {
 }
 
 /**
- * UAC 提示前先自绘说明对话框：
- * Windows 的 UAC 框只显示程序名 SuNet.exe，用户可能不知道这弹窗是自己刚才点的操作触发的。
+ * 授权提示前先自绘说明对话框：
+ * Windows 的 UAC 框只显示程序名 SuNet.exe、macOS 的授权框只显示程序名，
+ * 用户可能不知道这弹窗是自己刚才点的操作触发的。
  */
 export async function elevationNotice(action: string, enabled: boolean): Promise<boolean> {
   if (!enabled || elevatedCache === true) return true;
   return confirmModal({
     title: "需要管理员权限",
-    body: `${action}\n\n接下来会弹出 Windows 的 UAC 授权框（程序名显示为 SuNet.exe），请点击「是」继续。\n本次操作只需要一次授权，不会常驻管理员进程。`,
-    confirmText: "继续（将弹出 UAC）",
+    body: `${action}
+
+${os.AUTH_BODY}`,
+    confirmText: os.AUTH_CONTINUE,
   });
 }
 

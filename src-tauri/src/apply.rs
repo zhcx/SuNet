@@ -15,7 +15,7 @@ use crate::elevation;
 use crate::error::{AppError, Result, E3001, E3002, E4002};
 use crate::ipc::ApplyStep;
 use crate::os::hosts_file::HostsEntry;
-use crate::os::wininet::{self, ProxyState};
+use crate::os::system_proxy::{self, ProxyState};
 use crate::paths;
 use crate::probe;
 use crate::state::AppState;
@@ -398,12 +398,12 @@ fn step_proxy(t: &ProxyTarget) -> Result<ApplyStep> {
                 t.port
             )));
         }
-        let before = wininet::read()?;
+        let before = system_proxy::read()?;
         ensure_proxy_snapshot(&before)?;
         let server = format!("{host}:{}", t.port);
-        wininet::write_manual(true, &server, &t.bypass)?;
-        let notified = wininet::notify_changed();
-        let verified = wininet::verify(true).unwrap_or(false);
+        // 写操作统一走 proxy_ops：macOS 需要 root（helper / osascript），Windows 直接写 HKCU
+        let notified = crate::proxy_ops::write_manual(true, &server, &t.bypass)?;
+        let verified = system_proxy::verify(true).unwrap_or(false);
         let msg = if verified {
             format!(
                 "已启用系统代理 ***:{}（绕过：{}）{}",
@@ -433,9 +433,8 @@ fn step_proxy(t: &ProxyTarget) -> Result<ApplyStep> {
         // 关闭代理：不用"ProxyEnable=0"简单粗暴，而是快照还原（§3.3）
         match take_proxy_snapshot_file() {
             Some(snap) => {
-                wininet::restore(&snap)?;
-                wininet::notify_changed();
-                let verified = wininet::verify(snap.enable).unwrap_or(false);
+                crate::proxy_ops::restore(&snap)?;
+                let verified = system_proxy::verify(snap.enable).unwrap_or(false);
                 log::info!(
                     target: "proxy",
                     "代理已按接管前快照还原：enable={} pac={}",
@@ -454,9 +453,8 @@ fn step_proxy(t: &ProxyTarget) -> Result<ApplyStep> {
                 })
             }
             None => {
-                let now = wininet::read()?;
-                wininet::write_manual(false, "", &now.bypass)?;
-                wininet::notify_changed();
+                let now = system_proxy::read()?;
+                crate::proxy_ops::write_manual(false, "", &now.bypass)?;
                 if now.pac_present {
                     // 诚实报告：PAC 接管时 ProxyEnable=0 并不生效
                     Ok(step_soft(
@@ -559,14 +557,8 @@ fn rollback_layers(snap: &Snapshot, applied: &[&str]) -> (Vec<ApplyStep>, bool) 
             }
             "proxy" => {
                 let r = match snap.proxy.as_ref() {
-                    Some(p) => {
-                        let w = wininet::restore(p);
-                        if w.is_ok() {
-                            wininet::notify_changed();
-                        }
-                        w
-                    }
-                    None => wininet::hard_clear(),
+                    Some(p) => crate::proxy_ops::restore(p).map(|_| ()),
+                    None => crate::proxy_ops::hard_clear().map(|_| ()),
                 };
                 match r {
                     Ok(_) => steps.push(step_ok("rollback", "系统代理已还原为操作前状态")),
@@ -687,10 +679,9 @@ pub struct ClearReport {
 pub fn clear_proxy(state: &AppState) -> Result<ClearReport> {
     // 与 apply 共享同一把进程内锁 + 同一份快照逻辑（§5.5.8）
     let _guard = state.apply_lock.lock().map_err(|_| AppError::internal("锁被污染"))?;
-    let before = wininet::read()?;
-    wininet::hard_clear()?;
-    wininet::notify_changed();
-    let ok = wininet::verify(false).unwrap_or(false);
+    let before = system_proxy::read()?;
+    crate::proxy_ops::hard_clear()?;
+    let ok = system_proxy::verify(false).unwrap_or(false);
 
     if let Ok(mut rt) = state.runtime.lock() {
         rt.last_clear = Some(crate::state::ClearState {
@@ -705,7 +696,7 @@ pub fn clear_proxy(state: &AppState) -> Result<ClearReport> {
         "代理彻底清零：清除前 enable={} pac={} server=***:{}；回读校验={}",
         before.enable,
         before.pac_present,
-        wininet::parse_server(&before.server).map(|(_, p)| p).unwrap_or(0),
+        system_proxy::parse_server(&before.server).map(|(_, p)| p).unwrap_or(0),
         ok
     );
 
@@ -729,9 +720,8 @@ pub fn undo_clear(state: &AppState) -> Result<bool> {
     let Some(staged) = staged else {
         return Ok(false);
     };
-    wininet::restore(&staged.before)?;
-    wininet::notify_changed();
-    let verified = wininet::verify(staged.before.enable).unwrap_or(false);
+    crate::proxy_ops::restore(&staged.before)?;
+    let verified = system_proxy::verify(staged.before.enable).unwrap_or(false);
     log::info!(
         target: "proxy",
         "已撤销上次代理清零：还原到 enable={} pac={}，回读校验={}",

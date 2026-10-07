@@ -11,6 +11,7 @@ import { renderDns } from "./tabs/dns";
 import { renderProfiles } from "./tabs/profiles";
 import { renderLogs } from "./tabs/logs";
 import { openSettingsModal } from "./settings";
+import * as os from "./platform";
 
 // 主窗口入口；快捷面板走 src/quick-main.ts（独立 HTML 入口）
 
@@ -65,11 +66,11 @@ function renderHeader(): void {
   } else if (state.prand.is_elevated) {
     badge.className = "badge ok";
     badge.textContent = "已提权";
-    badge.title = "当前进程具备管理员权限，hosts / DNS 修改无需再弹 UAC";
+    badge.title = os.ELEVATED_TITLE;
   } else {
     badge.className = "badge plain";
     badge.textContent = "普通权限";
-    badge.title = "代理开关无需权限；仅在修改 hosts / DNS 时弹一次 UAC";
+    badge.title = os.NORMAL_TITLE;
   }
 
   const themeBtn = h("btn-theme");
@@ -231,7 +232,7 @@ async function maybeFirstRun(): Promise<void> {
         <button class="primary" id="first-run-go">保存并开始使用</button>
         <button id="first-run-skip">跳过</button>
       </div>
-      <p class="hint" style="margin-top:8px">权限说明：代理开关完全静默，无需管理员权限；只有修改 hosts / DNS 时才会在<b>你主动点击</b>后弹一次 UAC。</p>
+      <p class="hint" style="margin-top:8px">权限说明：${os.PERM_HINT}</p>
     </div>`;
 
   document.getElementById("first-run-skip")?.addEventListener("click", async () => {
@@ -305,6 +306,7 @@ async function maybeCrashRecovery(): Promise<void> {
 // ---------------- 启动 ----------------
 
 async function boot(): Promise<void> {
+  os.markPlatform();
   initTheme();
   onThemeChange(() => void api.markNotificationsRead());
 
@@ -377,7 +379,7 @@ export async function applyProfile(id: string): Promise<void> {
     !!s && !s.prand.is_elevated && s.settings.confirm_elevation_notice,
   );
   if (!ok) return;
-  ui.toast("info", "正在切换…", "含 hosts / DNS 的方案会弹出一次 UAC");
+  ui.toast("info", "正在切换…", os.SWITCH_TOAST_HINT);
   try {
     const r = await api.profileApply(id);
     if (r.ok) {

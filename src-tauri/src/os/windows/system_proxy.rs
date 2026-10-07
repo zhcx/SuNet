@@ -153,6 +153,14 @@ pub fn notify_changed() -> bool {
     }
 }
 
+/// 写代理是否需要管理员权限。
+///
+/// Windows 走 HKCU，普通用户即可写 → false。
+/// （macOS 对应实现见 `os/macos/system_proxy.rs`，那边恒为 true。）
+pub fn proxy_write_needs_root() -> bool {
+    false
+}
+
 /// 解析 "127.0.0.1:7890" 形式
 pub fn parse_server(server: &str) -> Option<(String, u16)> {
     let s = server.trim();

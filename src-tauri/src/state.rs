@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::error::{AppError, Result};
-use crate::os::wininet::ProxyState;
+use crate::os::system_proxy::ProxyState;
 use crate::paths;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;

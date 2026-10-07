@@ -10,6 +10,7 @@ use crate::error::{AppError, Result, E1004};
 use crate::ipc::{ApplyStep, Payload, TaskOutput};
 use crate::os::hosts_file::{self, HostsEntry};
 use crate::os::dns_client::{self, AddressFamily};
+use crate::os::system_proxy::{self, ProxyState};
 use serde_json::Value;
 
 const KNOWN_TASKS: &[&str] = &[
@@ -18,6 +19,9 @@ const KNOWN_TASKS: &[&str] = &[
     "dns_set",
     "dns_reset",
     "dns_flush",
+    "proxy_write",
+    "proxy_restore",
+    "proxy_clear",
     "probe",
 ];
 
@@ -141,6 +145,11 @@ pub fn execute(task: &str, data: &Value) -> TaskOutput {
                 Err(e) => TaskOutput::fail(e),
             }
         }
+        // ── 代理写任务（macOS 专用路径：networksetup 需要 root）──
+        // Windows 不会走到这里（proxy_write_needs_root() = false，进程内直接写）
+        "proxy_write" => proxy_write(data),
+        "proxy_restore" => proxy_restore(data),
+        "proxy_clear" => proxy_clear(),
         other => TaskOutput::fail(
             AppError::coded(E1004).with_detail(format!("未知任务名：{other}")),
         ),
@@ -317,6 +326,69 @@ fn dns_reset(data: &Value) -> TaskOutput {
     }
 }
 
+/// proxy_write：写入手动代理（`enable=false` 即关闭手动代理）
+///
+/// 载荷：`{ enable: bool, server: "host:port", bypass: String }`
+fn proxy_write(data: &Value) -> TaskOutput {
+    let enable = data["enable"].as_bool().unwrap_or(false);
+    let server = data["server"].as_str().unwrap_or("").to_string();
+    let bypass = data["bypass"].as_str().unwrap_or("").to_string();
+    let r = crate::critsec::with_critical_section(|| {
+        system_proxy::write_manual(enable, &server, &bypass)
+    });
+    match r {
+        Ok(_) => TaskOutput::ok().with_step(ok_step(
+            "proxy",
+            if enable {
+                "系统代理已启用（回读校验由调用方完成）".to_string()
+            } else {
+                "手动代理已关闭".to_string()
+            },
+        )),
+        Err(e) => {
+            let mut out = TaskOutput::fail(e.clone());
+            out.steps.push(bad_step("proxy", e.to_string()));
+            out
+        }
+    }
+}
+
+/// proxy_restore：按操作前的快照原样还原（含 PAC）
+///
+/// 载荷：`{ state: ProxyState }`
+fn proxy_restore(data: &Value) -> TaskOutput {
+    let state: ProxyState = match serde_json::from_value(data["state"].clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            return TaskOutput::fail(
+                AppError::coded(E1004).with_detail(format!("state 字段解析失败：{e}")),
+            )
+        }
+    };
+    let r = crate::critsec::with_critical_section(|| system_proxy::restore(&state));
+    match r {
+        Ok(_) => TaskOutput::ok().with_step(ok_step("proxy", "系统代理已按快照还原")),
+        Err(e) => {
+            let mut out = TaskOutput::fail(e.clone());
+            out.steps.push(bad_step("proxy", e.to_string()));
+            out
+        }
+    }
+}
+
+/// proxy_clear：彻底清空代理配置（保留绕过列表）
+fn proxy_clear() -> TaskOutput {
+    let r = crate::critsec::with_critical_section(system_proxy::hard_clear);
+    match r {
+        Ok(_) => TaskOutput::ok().with_step(ok_step("proxy", "系统代理配置已清空")),
+        Err(e) => {
+            let mut out = TaskOutput::fail(e.clone());
+            out.steps.push(bad_step("proxy", e.to_string()));
+            out
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +419,20 @@ mod tests {
         let out = execute("hosts_apply", &serde_json::json!({ "entries": "nope" }));
         assert!(!out.ok);
         assert_eq!(out.error.unwrap().code, E1004);
+    }
+
+    #[test]
+    fn proxy_restore_rejects_bad_state() {
+        // 载荷不合法时必须在碰系统配置之前就报错
+        let out = execute("proxy_restore", &serde_json::json!({ "state": 42 }));
+        assert!(!out.ok);
+        assert_eq!(out.error.unwrap().code, E1004);
+    }
+
+    #[test]
+    fn proxy_tasks_are_whitelisted() {
+        for t in ["proxy_write", "proxy_restore", "proxy_clear"] {
+            assert!(KNOWN_TASKS.contains(&t), "{t} 不在白名单里");
+        }
     }
 }

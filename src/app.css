@@ -1759,3 +1759,20 @@ details.help summary {
   font-size: var(--fs-xs);
   color: var(--fg-faint);
 }
+
+/* ---------------------------------------------------------------------------
+   macOS 差异（设计方案 §4.5.6）
+   <html data-os="macos"> 由 src/platform.ts 在启动时打上。只写"哪里不一样"：
+   主窗口用原生交通灯（titleBarStyle: Overlay + hiddenTitle），所以
+   · 自绘的最小化 / 关闭按钮必须藏起来，否则与红黄绿灯重复；
+   · 顶栏左侧要空出约三个灯的位置（trafficLightPosition x=14，三个 12px 按钮）。
+   快捷面板是 decorations: false 的浮窗，两平台一致，不需要额外规则。
+--------------------------------------------------------------------------- */
+[data-os="macos"] #btn-min,
+[data-os="macos"] #btn-hide {
+  display: none;
+}
+
+[data-os="macos"] .topbar {
+  padding-left: 78px;
+}

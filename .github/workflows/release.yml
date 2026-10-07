@@ -1,8 +1,13 @@
-# 发布流程：打一个 v* 标签（或用 workflow_dispatch 指定标签）→ 在 Windows 上构建安装包并建 Release，
-# 然后把 README 顶部的版本号、平台对照表、项目规模与最新发布日志刷新到默认分支。
+# 发布流程：打一个 v* 标签（或用 workflow_dispatch 指定标签）→ 在 Windows 与 macOS 上分别构建
+# 安装包并建 Release（同一个 Release，Windows 先建、macOS 往上加资产），
+# 然后把 README 顶部的版本号与平台对照表刷新到默认分支。
 #
-# 为什么只有 Windows：平台层是 Win32 / 注册表 / netsh / hosts（见 HANDOFF.md §6.4），
-# macOS 与 Linux 目前编译不过，所以不挂它们的 job —— 支持情况由 README 的平台对照表说明。
+# 平台层是分平台的：Windows = Win32 / 注册表 / netsh / hosts，macOS = networksetup / scutil / /etc/hosts
+# （见 src-tauri/src/os/windows 与 os/macos，映射表在 HANDOFF.md §6.4）。
+# Linux 仍未支持，不挂它的 job —— 支持情况由 README 的平台对照表说明。
+#
+# macOS job 为什么要 needs: windows：Release 由 windows job 创建，macOS job 用它的 releaseId
+# 上传资产。两个 job 同时建同一个 Release 会撞车（同名 Release 的创建不是幂等的）。
 #
 # 两个 job 之间为什么要串起来：用 GITHUB_TOKEN 产生的事件（例如「Release 已发布」）
 # 不会再触发新的工作流运行，所以 README 同步只能放在同一个工作流里做后续 job。
@@ -28,6 +33,9 @@ jobs:
     runs-on: windows-latest
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
+    # 给 macOS job 复用同一个 Release（见文件头的说明）
+    outputs:
+      releaseId: ${{ steps.tauri_action.outputs.releaseId }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v7
@@ -72,6 +80,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: 构建并创建 Release
+        id: tauri_action
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -89,9 +98,65 @@ jobs:
           # 同时放一份免安装的 SuNet.exe
           uploadPlainBinary: true
 
+  macos:
+    name: macOS 安装包（通用二进制 dmg）
+    needs: windows
+    runs-on: macos-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 安装 Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: 安装 Rust（stable + 两个 mac 目标，通用二进制需要）
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: 缓存 Rust 构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: macos
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      # 这是 macOS 平台层唯一能真正编译并跑测试的地方：本机（Windows）交叉检查会卡在
+      # objc2-exception-helper 的 cc-rs 找不到 C 编译器上，所以这一步失败就是真失败。
+      - name: 后端单元测试（macOS 平台层）
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: 前端类型检查
+        run: npm run check
+
+      - name: 构建 dmg 并加到同一个 Release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tauriScript: npm run tauri
+          tagName: ${{ env.TAG }}
+          releaseId: ${{ needs.windows.outputs.releaseId }}
+          # universal-apple-darwin = Apple Silicon + Intel 合成一个 app；
+          # 只出 dmg（WiX/MSI 是 Windows 专属）。签名身份是 "-"（ad-hoc），
+          # 见 src-tauri/tauri.macos.conf.json：没有开发者证书，不做公证。
+          args: --target universal-apple-darwin --bundles dmg
+          uploadUpdaterJson: false
+          # 裸的 Mach-O 可执行文件脱离 .app 跑不起来，不上传
+          uploadPlainBinary: false
+
   readme:
     name: 同步 README（版本 / 平台表 / 规模 / 发布日志）
-    needs: windows
+    needs: [windows, macos]
     runs-on: ubuntu-latest
     steps:
       - name: 检出默认分支

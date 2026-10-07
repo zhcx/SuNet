@@ -175,9 +175,23 @@ pub async fn dns_reset(
 
 #[tauri::command]
 pub async fn dns_flush(app: AppHandle) -> Result<()> {
-    crate::cmd::blocking(dns_client::flush).await?;
+    crate::cmd::blocking(flush_maybe_elevated).await?;
     crate::cmd::after_change(&app);
     Ok(())
+}
+
+/// 刷解析缓存：Windows 进程内直接调；macOS 需要 root（`dscacheutil` / `killall`），
+/// 走提权任务 `dns_flush`（复用同一张固定函数表）。
+fn flush_maybe_elevated() -> Result<()> {
+    if dns_client::flush_needs_root() {
+        crate::elevation::run_elevated(
+            "dns_flush",
+            serde_json::json!({}),
+            crate::elevation::TASK_TIMEOUT,
+        )?;
+        return Ok(());
+    }
+    dns_client::flush()
 }
 
 #[tauri::command]

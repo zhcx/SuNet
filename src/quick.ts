@@ -15,6 +15,7 @@ import { api, errText, type AppStateView, type ProfileBrief } from "./api";
 import { initTheme, onThemeChange, cycleTheme, currentMode } from "./theme";
 import { icon, type IconName } from "./icons";
 import * as ui from "./ui";
+import * as os from "./platform";
 
 const ic = (name: IconName, size = 16) => `<span class="i">${icon[name](size)}</span>`;
 const esc = ui.esc;
@@ -23,6 +24,7 @@ let state: AppStateView | null = null;
 let busy = false;
 
 export async function bootQuick(): Promise<void> {
+  os.markPlatform();
   document.documentElement.dataset.win = "quick";
   initTheme();
   onThemeChange(() => void refresh());
@@ -430,10 +432,10 @@ function bind(): void {
     });
   });
 
-  // ---- hosts 写入：需要一次 UAC ----
+  // ---- hosts 写入：需要一次管理员授权 ----
   $("#q-hosts-apply")?.addEventListener("click", (e) => {
     const btn = e.currentTarget as HTMLButtonElement;
-    inlineConfirm("写入系统 hosts 需要一次管理员授权（会弹出 UAC）", "继续", () =>
+    inlineConfirm(`写入系统 hosts 需要一次管理员授权（${os.AUTH_HINT}）`, "继续", () =>
       run(btn, async () => {
         const r = await api.hostsApply();
         if (r.ok) ui.toast("info", "hosts 已写入", r.message);
@@ -442,7 +444,7 @@ function bind(): void {
     );
   });
 
-  // ---- DNS 还原为自动：需要一次 UAC ----
+  // ---- DNS 还原为自动：需要一次管理员授权 ----
   $("#q-dns-reset")?.addEventListener("click", (e) => {
     const btn = e.currentTarget as HTMLButtonElement;
     inlineConfirm("把 IPv4 / IPv6 DNS 都交回自动获取？需要一次管理员授权", "还原", () =>
@@ -521,7 +523,7 @@ async function run<T>(el: HTMLElement | null, fn: () => Promise<T>): Promise<voi
     return;
   }
   busy = true;
-  // 执行期间钉住面板：UAC 授权框会抢焦点，不钉住的话面板会在用户点「是」的瞬间消失
+  // 执行期间钉住面板：授权框会抢焦点，不钉住的话面板会在用户点「是 / 好」的瞬间消失
   await api.quickSetPinned(true).catch(() => undefined);
   try {
     if (el instanceof HTMLButtonElement) await ui.withBusy(el, fn);

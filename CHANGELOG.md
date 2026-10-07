@@ -3,9 +3,53 @@
 本项目的所有重要变更都记录在这里。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-发布流程：打一个 `v*` 形式的标签（例如 `v0.0.1`）→ GitHub Actions 在 Windows 上构建
-NSIS `.exe` 与 MSI `.msi` 安装包并创建 Release，**本文件里对应版本的段落会被自动提取为
-Release 说明**，README 顶部的版本号与平台对照表也会同步刷新。
+发布流程：打一个 `v*` 形式的标签（例如 `v0.1.0`）→ GitHub Actions 依次在 `windows-latest` 与
+`macos-latest` 上构建（Windows：NSIS `.exe` + MSI `.msi`；macOS：通用二进制 `.dmg`），
+**本文件里对应版本的段落会被自动提取为 Release 说明**，README 顶部的版本号与平台对照表也会同步刷新。
+
+## [0.1.0] - 2026-10-07
+
+新增 macOS 支持。同一套代码在两个平台上用各自的平台层实现，各出各的安装包
+（Windows：NSIS `.exe` + MSI `.msi`；macOS：通用二进制 `.dmg`，Apple Silicon 与 Intel 通用）。
+
+### 新增
+
+- **macOS 平台层**：系统代理走 `networksetup` 写全部活动网络服务（读回 `scutil --proxy`）；
+  DNS 走 `networksetup -getdnsservers` / `-setdnsservers`（服务顺序即优先级，写后回读校验，
+  刷缓存用 `dscacheutil -flushcache` + `killall -HUP mDNSResponder`）；hosts 写 `/etc/hosts`，
+  同目录临时文件 → `rename` → 归位 `root:wheel` `0644`。
+- **macOS 提权**：新增常驻提权助手（root LaunchDaemon + unix socket，按调用方 uid 校验），
+  装一次之后写 hosts / DNS / 系统代理不再弹授权框；未装助手时回退到
+  `osascript … with administrator privileges`，弹一次系统授权框（输登录密码）。
+  助手可用 `SuNet --helper-install` / `--helper-uninstall` / `--helper-status` 管理。
+- **macOS 开机自启**：写 `~/Library/LaunchAgents` 的 LaunchAgent（Windows 侧仍是计划任务）。
+- **macOS 界面适配**：改用原生交通灯（`titleBarStyle: Overlay` + `hiddenTitle`），隐藏自绘的
+  最小化 / 隐藏按钮；授权提示、自启文案、代理说明与热键符号（⌃⌥⇧⌘）随平台切换。
+- **发布流水线**：打 `v*` 标签后 CI 依次构建 Windows 与 macOS 产物，再按本文件对应段落创建 Release，
+  并把版本号与平台对照表写回 README。
+
+### 变更
+
+- 代理写入收口到 `proxy_ops.rs`，由平台决定是否需要提权（Windows 写 HKCU 不需要，macOS 需要 root）；
+  顺带修掉"macOS 上回滚代理会因权限不足静默失败"的问题。
+- 跨进程互斥分平台：Windows 仍是命名互斥体，macOS 改用 `/tmp/sunet-critsec.lock` 的 `flock`（同为 10 秒超时）。
+- `winreg` 移入 Windows 专用依赖，新增 `libc`（macOS）；版本号 `0.0.1` → `0.1.0`。
+- 错误码 E3003 文案改为「代理设置写入被拒绝（可能需要管理员权限）」。
+
+### 修复
+
+- macOS 上回滚代理、刷 DNS 缓存会因缺少管理员权限而静默失败（前者改走提权任务，后者改走 `dns_flush` 任务）。
+- 无边框顶栏在 macOS 上会与原生交通灯重叠（改为按平台隐藏自绘按钮并留出左边距）。
+
+### 已知限制
+
+- macOS 包未签名未公证（没有开发者证书），首次打开需要在「系统设置 → 隐私与安全性」放行一次，
+  或执行 `xattr -dr com.apple.quarantine /Applications/SuNet.app`。
+- **macOS 平台层尚未在真机上验证**：开发机是 Windows，且没有 macOS 交叉编译环境
+  （`cargo check --target aarch64-apple-darwin` 会因缺少 C 编译器失败），目前只能由 CI 验证"能编译"。
+  待实测清单见 `HANDOFF.md` §6.4。
+- Linux 未支持：平台层、托盘、全局热键与提权模型都需要重新设计。
+- 未接入自动更新；未实现 WinHTTP 系统代理、PAC 模式、TUN / 虚拟网卡、hosts 通配符规则、系统 DoH 写入。
 
 ## [0.0.1] - 2026-10-07
 

@@ -8,7 +8,7 @@
 use crate::error::Result;
 use crate::os::dns_client::{self, DnsFamilyState};
 use crate::os::hosts_file;
-use crate::os::wininet::{self, ProxyState};
+use crate::os::system_proxy::{self, ProxyState};
 use crate::paths;
 use crate::util;
 use serde::{Deserialize, Serialize};
@@ -86,7 +86,7 @@ pub fn take(
     };
 
     let (proxy, proxy_existed) = if include_proxy {
-        match wininet::read() {
+        match system_proxy::read() {
             Ok(p) => (Some(p), true),
             Err(e) => {
                 log::warn!(target: "backup", "读取代理状态失败（视为不存在）：{e}");
@@ -177,7 +177,7 @@ fn meta_of(s: &Snapshot) -> SnapshotMeta {
             .unwrap_or(0),
         hosts_existed: s.hosts_existed,
         proxy_state: match &s.proxy {
-            Some(p) if p.enable => match wininet::parse_server(&p.server) {
+            Some(p) if p.enable => match system_proxy::parse_server(&p.server) {
                 Some((_, port)) => format!("已开启（***:{port}）"),
                 None => "已开启".into(),
             },
@@ -300,7 +300,7 @@ pub fn diff(id: &str) -> Result<DiffReport> {
     }
 
     if let Some(p) = snap.proxy.as_ref() {
-        let now = wininet::read().unwrap_or_default();
+        let now = system_proxy::read().unwrap_or_default();
         if now.enable != p.enable {
             items.push(DiffItem {
                 kind: "proxy".into(),
@@ -366,7 +366,7 @@ fn family_text(f: &DnsFamilyState) -> String {
 }
 
 fn mask_server(s: &str) -> String {
-    match wininet::parse_server(s) {
+    match system_proxy::parse_server(s) {
         Some((_, port)) => format!("***:{port}"),
         None => "—".into(),
     }

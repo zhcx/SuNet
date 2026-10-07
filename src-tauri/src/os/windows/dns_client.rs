@@ -571,6 +571,14 @@ pub fn reset(alias: &str, family: Option<AddressFamily>) -> Result<()> {
 }
 
 /// 清空 DNS 客户端缓存（等价 ipconfig /flushdns，无需提权）
+/// 刷新 DNS 缓存是否需要管理员权限。
+///
+/// Windows 走 `DnsFlushResolverCache`（Dnscache 服务 IPC），普通用户即可 → false。
+/// （macOS 对应实现见 `os/macos/dns_client.rs`，那边需要 root，恒为 true。）
+pub fn flush_needs_root() -> bool {
+    false
+}
+
 pub fn flush() -> Result<()> {
     let ok = unsafe { DnsFlushResolverCache() };
     if ok == 0 {

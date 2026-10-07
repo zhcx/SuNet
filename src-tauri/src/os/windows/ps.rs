@@ -6,6 +6,11 @@
 //!     IP 地址经 `IpAddr::from_str` 解析，序列化回文本必然只含 [0-9a-f:.%]
 //!   - 附加防线：`quote_ps` 对单引号加倍，`assert_script_safe` 对最终脚本做一次拒绝式校验
 //!   - CREATE_NO_WINDOW：不弹黑窗
+//!
+//! 注意：DNS 写入已改走 netsh（见 `dns_client.rs` 模块注释），本模块整体保留未用，
+//! 留作方案 B 的参考实现与回退路径 —— 所以这里显式允许死代码。
+
+#![allow(dead_code)]
 
 use crate::error::{AppError, Result};
 use std::io::Read;
