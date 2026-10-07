@@ -1,0 +1,121 @@
+# 发布流程：打一个 v* 标签（或用 workflow_dispatch 指定标签）→ 在 Windows 上构建安装包并建 Release，
+# 然后把 README 顶部的版本号、平台对照表、项目规模与最新发布日志刷新到默认分支。
+#
+# 为什么只有 Windows：平台层是 Win32 / 注册表 / netsh / hosts（见 HANDOFF.md §6.4），
+# macOS 与 Linux 目前编译不过，所以不挂它们的 job —— 支持情况由 README 的平台对照表说明。
+#
+# 两个 job 之间为什么要串起来：用 GITHUB_TOKEN 产生的事件（例如「Release 已发布」）
+# 不会再触发新的工作流运行，所以 README 同步只能放在同一个工作流里做后续 job。
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要构建并发布的标签名，例如 v0.0.1（手动触发时必填）'
+        required: true
+
+# 创建 Release、推送 README 提交都需要写权限
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows 安装包（NSIS + MSI）
+    runs-on: windows-latest
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 安装 Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: 安装 Rust（stable）
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: 缓存 Rust 构建产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装前端依赖
+        run: npm ci
+
+      - name: 后端单元测试
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: 前端类型检查
+        run: npm run check
+
+      - name: 提取本版本的发布说明（来自 CHANGELOG.md）
+        id: notes
+        shell: bash
+        run: |
+          node scripts/changelog-section.mjs "$TAG" > release-notes.md
+          echo "本次 Release 说明（前 20 行）："
+          head -n 20 release-notes.md
+          {
+            echo "body<<SU_NET_NOTES_EOF"
+            cat release-notes.md
+            echo "SU_NET_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 构建并创建 Release
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tauriScript: npm run tauri
+          tagName: ${{ env.TAG }}
+          releaseName: '速网 SuNet ${{ env.TAG }}'
+          releaseBody: ${{ steps.notes.outputs.body }}
+          releaseDraft: false
+          prerelease: false
+          # msi = WiX 安装包，nsis = 单文件安装器；两者都出
+          args: --bundles nsis,msi
+          # 没有接入 tauri 更新器（无签名公钥），别生成 latest.json
+          uploadUpdaterJson: false
+          # 同时放一份免安装的 SuNet.exe
+          uploadPlainBinary: true
+
+  readme:
+    name: 同步 README（版本 / 平台表 / 规模 / 发布日志）
+    needs: windows
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出默认分支
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: 安装 Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: 重新生成 README 的自动区
+        run: node scripts/update-readme.mjs
+
+      - name: 有变化才提交
+        shell: bash
+        run: |
+          if [ -z "$(git status --porcelain README.md)" ]; then
+            echo "README.md 没有变化，跳过提交"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs: 同步 README 版本与平台对照表（${{ github.ref_name }}）"
+          git push

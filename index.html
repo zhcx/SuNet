@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>速网 SuNet</title>
+    <link rel="stylesheet" href="/src/tokens.css" />
+    <link rel="stylesheet" href="/src/app.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar" data-tauri-drag-region="deep">
+        <div class="brand">
+          <span class="logo" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="name">速网 <em>SuNet</em></span>
+        </div>
+
+        <div class="profile-picker">
+          <span class="label">当前方案</span>
+          <select id="active-profile" title="当前生效的方案"></select>
+          <button id="btn-apply-profile" class="primary">切换</button>
+        </div>
+
+        <div class="topbar-right">
+          <span id="priv-badge" class="badge plain"></span>
+          <button id="btn-theme" class="icon-btn" title="主题：跟随系统"></button>
+          <button id="btn-settings" class="icon-btn" title="设置"></button>
+          <button id="btn-min" class="icon-btn" title="最小化"></button>
+          <button id="btn-hide" class="icon-btn" title="关闭窗口（隐藏到托盘，程序继续运行）"></button>
+        </div>
+      </header>
+
+      <div id="banners" class="banners"></div>
+      <nav class="tabs" id="tabs"></nav>
+      <main id="view" class="view"></main>
+
+      <footer class="statusbar">
+        <span id="status-hosts" class="status-item" title="去 Hosts 页"></span>
+        <span id="status-proxy" class="status-item" title="去代理页"></span>
+        <span id="status-dns" class="status-item" title="去 DNS 页"></span>
+        <span class="spacer"></span>
+        <span id="status-lock" class="status-item warn" hidden></span>
+        <button id="btn-global-restore" class="link danger">全局还原</button>
+      </footer>
+    </div>
+
+    <div id="toasts" class="toasts"></div>
+    <div id="modal-root"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

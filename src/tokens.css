@@ -1,0 +1,126 @@
+/* 设计令牌（设计方案 §9.1）
+   硬性规则：所有颜色只能引用变量。任何一处硬编码十六进制色，
+   都会在深色模式里变成「白底白字」或「黑底黑字」。 */
+
+:root {
+  color-scheme: light dark;
+
+  /* ---- 表面 ---- */
+  --bg: #f6f7f9;
+  --bg-elev: #ffffff;
+  --bg-sunken: #eef1f5;
+  --bg-hover: #f2f4f7;
+  --bg-active: #e8ecf1;
+  --fg: #0f172a;
+  --fg-muted: #5b6b7f;
+  --fg-faint: #93a1b1;
+
+  /* ---- 线 ---- */
+  --border: #e3e8ee;
+  --border-strong: #ccd5df;
+
+  /* ---- 语义色 ---- */
+  --accent: #ef9f27;
+  --accent-hover: #e08f12;
+  --accent-fg: #1c1917;
+  --accent-soft: color-mix(in srgb, var(--accent) 14%, transparent);
+  --accent-line: color-mix(in srgb, var(--accent) 45%, transparent);
+
+  --danger: #d64545;
+  --danger-soft: color-mix(in srgb, var(--danger) 12%, transparent);
+  --danger-line: color-mix(in srgb, var(--danger) 45%, transparent);
+
+  --warning: #c98118;
+  --warning-soft: color-mix(in srgb, var(--warning) 14%, transparent);
+  --warning-line: color-mix(in srgb, var(--warning) 45%, transparent);
+
+  --success: #2f9e63;
+  --success-soft: color-mix(in srgb, var(--success) 13%, transparent);
+  --success-line: color-mix(in srgb, var(--success) 42%, transparent);
+
+  --info: #2f6fd0;
+  --info-soft: color-mix(in srgb, var(--info) 12%, transparent);
+  --info-line: color-mix(in srgb, var(--info) 42%, transparent);
+
+  /* ---- 阴影 ---- */
+  --shadow-sm: 0 1px 2px rgb(15 23 42 / 0.06);
+  --shadow-md: 0 2px 6px rgb(15 23 42 / 0.08), 0 1px 2px rgb(15 23 42 / 0.06);
+  --shadow-lg: 0 12px 32px rgb(15 23 42 / 0.16), 0 2px 8px rgb(15 23 42 / 0.08);
+  --ring: 0 0 0 3px color-mix(in srgb, var(--accent) 32%, transparent);
+
+  /* ---- 字体 ---- */
+  /* 全软件统一微软雅黑：优先 Microsoft YaHei UI（UI 字重在小字号下更清晰），
+     再退到 Microsoft YaHei / 中文名，最后才是系统默认 */
+  --font: "Microsoft YaHei UI", "Microsoft YaHei", "微软雅黑", "Segoe UI",
+    system-ui, sans-serif;
+  /* 等宽字体同样带上雅黑兜底：地址/IP 用等宽，中文注释不会掉进衬线或方块 */
+  --mono: "Cascadia Mono", Consolas, "Microsoft YaHei UI", "Microsoft YaHei",
+    monospace;
+  --fs-xs: 11.5px;
+  --fs-sm: 12.5px;
+  --fs-base: 13.5px;
+  --fs-title: 15px;
+  --fs-page: 19px;
+  --lh: 1.6;
+
+  /* ---- 间距（8px 网格）---- */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+
+  /* ---- 圆角 ---- */
+  --r-sm: 5px;
+  --r-md: 7px;
+  --r-lg: 10px;
+  --r-xl: 14px;
+  --r-full: 999px;
+
+  /* ---- 控件 ---- */
+  --h-ctl: 30px;
+  --h-ctl-sm: 26px;
+
+  /* ---- 动效 ---- */
+  --dur: 140ms;
+  --dur-slow: 220ms;
+  --ease: cubic-bezier(0.2, 0.8, 0.3, 1);
+
+  /* ---- 层级 ---- */
+  --z-sticky: 10;
+  --z-toast: 40;
+  --z-modal: 60;
+}
+
+[data-theme="dark"] {
+  --bg: #101725;
+  --bg-elev: #1a2233;
+  --bg-sunken: #141c2b;
+  --bg-hover: #212b3e;
+  --bg-active: #27334a;
+  --fg: #e4eaf2;
+  --fg-muted: #97a5b8;
+  --fg-faint: #64748b;
+  --border: #2b3548;
+  --border-strong: #3c4962;
+
+  --accent: #f2ab3d;
+  --accent-hover: #ffbb55;
+  --accent-fg: #1c1917;
+  --danger: #f07575;
+  --warning: #e9b949;
+  --success: #4cc38a;
+  --info: #6aa6f5;
+
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.4);
+  --shadow-md: 0 2px 8px rgb(0 0 0 / 0.45);
+  --shadow-lg: 0 16px 40px rgb(0 0 0 / 0.55);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur: 0ms;
+    --dur-slow: 0ms;
+  }
+}

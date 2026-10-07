@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light" data-win="quick">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SuNet 快捷面板</title>
+    <link rel="stylesheet" href="/src/tokens.css" />
+    <link rel="stylesheet" href="/src/app.css" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- 首帧骨架：形状与真实瓦片一致，避免弹出时"跳一下" -->
+      <div class="flyout">
+        <div class="flyout-head" data-tauri-drag-region="deep">
+          <span class="flyout-title"><span class="dot"></span>速网</span>
+          <span class="spacer"></span>
+        </div>
+        <div class="flyout-status">
+          <span class="badge plain">正在读取状态…</span>
+        </div>
+        <div class="flyout-body">
+          <div class="tile wide">
+            <div class="tile-top">
+              <span class="tile-icon"></span>
+              <span class="skeleton" style="width: 56px"></span>
+            </div>
+            <div class="skeleton" style="width: 70%"></div>
+          </div>
+          <div class="tiles">
+            <div class="tile"><div class="skeleton" style="width: 60%"></div></div>
+            <div class="tile"><div class="skeleton" style="width: 60%"></div></div>
+          </div>
+          <div class="tile wide"><div class="skeleton" style="width: 45%"></div></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="toasts" class="toasts"></div>
+    <div id="modal-root"></div>
+    <script type="module" src="/src/quick-main.ts"></script>
+  </body>
+</html>

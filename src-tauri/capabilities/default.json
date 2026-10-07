@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "SuNet 能力集：仅开放核心 IPC 与事件，窗口/托盘/热键全部由 Rust 侧驱动。快捷面板是无边框窗口，需要 start-dragging 才能拖动，其余窗口操作仍走自研命令，不开放给前端。",
+  "windows": ["main", "quick"],
+  "permissions": ["core:default", "core:window:allow-start-dragging"]
+}
