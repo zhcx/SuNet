@@ -231,12 +231,16 @@ fn parse_service_order(text: &str) -> Vec<Service> {
     let mut out: Vec<Service> = Vec::new();
     for line in text.lines() {
         let l = line.trim();
-        if !l.starts_with('(') {
-            continue;
-        }
-        let Some(inner) = l.strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
+        let Some(rest) = l.strip_prefix('(') else {
             continue;
         };
+        // 括号里的内容是「行首的一段」，不是整行：服务行 `(1) Wi-Fi` 后面还有名字，
+        // 硬件端口行 `(Hardware Port: Wi-Fi, Device: en0)` 才是以 `)` 收尾。
+        let Some(close) = rest.find(')') else {
+            continue;
+        };
+        let inner = &rest[..close];
+        let name_part = rest[close + 1..].trim();
         if let Some(hp) = inner.strip_prefix("Hardware Port:") {
             if let Some((port, dev)) = hp.split_once(", Device:") {
                 if let Some(last) = out.last_mut() {
@@ -246,9 +250,7 @@ fn parse_service_order(text: &str) -> Vec<Service> {
             }
             continue;
         }
-        let mut it = inner.splitn(2, ')');
-        let num = it.next().unwrap_or("").trim();
-        let name_part = it.next().unwrap_or("").trim();
+        let num = inner.trim();
         if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) || name_part.is_empty() {
             continue;
         }
