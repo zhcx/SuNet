@@ -326,6 +326,8 @@ Hyper-V 的 vEthernet 报 IfType=6（会被 if_type∈{6,71} 的物理近似误�
 | 提权通道 | 手工造载荷 + `--task probe` 端到端（见 §5.3） |
 | 配置容错 | 故意带 BOM 保存后仍能加载（`只读=false`） |
 | macOS 平台层语法 | `rustfmt --edition 2021 --check src/os/macos/*.rs src/helper/*.rs` 无语法错误（**只是语法**，不是编译，更不是实测） |
+| macOS 平台层编译 + 单测 | CI 的 `macos-latest` job（Actions run **37639760440**，tag `v0.0.1` → commit `91bd35d`）：`cargo test` → **59 passed / 0 failed**、`npm run check` 零错误、`--target universal-apple-darwin --bundles dmg` 构建成功（`SuNet_0.0.1_universal.dmg` 5 821 694 B）。**这只证明能编译 + 单测通过，不等于真机跑通**（见 §6.4） |
+| CI 抓到的两个 macOS 专属 bug（已修） | ① 编译错误 4 处：`src-tauri/src/helper/install.rs:57/60/70` 少了 `?`（`paths::exe_path()` 返回 `io::Result<PathBuf>`）；`src-tauri/src/os/macos/dns_client.rs:384` 的 `write_dns` 尾表达式返回 `Result<String>` 而签名是 `Result<()>`（补 `?` + `Ok(())`）；另加测试闭包 `_up` 未用参数。<br>② 单测 `os::macos::dns_client::tests::parse_order_extracts_service_and_device` 失败：`parse_service_order` 原本用 `strip_prefix('(')` + `strip_suffix(')')`，要求**整行**被括号包住，而 `networksetup -listnetworkserviceorder` 的服务行是 `(1) Wi-Fi`（括号只占行首一段，后面还有名字）→ 解析出 0 个服务。已改为「取第一个 `)` 之前的为序号/硬件端口、之后的为名字」，并在本机用独立 harness 调真实函数复验（含 `*停用` 与 `USB 10/100/1000 LAN` 这类带斜杠的名字） |
 
 ### 5.2 启动冒烟 + 日志判读（最常用）
 
@@ -476,7 +478,7 @@ WinHTTP 代理、PAC 代理模式、TUN/虚拟网卡、hosts 通配符规则、�
 4. 通用二进制（`--target universal-apple-darwin`）与 dmg 产物、ad-hoc 签名后的 Gatekeeper 提示。
 5. 前端 `data-os="macos"` 的样式/文案分支是否完整（自绘按钮隐藏、顶栏留白、授权文案）。
 
-**本机验证边界**：本机没有 macOS，交叉检查也做不了 —— 没有 `cc`，`cargo check --target aarch64-apple-darwin` 会死在 `objc2-exception-helper` 的 build script（`failed to find tool "cc"`）。所以"macOS 能不能编译"只能由 CI 回答；本地能保证的只有 `rustfmt --edition 2021 --check` 无语法错误 + Windows 侧 `cargo test` 不回归。
+**本机验证边界**：本机没有 macOS，交叉检查也做不了 —— 没有 `cc`，`cargo check --target aarch64-apple-darwin` 会死在 `objc2-exception-helper` 的 build script（`failed to find tool "cc"`）。所以"macOS 能不能编译"只能由 CI 回答（**CI 已给出答案：能编译、59 项单测通过、universal dmg 能出，见 §5.1**）；本地能保证的只有 `rustfmt --edition 2021 --check` 无语法错误 + Windows 侧 `cargo test` 不回归。
 
 **Mac 实测清单（拿到 mac 后按顺序跑）**
 1. `npm ci` → `npm run tauri -- build -- --target universal-apple-darwin --bundles dmg` → 装 dmg（首次要在「系统设置 → 隐私与安全性」放行）。
