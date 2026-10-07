@@ -20,7 +20,7 @@ cd src-tauri && cargo test      # 本机平台跑自己那份单测（Windows 55
 npm run tauri -- build -- --target universal-apple-darwin --bundles dmg
 
 # 发布：打 tag 即出包（Windows NSIS+MSI、macOS 通用 dmg，同一个 Release）
-git tag v0.1.0 && git push origin v0.1.0
+git tag v0.0.1 && git push origin v0.0.1
 ```
 
 当前状态：**功能完整、可运行、已实测通过**（范围见 §5.1），未做代码签名与自动更新。
@@ -30,7 +30,7 @@ git tag v0.1.0 && git push origin v0.1.0
 > 2026-10-07 无边框：主界面隐藏 Windows 标题栏，改为自绘顶栏（右上角 `−` 最小化 / `×` 隐藏到托盘，新增 `window_minimize` 命令）；踩到 tao「首帧 `WM_NCCALCSIZE` 走 DefWindowProc → 残留系统标题栏」的坑，用 `force_frame_recalc`（`SetWindowPos(SWP_FRAMECHANGED)`）修掉。细节见 §4.18；macOS 侧不用这套补丁（改用原生的 `titleBarStyle: "Overlay"`）。
 > 2026-10-07 macOS：新增 `src-tauri/src/os/macos/*`（7 文件）与常驻提权助手 `src-tauri/src/helper/*`（unix socket + root LaunchDaemon）；
 > 共用层按平台分叉（新增 `proxy_ops.rs`、`proxy_write_needs_root()`、`flush_needs_root()`、`critsec.rs` 的 flock 分支）；
-> 前端新增 `src/platform.ts`（唯一平台真源，给 `<html>` 打 `data-os`）；版本号 `0.0.1` → **`0.1.0`**；CI 加 macOS job。
+> 前端新增 `src/platform.ts`（唯一平台真源，给 `<html>` 打 `data-os`）；**版本号保持 `0.0.1`**（macOS 支持并入同一版本，与 Release tag 对齐）；CI 加 macOS job。
 > Windows 侧逻辑未变。细节见 §4.19 与 §6.4。
 
 | 事实 | 值 |
