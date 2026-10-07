@@ -53,7 +53,7 @@ pub fn install() -> Result<String> {
     if !crate::os::privilege::is_elevated() {
         return Err(AppError::internal("安装 helper 需要管理员权限"));
     }
-    let src = crate::paths::exe_path();
+    let src = crate::paths::exe_path()?;
     if !src.is_file() {
         return Err(AppError::internal(format!(
             "找不到可执行文件：{}",

@@ -382,7 +382,8 @@ fn write_dns(service: &str, list: &[String]) -> Result<()> {
         args.extend(list.iter().cloned());
     }
     net::networksetup(&args)
-        .map_err(|e| AppError::coded(E4001).with_detail(format!("设置 DNS 失败（{service}）：{e}")))
+        .map_err(|e| AppError::coded(E4001).with_detail(format!("设置 DNS 失败（{service}）：{e}")))?;
+    Ok(())
 }
 
 pub fn resolve_alias(alias: &str) -> Result<NetInterface> {
@@ -571,7 +572,7 @@ Device: en1
     #[test]
     fn pick_prefers_physical_up_primary() {
         let mk =
-            |alias: &str, physical: bool, up: bool, primary: bool, status: &str| NetInterface {
+            |alias: &str, physical: bool, _up: bool, primary: bool, status: &str| NetInterface {
                 alias: alias.to_string(),
                 status: status.to_string(),
                 is_physical: physical,
