@@ -48,12 +48,40 @@ pub fn is_elevated() -> bool {
 /// 若当前进程已是管理员，则直接在本进程执行，不重复弹 UAC。
 #[cfg(target_os = "windows")]
 pub fn run_elevated(task: &str, payload: Value, timeout: Duration) -> Result<TaskOutput> {
+    let output = run_elevated_raw(task, payload, timeout)?;
+    if !output.ok {
+        if let Some(err) = output.error.clone() {
+            return Err(err);
+        }
+    }
+    Ok(output)
+}
+
+/// 与 [`run_elevated`] 相同，但**不把 `!out.ok` 转成 `Err`**。
+///
+/// 批处理任务（一次提权跑多层）需要拿到子进程上报的**部分步骤**，
+/// 才知道哪些层已经落地、需要回滚 —— 那部分信息会被 `run_elevated` 的
+/// 错误转换丢掉。`Err` 只保留"基础设施失败"（启动失败 / 超时 / 用户取消）。
+#[cfg(target_os = "windows")]
+pub fn run_elevated_raw(task: &str, payload: Value, timeout: Duration) -> Result<TaskOutput> {
     if !task_name_ok(task) {
         return Err(AppError::internal(format!("非法任务名：{task}")));
     }
     if is_elevated() {
         log::info!(target: "elevation", "当前已是管理员，任务 {task} 在本进程执行");
         return Ok(crate::task_runner::execute(task, &payload));
+    }
+
+    // 静默通道优先：用户装过计划任务（且开关打开）就完全不再弹 UAC；
+    // 通道不可用/被删/正在忙时自动回退到下面的 runas 路径，行为与从前一致。
+    if crate::elevation_task::usable() {
+        match crate::elevation_task::run(task, payload.clone(), timeout) {
+            Ok(out) => return Ok(out),
+            Err(e) => log::warn!(
+                target: "elevation",
+                "静默通道执行 {task} 失败，回退 runas：{e}"
+            ),
+        }
     }
 
     let (in_path, out_path) = ipc::prepare(task, payload)?;
@@ -73,7 +101,8 @@ pub fn run_elevated(task: &str, payload: Value, timeout: Duration) -> Result<Tas
     sei.lpVerb = verb.as_ptr();
     sei.lpFile = file.as_ptr();
     sei.lpParameters = params_w.as_ptr();
-    sei.nShow = SW_SHOWNORMAL;
+    // 提权子进程只干活、不露面：SW_HIDE 避免 UAC 通过后任务栏闪一个窗口
+    sei.nShow = SW_HIDE;
 
     let started = std::time::Instant::now();
     let ok = unsafe { ShellExecuteExW(&mut sei) };
@@ -142,11 +171,6 @@ pub fn run_elevated(task: &str, payload: Value, timeout: Duration) -> Result<Tas
         out_path.display()
     );
 
-    if !output.ok {
-        if let Some(err) = output.error.clone() {
-            return Err(err);
-        }
-    }
     Ok(output)
 }
 
@@ -160,6 +184,19 @@ pub fn run_elevated(task: &str, payload: Value, timeout: Duration) -> Result<Tas
 /// helper 不可用或调用失败时退回 osascript 授权框。
 #[cfg(target_os = "macos")]
 pub fn run_elevated(task: &str, payload: Value, timeout: Duration) -> Result<TaskOutput> {
+    let output = run_elevated_raw(task, payload, timeout)?;
+    if !output.ok {
+        if let Some(err) = output.error.clone() {
+            return Err(err);
+        }
+    }
+    Ok(output)
+}
+
+/// 与 [`run_elevated`] 相同，但**不把 `!out.ok` 转成 `Err`**（批处理任务要靠子进程
+/// 上报的部分步骤决定回滚哪些层）。`Err` 只保留基础设施失败（启动失败 / 用户取消）。
+#[cfg(target_os = "macos")]
+pub fn run_elevated_raw(task: &str, payload: Value, timeout: Duration) -> Result<TaskOutput> {
     if !task_name_ok(task) {
         return Err(AppError::internal(format!("非法任务名：{task}")));
     }
@@ -178,11 +215,6 @@ pub fn run_elevated(task: &str, payload: Value, timeout: Duration) -> Result<Tas
                     out.ok,
                     started.elapsed().as_millis()
                 );
-                if !out.ok {
-                    if let Some(err) = out.error.clone() {
-                        return Err(err);
-                    }
-                }
                 return Ok(out);
             }
             Err(e) => {
@@ -253,12 +285,47 @@ fn run_via_osascript(task: &str, payload: Value) -> Result<TaskOutput> {
         started.elapsed().as_millis()
     );
 
-    if !output.ok {
-        if let Some(err) = output.error.clone() {
-            return Err(err);
-        }
-    }
     Ok(output)
+}
+
+/// 用 `osascript ... with administrator privileges` 以管理员身份跑一条**固定的自身子命令**
+/// （例如 `--helper-install` / `--helper-uninstall`）。
+///
+/// 与 [`run_via_osascript`] 的区别：那条走的是 `--task` 载荷协议，只能跑 task_runner 的
+/// 白名单任务；而安装/卸载常驻助手要写 `/Library` 并加载 LaunchDaemon，不是 task，
+/// 所以单开一条。**不接受任意命令**，只由本模块内部的固定调用点使用。
+///
+/// 注意：不施加 timeout —— 授权框在等用户输密码，把等待算作超时是误判。
+#[cfg(target_os = "macos")]
+pub fn run_self_command_elevated(extra_args: &[&str]) -> Result<String> {
+    use crate::os::macos::net;
+
+    let exe = paths::exe_path()?;
+    let mut parts = vec![sh_quote(&exe.to_string_lossy())];
+    for a in extra_args {
+        parts.push(sh_quote(a));
+    }
+    let command = parts.join(" ");
+    let script = format!(
+        "do shell script \"{}\" with administrator privileges",
+        as_escape(&command)
+    );
+
+    log::info!(target: "elevation", "以管理员身份执行自身子命令：{extra_args:?}");
+    match net::try_run(net::OSASCRIPT, &["-e".to_string(), script]) {
+        Ok((true, out, _)) => Ok(out.trim().to_string()),
+        Ok((false, out, err)) => {
+            if is_cancelled(&out, &err) {
+                log::info!(target: "elevation", "用户取消授权（E1001）");
+                return Err(AppError::coded(crate::error::E1001));
+            }
+            Err(AppError::internal(format!(
+                "命令执行失败：{}",
+                first_nonempty(&err, &out)
+            )))
+        }
+        Err(e) => Err(AppError::internal(format!("无法启动 osascript：{e}"))),
+    }
 }
 
 /// POSIX 单引号转义

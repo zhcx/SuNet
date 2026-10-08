@@ -17,8 +17,10 @@ pub struct PrivilegeState {
     pub can_write_dns: bool,
 }
 
+/// 是否 root。进程生命周期内不会改变，记住结果免得反复 syscall。
 pub fn is_elevated() -> bool {
-    unsafe { libc::geteuid() == 0 }
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| unsafe { libc::geteuid() == 0 })
 }
 
 pub fn detect() -> PrivilegeState {

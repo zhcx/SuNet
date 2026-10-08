@@ -30,14 +30,14 @@
 ## 下载
 
 <!-- BEGIN:version -->
-当前版本 **v0.0.1**（2026-10-07） · [更新日志](CHANGELOG.md) · [下载安装包](https://github.com/zhcx/SuNet/releases/latest)
+当前版本 **v0.0.2**（2026-10-08） · [更新日志](CHANGELOG.md) · [下载安装包](https://github.com/zhcx/SuNet/releases/latest)
 <!-- END:version -->
 
 <!-- BEGIN:platforms -->
 | 平台 | 安装包 | 状态 | 说明 |
 | --- | --- | --- | --- |
 | Windows 10 / 11 · x64 | `SuNet_<版本>_x64-setup.exe`（NSIS）、`SuNet_<版本>_x64_en-US.msi`（WiX），以及免安装的 `SuNet_windows_x64.exe` | ✅ 已支持 | 三件套（hosts / 系统代理 / DNS）全功能，托盘常驻与全局热键可用；安装包由 GitHub Actions 在打 tag 时自动构建，见 [Releases](https://github.com/zhcx/SuNet/releases) |
-| macOS 10.15+ · Apple Silicon / Intel | `SuNet_<版本>_universal.dmg`（通用二进制，内含 `SuNet.app`） | ✅ 已支持（未签名） | 三件套（hosts / 系统代理 / DNS）与托盘、全局热键可用；写 hosts / 系统代理 / DNS 会弹一次系统授权框（输入登录密码，安装后台助手后免密码）；未做代码签名与公证，首次打开需在「系统设置 → 隐私与安全性」里放行，见 [Releases](https://github.com/zhcx/SuNet/releases) |
+| macOS 10.15+ · Apple Silicon / Intel | `SuNet_<版本>_aarch64.dmg`（Apple Silicon）、`SuNet_<版本>_x86_64.dmg`（Intel），均内含 `SuNet.app` | ✅ 已支持（未签名） | 三件套（hosts / 系统代理 / DNS）与托盘、全局热键可用；写 hosts / 系统代理 / DNS 会弹一次系统授权框（输入登录密码，安装后台助手后免密码）；未做代码签名与公证，首次打开需在「系统设置 → 隐私与安全性」里放行，见 [Releases](https://github.com/zhcx/SuNet/releases) |
 | Linux | — | ❌ 未支持 | 平台层、托盘、全局热键与提权模型都需要重新设计 |
 <!-- END:platforms -->
 
@@ -50,21 +50,25 @@
 ```bash
 npm install
 npm run tauri -- dev                            # 开发（Windows 需要 WebView2，Win10/11 默认自带）
-npm run tauri -- build                          # 打包 NSIS 安装器
-npm run tauri -- build -- --bundles nsis,msi     # 再加上 WiX 的 .msi（首次会自动下载 WiX）
+npm run tauri -- build                          # 默认出全部本平台安装包（Windows 即 NSIS + MSI）
+npm run tauri -- build -- --bundles nsis         # 只出 NSIS 安装器
+npm run tauri -- build -- --bundles nsis,msi     # 只出 NSIS + WiX 的 .msi（首次会自动下载 WiX）
 cd src-tauri && cargo test                      # 单元测试（Windows 55 项 / macOS 59 项，纯逻辑，不碰系统）
 
 # macOS（需要 Xcode Command Line Tools）
 npm run tauri -- dev
-npm run tauri -- build -- --target universal-apple-darwin --bundles dmg   # 通用二进制 dmg
+npm run tauri -- build -- --target aarch64-apple-darwin --bundles dmg   # Apple Silicon dmg
+npm run tauri -- build -- --target x86_64-apple-darwin --bundles dmg    # Intel dmg
 ```
 
 需要 Node 22+ 与 stable Rust 工具链；dev server 用 **5180** 端口（不是 Tauri 默认的 5173）。
 两个平台的平台层代码是分开的（`src-tauri/src/os/windows` 与 `os/macos`），
-所以**在哪个平台构建就只能跑那个平台的功能**；打 tag 时两条流水线各出一套安装包。
+所以**在哪个平台构建就只能跑那个平台的功能**。
 
-打 `v*` 形式的标签会触发 [Release 工作流](.github/workflows/release.yml)：在 Windows 上跑测试、
-构建两种安装包并创建 Release，同时刷新本页顶部的版本号与平台对照表。
+打 `v*` 形式的标签会触发 [Release 工作流](.github/workflows/release.yml)：
+先用 `prepare-release` 建好 Release（说明取自 `CHANGELOG.md`），再由 matrix 并行构建
+Windows（NSIS + MSI）与 macOS（Apple Silicon / Intel 各一份 dmg）并上传到同一个 Release，
+最后刷新本页顶部的版本号与平台对照表。任何平台失败都不影响其他平台（`fail-fast: false`）。
 
 ## 文档
 

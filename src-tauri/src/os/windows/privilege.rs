@@ -14,8 +14,14 @@ pub struct PrivilegeState {
     pub can_write_dns: bool,
 }
 
+/// 是否管理员（提权状态）。
+///
+/// 进程的提权状态在生命周期内不会改变，用 `OnceLock` 记住结果 —— 状态聚合
+/// （`get_app_state`）与托盘刷新都会反复调用它，没必要每次都走一遍
+/// OpenProcessToken / GetTokenInformation。
 pub fn is_elevated() -> bool {
-    unsafe {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| unsafe {
         let mut token: HANDLE = std::ptr::null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
             return false;
@@ -31,7 +37,7 @@ pub fn is_elevated() -> bool {
         );
         CloseHandle(token);
         ok != 0 && elevation.TokenIsElevated != 0
-    }
+    })
 }
 
 pub fn detect() -> PrivilegeState {

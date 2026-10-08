@@ -87,16 +87,15 @@ pub async fn get_app_state(app: AppHandle) -> Result<AppStateView> {
             .unwrap_or(false);
         // 统计与托管区块同源一次读出（见 hosts_file::snapshot 的说明）
         let (hosts_stats, block_entries) = crate::os::hosts_file::snapshot()?;
-        let tray = {
-            // tray::status 内部还会读一次 hosts 统计；把已算好的传进去避免重复 IO
-            crate::tray::status_with_hosts(&a, hosts_stats.enabled_entries)
-        };
+        // 代理状态这里读一次：托盘聚合与下面返回给前端的 proxy 字段共用，少读一次
+        let proxy = crate::os::system_proxy::read().ok();
+        let tray = crate::tray::status_with(&a, hosts_stats.enabled_entries, proxy.clone());
         Ok(AppStateView {
             version: env!("CARGO_PKG_VERSION").to_string(),
             initialized: cfg.initialized,
             read_only: state.read_only.lock().ok().and_then(|g| g.clone()),
             prand: privilege::detect(),
-            proxy: crate::os::system_proxy::read().unwrap_or_default(),
+            proxy: proxy.unwrap_or_default(),
             hosts: hosts_stats,
             hosts_pending: {
                 let mut file_lines: Vec<String> =
@@ -157,6 +156,8 @@ pub async fn settings_save(
         crate::logging::set_level(crate::logging::parse_level(&settings.log_level));
         crate::logging::set_redact(settings.log_redact);
         crate::logging::prune(&crate::paths::logs_dir(), settings.log_keep_days);
+        // 静默提权开关也随保存立即生效（用户直接改 config.json 时同样适用）
+        crate::elevation_task::set_enabled(settings.silent_elevation);
         Ok(settings)
     })
     .await?;
@@ -1170,175 +1171,136 @@ pub async fn mark_notifications_read(app: AppHandle) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// 首次运行（§15.1：不弹向导，一页说清）
+// 首次运行（§15.1：不弹向导，也不抓「原始设置」）
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize, Clone, Debug)]
-pub struct FirstRunReport {
-    pub initialized: bool,
-    pub hosts_path: String,
-    pub hosts_custom_lines: usize,
-    pub hosts_block_lines: usize,
-    pub proxy: ProxyState,
-    pub dns: Vec<(String, String)>,
-    pub interfaces: usize,
-}
-
-#[tauri::command]
-pub async fn first_run_report(state: State<'_, SharedState>) -> Result<FirstRunReport> {
-    let s: Arc<_> = state.inner().clone();
-    crate::cmd::blocking(move || {
-        let cfg = s.cfg_clone()?;
-        let (bytes, _) = crate::os::hosts_file::read_raw()?;
-        let text = crate::os::hosts_file::decode(&bytes).unwrap_or_default();
-        let parsed = crate::os::hosts_file::parse(&text)?;
-        let custom = parsed
-            .head
-            .lines()
-            .chain(parsed.tail.lines())
-            .filter(|l| {
-                let t = l.trim();
-                !t.is_empty() && !t.starts_with('#')
-            })
-            .count();
-        let block = crate::os::hosts_file::parse_block_lines(&parsed.block).len();
-
-        let mut dns = Vec::new();
-        let mut interfaces = 0usize;
-        if let Ok(list) = crate::os::dns_client::list_interfaces() {
-            interfaces = list.len();
-            for i in list
-                .iter()
-                .filter(|i| i.is_physical && i.status.eq_ignore_ascii_case("Up"))
-                .take(3)
-            {
-                let v4 = if i.v4.is_dhcp {
-                    "自动获取".to_string()
-                } else {
-                    format!("手动 {}", i.v4.servers.join(", "))
-                };
-                let v6 = if i.v6.is_dhcp {
-                    "自动获取".to_string()
-                } else {
-                    format!("手动 {}", i.v6.servers.join(", "))
-                };
-                dns.push((i.alias.clone(), format!("IPv4 {v4} · IPv6 {v6}")));
-            }
-        }
-
-        Ok(FirstRunReport {
-            initialized: cfg.initialized,
-            hosts_path: crate::os::hosts_file::hosts_path()
-                .to_string_lossy()
-                .to_string(),
-            hosts_custom_lines: custom,
-            hosts_block_lines: block,
-            proxy: crate::os::system_proxy::read().unwrap_or_default(),
-            dns,
-            interfaces,
-        })
-    })
-    .await
-}
-
-/// 首次运行第 ③ 步：把当前状态存成一个方案，并静默写入第一份快照
+/// 首次运行收尾：只把「已完成引导」标记写回配置。
+///
+/// 不再把当前系统状态抓成一个方案（旧的「保存一份原始设置」引导已移除）：
+/// 默认基线就是**不写 hosts、不开系统代理、不改 DNS**，要什么由用户主动开启。
 #[tauri::command]
 pub async fn first_run_finish(
     app: AppHandle,
-    name: Option<String>,
     state: State<'_, SharedState>,
-) -> Result<String> {
+) -> Result<()> {
     let s: Arc<_> = state.inner().clone();
-    let id = crate::cmd::blocking(move || {
+    crate::cmd::blocking(move || {
         s.assert_writable()?;
-        // 1) 接管已有托管区块内容为手工条目
-        let existing = crate::os::hosts_file::read_block_entries().unwrap_or_default();
-        let proxy = crate::os::system_proxy::read().unwrap_or_default();
-
-        // 2) 采集首个已连接物理网卡的 DNS
-        let mut alias = String::new();
-        let mut v4 = Vec::new();
-        let mut v6 = Vec::new();
-        let mut enable_v4 = false;
-        let mut enable_v6 = false;
-        if let Ok(list) = crate::os::dns_client::list_interfaces() {
-            if let Some(i) = crate::os::dns_client::pick_in_use(&list) {
-                alias = i.alias.clone();
-                if !i.v4.is_dhcp && !i.v4.servers.is_empty() {
-                    enable_v4 = true;
-                    v4 = i.v4.servers.clone();
-                }
-                if !i.v6.is_dhcp && !i.v6.servers.is_empty() {
-                    enable_v6 = true;
-                    v6 = i.v6.servers.clone();
-                }
-            }
-        }
-
-        let profile_name = name.unwrap_or_else(|| {
-            format!("当前配置（{}）", chrono::Local::now().format("%Y-%m-%d"))
-        });
-        let (host, port) = crate::os::system_proxy::parse_server(&proxy.server).unwrap_or_default();
-        let new_profile = crate::config::Profile {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: profile_name.clone(),
-            is_builtin: false,
-            note: "首次运行时抓取的「接管前」状态，可随时切回".into(),
-            hosts: crate::config::ProfileHosts::default(),
-            proxy: crate::config::ProfileProxy {
-                enabled: proxy.enable,
-                host,
-                port,
-                bypass: proxy.bypass.clone(),
-            },
-            dns: crate::config::ProfileDns {
-                enabled: !alias.is_empty(),
-                mode: if enable_v4 || enable_v6 { "manual" } else { "dhcp" }.into(),
-                interface_alias: alias,
-                preset_id: None,
-                v4,
-                v6,
-                enable_v4,
-                enable_v6,
-            },
-        };
-        let pid = new_profile.id.clone();
-
         s.with_cfg_mut(|c| {
-            for mut e in existing {
-                e.origin = "manual".into();
-                if !c
-                    .hosts_entries
-                    .iter()
-                    .any(|x| x.hostname == e.hostname && x.ip == e.ip)
-                {
-                    c.hosts_entries.push(e);
-                }
-            }
-            c.profiles.push(new_profile.clone());
             c.initialized = true;
             Ok(())
         })?;
         s.save_cfg()?;
-
-        // 3) 静默写入第一份快照（「接管前」基线）
-        let active = s.cfg_clone().ok().and_then(|c| c.active_profile_id);
-        if let Err(e) = crate::backup::take(
-            "首次运行基线",
-            active.as_deref(),
-            20,
-            true,
-            true,
-            &[],
-        ) {
-            log::warn!(target: "firstrun", "写入基线快照失败：{e}");
-        }
-        log::info!(target: "firstrun", "首次运行完成，已创建方案「{profile_name}」");
-        Ok(pid)
+        log::info!(
+            target: "firstrun",
+            "首次运行已完成（默认基线：无 hosts / 无代理 / 无自定义 DNS）"
+        );
+        Ok(())
     })
     .await?;
     crate::cmd::after_change(&app);
-    Ok(id)
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 静默提权通道（Windows：计划任务版；安全边界见 elevation_task.rs 的模块说明）
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Clone, Debug)]
+pub struct SilentElevationStatus {
+    /// 本平台是否支持静默提权（两个平台都支持，只是实现不同）
+    pub supported: bool,
+    /// 是否处于启用状态（Windows = 配置开关；macOS = 装好助手即启用）
+    pub enabled: bool,
+    /// 通道是否已装好（Windows = 计划任务指向当前 exe；macOS = LaunchDaemon plist 存在）
+    pub installed: bool,
+    /// 界面上这条通道叫什么（「静默提权通道」/「免密提权助手」）
+    pub noun: String,
+    /// 状态说明（直接给界面显示，平台差异由后端收口，前端不判断平台）
+    pub detail: String,
+}
+
+fn silent_status() -> SilentElevationStatus {
+    let installed = crate::elevation_task::is_installed();
+    let enabled = crate::elevation_task::enabled();
+    SilentElevationStatus {
+        supported: crate::elevation_task::supported(),
+        enabled,
+        installed,
+        noun: crate::elevation_task::noun().to_string(),
+        detail: crate::elevation_task::detail(installed, enabled),
+    }
+}
+
+#[tauri::command]
+pub async fn silent_elevation_status() -> Result<SilentElevationStatus> {
+    crate::cmd::blocking(|| Ok(silent_status())).await
+}
+
+#[tauri::command]
+pub async fn silent_elevation_install(
+    app: AppHandle,
+    state: State<'_, SharedState>,
+) -> Result<SilentElevationStatus> {
+    let s: Arc<_> = state.inner().clone();
+    crate::cmd::blocking(move || {
+        s.assert_writable()?;
+        // Windows：注册一个 `RL HIGHEST` 的计划任务本身就需要管理员 → 交给提权子进程
+        //          （若通道已经装好，这一步会复用静默路径，不会再弹 UAC）
+        #[cfg(target_os = "windows")]
+        crate::elevation::run_elevated(
+            "silent_install",
+            serde_json::json!({}),
+            crate::elevation::TASK_TIMEOUT,
+        )?;
+        // macOS：安装常驻助手自带 osascript 提权（一次性输密码），不需要再套一层
+        #[cfg(target_os = "macos")]
+        crate::elevation_task::install()?;
+        s.with_cfg_mut(|c| {
+            c.settings.silent_elevation = true;
+            Ok(())
+        })?;
+        s.save_cfg()?;
+        Ok(())
+    })
+    .await?;
+    // 安装发生在子进程 / 外部命令里，父进程侧把缓存与开关同步过来
+    crate::elevation_task::invalidate_cache();
+    crate::elevation_task::set_enabled(true);
+    let st = crate::cmd::blocking(|| Ok(silent_status())).await?;
+    crate::cmd::after_change(&app);
+    Ok(st)
+}
+
+#[tauri::command]
+pub async fn silent_elevation_uninstall(
+    app: AppHandle,
+    state: State<'_, SharedState>,
+) -> Result<SilentElevationStatus> {
+    let s: Arc<_> = state.inner().clone();
+    crate::cmd::blocking(move || {
+        s.assert_writable()?;
+        #[cfg(target_os = "windows")]
+        crate::elevation::run_elevated(
+            "silent_uninstall",
+            serde_json::json!({}),
+            crate::elevation::TASK_TIMEOUT,
+        )?;
+        #[cfg(target_os = "macos")]
+        crate::elevation_task::uninstall()?;
+        s.with_cfg_mut(|c| {
+            c.settings.silent_elevation = false;
+            Ok(())
+        })?;
+        s.save_cfg()?;
+        Ok(())
+    })
+    .await?;
+    crate::elevation_task::invalidate_cache();
+    crate::elevation_task::set_enabled(false);
+    let st = crate::cmd::blocking(|| Ok(silent_status())).await?;
+    crate::cmd::after_change(&app);
+    Ok(st)
 }
 
 #[cfg(test)]

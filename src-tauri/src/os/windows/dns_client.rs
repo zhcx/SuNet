@@ -23,6 +23,8 @@ use crate::os::winapi::{
 };
 use serde::{Deserialize, Serialize};
 use std::os::windows::process::CommandExt;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
 use winreg::RegKey;
 
@@ -232,8 +234,52 @@ impl SocketAddress {
     }
 }
 
-/// 枚举网卡（含 DNS 状态）。纯内存读取，毫秒级；不再受 PowerShell 冷启动影响。
+/// 网卡枚举缓存（与 macOS 侧对齐）：UI 会在极短时间内连续调用
+/// `dns_interfaces` / `dns_get` / `dns_v6_ready`，每次都要重走 GAA 并逐个网卡读注册表。
+/// 写入（set / reset）后立即失效，保证写后回读拿到新值。
+const CACHE_TTL: Duration = Duration::from_secs(2);
+
+type CacheCell = Mutex<Option<(Instant, Vec<NetInterface>)>>;
+
+fn cache() -> &'static CacheCell {
+    static CACHE: OnceLock<CacheCell> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// 使网卡枚举缓存失效（DNS 写入后必须调用）
+pub fn invalidate_cache() {
+    if let Ok(mut c) = cache().lock() {
+        *c = None;
+    }
+}
+
+fn cache_get() -> Option<Vec<NetInterface>> {
+    let c = cache().lock().ok()?;
+    let (at, list) = c.as_ref()?;
+    if at.elapsed() <= CACHE_TTL {
+        Some(list.clone())
+    } else {
+        None
+    }
+}
+
+fn cache_put(list: &[NetInterface]) {
+    if let Ok(mut c) = cache().lock() {
+        *c = Some((Instant::now(), list.to_vec()));
+    }
+}
+
+/// 枚举网卡（含 DNS 状态），带短 TTL 缓存。纯内存读取，毫秒级；不受 PowerShell 冷启动影响。
 pub fn list_interfaces() -> Result<Vec<NetInterface>> {
+    if let Some(list) = cache_get() {
+        return Ok(list);
+    }
+    let list = enumerate_interfaces()?;
+    cache_put(&list);
+    Ok(list)
+}
+
+fn enumerate_interfaces() -> Result<Vec<NetInterface>> {
     let adapters = unsafe { gaa_adapters() }?;
 
     let mut out = Vec::new();
@@ -539,6 +585,7 @@ pub fn set(alias: &str, family: AddressFamily, servers: &[String]) -> Result<()>
         family.label(),
         list.join(",")
     );
+    invalidate_cache();
     Ok(())
 }
 
@@ -567,6 +614,7 @@ pub fn reset(alias: &str, family: Option<AddressFamily>) -> Result<()> {
         iface.alias,
         family.map(|f| f.label().to_string()).unwrap_or_else(|| "全部".into())
     );
+    invalidate_cache();
     Ok(())
 }
 

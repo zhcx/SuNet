@@ -23,6 +23,11 @@ const KNOWN_TASKS: &[&str] = &[
     "proxy_restore",
     "proxy_clear",
     "probe",
+    // 批处理外壳：内部只允许上面这些子任务，且不允许嵌套自己
+    "batch",
+    // 静默提权通道的安装 / 卸载（仅 Windows 有效；必须在提权进程里执行）
+    "silent_install",
+    "silent_uninstall",
 ];
 
 pub struct TaskArgs {
@@ -124,6 +129,8 @@ pub fn run_and_exit(args: TaskArgs) -> i32 {
 /// 固定函数表分派（不做动态求值）
 pub fn execute(task: &str, data: &Value) -> TaskOutput {
     match task {
+        // 批处理：一次提权跑多个子任务（见 batch 的说明）
+        "batch" => batch(data),
         "probe" => TaskOutput::ok().with_step(ApplyStep {
             kind: "probe".into(),
             applied: true,
@@ -150,10 +157,99 @@ pub fn execute(task: &str, data: &Value) -> TaskOutput {
         "proxy_write" => proxy_write(data),
         "proxy_restore" => proxy_restore(data),
         "proxy_clear" => proxy_clear(),
+        // ── 静默提权通道（Windows 计划任务）的安装 / 卸载 ──
+        // 装/删一个 `RL HIGHEST` 的计划任务本身就需要管理员，所以只能在提权进程里做。
+        "silent_install" | "silent_uninstall" => silent_channel(task == "silent_install"),
         other => TaskOutput::fail(
             AppError::coded(E1004).with_detail(format!("未知任务名：{other}")),
         ),
     }
+}
+
+/// 静默提权通道（Windows 计划任务）的安装 / 卸载。
+///
+/// 装上之后，hosts / DNS 的写入不再需要逐次 UAC（见 `elevation_task.rs`）。
+/// 非 Windows 平台没有这条通道，`elevation_task::install` 会返回「仅 Windows 可用」。
+fn silent_channel(install: bool) -> TaskOutput {
+    let r = if install {
+        crate::elevation_task::install()
+    } else {
+        crate::elevation_task::uninstall()
+    };
+    match r {
+        Ok(msg) => TaskOutput::ok().with_step(ok_step("elevation", msg)),
+        Err(e) => {
+            let mut out = TaskOutput::fail(e.clone());
+            out.steps.push(bad_step("elevation", e.to_string()));
+            out
+        }
+    }
+}
+
+/// batch：把一串子任务按顺序放进**同一个提权进程**里执行。
+///
+/// 动机：一次方案切换要写 hosts 与 DNS 两层，而两层都必须提权 —— 原先各起一个提权
+/// 进程，Windows 上就是连着弹两次 UAC。合并后只起一次；子任务顺序与父进程原先的
+/// 逐层调用顺序完全一致，失败即停（与父进程 short-circuit 的语义一致），已完成
+/// 的步骤照实上报，父进程据此判断哪些层已落地、要回滚哪些层。
+///
+/// 安全约束：子任务仍然只能来自 [`KNOWN_TASKS`] 白名单，且**禁止嵌套 batch** ——
+/// 否则一个载荷就能把子进程拖进自增递归。
+fn batch(data: &Value) -> TaskOutput {
+    let Some(ops) = data["ops"].as_array() else {
+        return TaskOutput::fail(AppError::coded(E1004).with_detail("缺少 ops 数组"));
+    };
+    if ops.is_empty() {
+        return TaskOutput::fail(AppError::coded(E1004).with_detail("ops 为空"));
+    }
+
+    let mut out = TaskOutput::ok();
+    for op in ops {
+        let name = match op["task"].as_str() {
+            Some(n) => n,
+            None => {
+                return TaskOutput::fail(AppError::coded(E1004).with_detail("op 缺少 task 字段"))
+            }
+        };
+        if name == "batch" || !KNOWN_TASKS.contains(&name) {
+            return TaskOutput::fail(
+                AppError::coded(E1004).with_detail(format!("batch 不接受子任务：{name}")),
+            );
+        }
+        let sub = op.get("data").cloned().unwrap_or(Value::Null);
+        let TaskOutput {
+            ok,
+            steps: sub_steps,
+            extra,
+            error,
+            ..
+        } = execute(name, &sub);
+        if !extra.is_null() {
+            out.extra = extra;
+        }
+        let reported = sub_steps.len();
+        out.steps.extend(sub_steps);
+        if !ok {
+            // 失败即停：后面的层一步都不执行，父进程按已上报的步骤决定回滚。
+            //
+            // 个别子任务在「载荷本身不合法」时会直接失败、一条步骤都不上报
+            // （例如 proxy_restore 的 state 解析失败）—— 这里补一条，
+            // 保证每次失败都能在报告里看到，也让「已上报步骤数」这个信号可靠：
+            // 父进程正是靠它反推哪些层已经落地。
+            if reported == 0 {
+                let why = error
+                    .as_ref()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "未知错误".to_string());
+                out.steps
+                    .push(bad_step("batch", format!("子任务 {name} 失败：{why}")));
+            }
+            out.ok = false;
+            out.error = error;
+            break;
+        }
+    }
+    out
 }
 
 fn ok_step(kind: &str, msg: impl Into<String>) -> ApplyStep {
@@ -434,5 +530,39 @@ mod tests {
         for t in ["proxy_write", "proxy_restore", "proxy_clear"] {
             assert!(KNOWN_TASKS.contains(&t), "{t} 不在白名单里");
         }
+    }
+
+    /// 批处理：失败即停，且已完成的步骤必须上报（父进程靠它决定回滚哪些层）。
+    /// 这里刻意用「载荷非法因而在碰系统之前就失败」的子任务，避免测试动真实系统配置。
+    #[test]
+    fn batch_stops_at_first_failure_and_reports_steps() {
+        let out = execute(
+            "batch",
+            &serde_json::json!({
+                "ops": [
+                    { "task": "proxy_restore", "data": { "state": 42 } },
+                    { "task": "proxy_restore", "data": { "state": 43 } }
+                ]
+            }),
+        );
+        assert!(!out.ok);
+        assert_eq!(out.steps.len(), 1, "第一个子任务失败后必须停止（第二个不得执行）");
+        assert_eq!(out.steps[0].kind, "batch", "子任务未上报步骤时要补一条失败步骤");
+        assert_eq!(out.error.unwrap().code, E1004);
+    }
+
+    /// 嵌套 batch 与白名单外的子任务都必须被拒（否则载荷能把子进程拖进自增递归）
+    #[test]
+    fn batch_rejects_nesting_and_unknown_tasks() {
+        let nested = execute("batch", &serde_json::json!({ "ops": [ { "task": "batch" } ] }));
+        assert!(!nested.ok);
+        assert_eq!(nested.error.unwrap().code, E1004);
+
+        let unknown = execute("batch", &serde_json::json!({ "ops": [ { "task": "rm_rf" } ] }));
+        assert!(!unknown.ok);
+        assert_eq!(unknown.error.unwrap().code, E1004);
+
+        let empty = execute("batch", &serde_json::json!({ "ops": [] }));
+        assert!(!empty.ok);
     }
 }

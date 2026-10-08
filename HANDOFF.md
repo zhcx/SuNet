@@ -17,9 +17,10 @@ npm run check                   # 前端类型检查
 cd src-tauri && cargo test      # 本机平台跑自己那份单测（Windows 55 项，纯逻辑，不碰系统）
 
 # macOS（需要 Xcode Command Line Tools）
-npm run tauri -- build -- --target universal-apple-darwin --bundles dmg
+npm run tauri -- build -- --target aarch64-apple-darwin --bundles dmg   # Apple Silicon
+npm run tauri -- build -- --target x86_64-apple-darwin --bundles dmg    # Intel
 
-# 发布：打 tag 即出包（Windows NSIS+MSI、macOS 通用 dmg，同一个 Release）
+# 发布：打 tag 即出包（Windows NSIS+MSI、macOS 两种架构各一份 dmg，同一个 Release）
 git tag v0.0.1 && git push origin v0.0.1
 ```
 
@@ -32,6 +33,19 @@ git tag v0.0.1 && git push origin v0.0.1
 > 共用层按平台分叉（新增 `proxy_ops.rs`、`proxy_write_needs_root()`、`flush_needs_root()`、`critsec.rs` 的 flock 分支）；
 > 前端新增 `src/platform.ts`（唯一平台真源，给 `<html>` 打 `data-os`）；**版本号保持 `0.0.1`**（macOS 支持并入同一版本，与 Release tag 对齐）；CI 加 macOS job。
 > Windows 侧逻辑未变。细节见 §4.19 与 §6.4。
+> 2026-10-08 首启与托盘口径：首启不再弹「保存原始设置」引导（默认基线 = 不写 hosts / 不开代理 / 不改 DNS）；托盘 tooltip、托盘菜单项与快捷面板徽标统一为 `effective_headline`（无活动方案时按真实生效状态显示「自定义设置」或「默认 · 直连」）。细节见 §4.16.2 与设计方案 §15.1。
+> 2026-10-08 权限与性能专项：
+> · **权限** —— `is_elevated()` 进程内 memoize；提权子进程 `SW_HIDE`（不再闪窗）；`apply()` 增加 **no-op 剪枝**（`prune_satisfied`）：已经是目标状态的 hosts / DNS 层不再下发，于是切到「默认 · 直连」或任何已达成方案时**不会再白弹 UAC**。
+> · **性能** —— 托盘主题轮询 1s→5s（macOS 的 `taskbar_is_light()` 每秒会 fork 一个 `defaults` 进程）；`notify::send` 只有非 Info 才刷新托盘；`get_app_state` 的代理状态只读一次；Windows 网卡枚举加 2s 缓存（写后失效，与 macOS 对齐）；主窗口标签栏只构建一次、方案下拉仅在集合变化时重建、同页刷新不再闪「加载中…」并保住滚动位置；快捷面板高度未变不再发 resize IPC；`ui.openModal` 关闭时移除 Esc 监听（修掉监听累积泄漏）。
+> · **UI** —— `.chip*` 的飞行面板样式收敛到 `.flyout` 作用域（原先未限定，会按源码顺序全局覆盖主窗口的方案 chip 样式）。
+> 2026-10-08 三项推进（提权合并 / 静默提权 / 深刷新合并）：
+> · **合并提权**：`apply()` 把 hosts + DNS 合并进**同一个提权子进程**（新任务 `batch`，见 `task_runner.rs`）—— Windows 上「切一次方案弹两次 UAC」变成一次。顺序调整为 **proxy → hosts+DNS**，于是回滚逆序 = dns → hosts → proxy，正好符合"先恢复解析层、再恢复传输层"的文档口径（旧顺序 hosts→proxy→dns 的逆序与口径相悖）；代理失败时也就不用回滚任何提权层了。新增 `elevation::run_elevated_raw`：批处理要靠子进程上报的**部分步骤**决定回滚哪些层，所以不能把 `!ok` 直接转成 `Err`。回滚路径仍逐层调用（失败路径，暂未合并）。
+> · **静默提权通道（Windows，默认关）**：新增 `src-tauri/src/elevation_task.rs` —— 用户显式安装后注册一个 `RL HIGHEST` 的计划任务 `SuNet-SilentElevation`（动作是 `SuNet.exe --silent-worker`），此后的写入只需 `schtasks /Run` 触发，**不再弹 UAC**；工作进程读走 `SuNet/ipc` 里 60 秒内新写下的载荷（仍要过 `verify_payload_file` 的属主/形状/非符号链接校验与任务白名单），做完即退、不常驻、不建托盘。任何一步失败都自动回退 `runas`。**安全边界（已在模块头写清）**：它等价于"一次授权、长期有效"，任何以该用户身份运行的代码都能触发 → 因此**默认关闭**、必须在「设置 → 提权」里显式安装；卸载后立即恢复逐次 UAC。
+> · **深刷新合并**：`main.ts` 的 `refreshState` 把同一时间窗内的多次刷新合并成一次（一次操作原本会连着触发 2–3 遍整页重渲），期间提出的 deep 请求补跑一次；DNS 预设搜索加 120ms 防抖。
+> 2026-10-08 macOS 同步（静默提权做成两平台统一）：
+> · 上面那条「静默提权通道」不再只有 Windows 有实现 —— `elevation_task.rs` 现在是三个实现：`imp`（Windows，计划任务）、**`macos_impl`（macOS，映射到常驻 root 助手）**、`unsupported`（兜底）。`noun()/detail()` 由后端按平台给文案，前端不做平台判断，于是「设置 → 提权」的按钮在两个平台都可用：Windows 显示「安装静默提权通道」，macOS 显示「安装免密提权助手」。
+> · **补上的真实缺口**：macOS 的常驻助手此前**只有命令行入口**（`SuNet --helper-install` / `--helper-uninstall` / `--helper-status`，见 `main.rs` 的 `helper_entry`），界面上装不了。现在 `elevation::run_self_command_elevated(&["--helper-install"])` 用 `osascript ... with administrator privileges` 跑这条自身子命令（不改 `--task` 协议、不接受任意命令、不计 timeout），设置页可一键安装/卸载。
+> · 其余两项（`batch` 合并提权、刷新合并、no-op 剪枝、memoize、主题轮询降频等）本来就写在共享代码里，macOS 同样生效；`batch` 在 macOS 上可用是因为 helper 守护进程也是调 `task_runner::execute`（见 `helper/daemon.rs`），无需另做适配。
 
 | 事实 | 值 |
 |---|---|
@@ -42,8 +56,8 @@ git tag v0.0.1 && git push origin v0.0.1
 | 配置 schema | `schema_version = 1`（迁移表在 `migrate.rs`） |
 | 单测 | 源码共 **66** 个 `#[test]`（覆盖 hosts 编解码/幂等、预设地址、订阅校验、迁移、脱敏、hex、IPC 映射、热键直连切换目标选择、快捷键键名收敛与非法组合拒绝、DNS/代理解析与 `pick_in_use`）；其中平台专属 macOS 11 / Windows 7，各自只编译自己那份 → **Windows 实测 55**，macOS 预期 59 |
 | 前端产物 | index.html + quick.html 双入口，约 98 KB JS / 25 KB CSS（压缩后 gzip 约 31 KB） |
-| 生产包体积 | Windows：`SuNet.exe` 6.2 MB（不含 WebView2，用系统自带）；NSIS 安装包 `SuNet_<版本>_x64-setup.exe` 约 2.2 MB（`target/release/bundle/nsis/`），MSI 在 `bundle/msi/`。macOS：`SuNet_<版本>_universal.dmg`（ad-hoc 签名，未公证） |
-| 发布流水线 | `.github/workflows/release.yml`：tag `v*` → `windows`（nsis+msi）→ `macos`（universal dmg）→ `readme`（把 CHANGELOG 对应段落与平台表写回 README 并提交）；三个 job 串行、共用同一个 Release |
+| 生产包体积 | Windows：`SuNet.exe` 6.2 MB（不含 WebView2，用系统自带）；NSIS 安装包 `SuNet_<版本>_x64-setup.exe` 约 2.2 MB（`target/release/bundle/nsis/`），MSI 在 `bundle/msi/`。macOS：`SuNet_<版本>_aarch64.dmg` / `SuNet_<版本>_x86_64.dmg`（ad-hoc 签名，未公证；此前 universal 包约 5.8 MB） |
+| 发布流水线 | `.github/workflows/release.yml`（结构参考同作者的 zeditor）：tag `v*` → `prepare-release`（先建 Release，说明取自 CHANGELOG）→ `build` matrix 并行（Windows nsis+msi；macOS aarch64 / x86_64 各一份 dmg，`fail-fast: false`）→ `readme`（把平台表与版本号写回 README 并提交）；各构建 job 只依赖 `prepare-release`，平台之间互不连坐 |
 
 ---
 
@@ -167,6 +181,7 @@ Tauri 靠 CLI 设的环境变量决定用 `devUrl` 还是内嵌 `frontendDist`�
 `powershell.exe`（加载 NetAdapter/DnsClient 模块）在本机实测 **约 3.0–3.1s/次**（不是交接初期估计的 0.5–1.5s）。
 网卡枚举曾遍布状态聚合、DNS 页、写入前白名单校验、主窗口每次打开的 first_run_report，
 是"整个软件反应极慢"的主因。现状：枚举走 `GetAdaptersAddresses`（纯内存读，毫秒级）；
+`first_run_report` 已于 2026-10-08 随首启引导一并删除，主窗口打开不再做任何枚举；
 `Set-DnsClientServerAddress` **已被弃用**（见 §4.14），写入/还原走 netsh 分族命令。
 
 ### 4.14 DNS 写入路径：Set-DnsClientServerAddress 没有 -AddressFamily（2026-10-07 实测踩出）
@@ -251,11 +266,16 @@ Hyper-V 的 vEthernet 报 IfType=6（会被 if_type∈{6,71} 的物理近似误�
   **整体替换** `c.settings` —— 「先点应用、再点保存」会把刚改好的热键写回旧值（改绑静默回滚）。
 - 界面显示的键帽只是展示（`GLYPH` 把 `Minus` 显示成 `-`、`ArrowUp` 显示成 `↑`），**配置里存的永远是规范名**。
 
-### 4.16.2 主界面不再显示「未启用任何方案」
-`active_profile_id` 为 `None` 时，顶部下拉与方案页现在都显示内置「默认 · 直连」
+### 4.16.2 不再显示「未启用任何方案」（2026-10-08 全量统一）
+`active_profile_id` 为 `None` 时，顶部下拉与方案页显示内置「默认 · 直连」
 （`main.ts::renderHeader` 删掉了空 value 选项 —— 它还会让 `select.value=""` 把「切换」按钮永久置灰）。
-**注意 `src-tauri/src/tray.rs` 里还有三处「未启用任何方案」（托盘菜单项 / tooltip）本次未改**，
-行为不一致是已知的，要统一时记得改这三处。
+托盘侧原先还残留「未启用任何方案」：tooltip 与托盘菜单项（`tray.rs`）、快捷面板状态徽标
+（`quick.ts`）。2026-10-08 起三处统一为同一口径 `effective_headline`：
+1. 有活动方案 → 方案名；
+2. 没有活动方案，但三层里有实际生效的（代理开着 / 有托管 hosts 条目 / DNS 手动）→ 「自定义设置」；
+3. 都没有 → 「默认 · 直连」。
+
+用户手动开启设置（托盘开关代理、直接应用 hosts/DNS）后，不再被错误提示成"未启用方案"。
 
 ### 4.17 热键切换后界面不刷新（2026-10-07 用户实测报出）
 现象：按热键切到内置「默认 · 直连」，**代理确实被清掉了，但主窗口顶部下拉与快捷面板仍显示切换前的方案**。
@@ -475,13 +495,13 @@ WinHTTP 代理、PAC 代理模式、TUN/虚拟网卡、hosts 通配符规则、�
 1. `osascript` 提权路径的取消/失败判定，以及"取消后不留半套配置"（靠 `apply.rs` 的回滚）。
 2. 常驻助手的安装/鉴权/卸载：BTM 是否拦 `bootstrap system`、socket peer uid 校验、卸载残留。
 3. `pick_in_use()` 的服务选择：只有 Wi-Fi、或 Wi-Fi + 有线同时在用时，写到的服务是否是用户实际在用的那个。
-4. 通用二进制（`--target universal-apple-darwin`）与 dmg 产物、ad-hoc 签名后的 Gatekeeper 提示。
+4. 按架构构建的 dmg 产物（`--target aarch64-apple-darwin` / `x86_64-apple-darwin`）、ad-hoc 签名后的 Gatekeeper 提示。
 5. 前端 `data-os="macos"` 的样式/文案分支是否完整（自绘按钮隐藏、顶栏留白、授权文案）。
 
-**本机验证边界**：本机没有 macOS，交叉检查也做不了 —— 没有 `cc`，`cargo check --target aarch64-apple-darwin` 会死在 `objc2-exception-helper` 的 build script（`failed to find tool "cc"`）。所以"macOS 能不能编译"只能由 CI 回答（**CI 已给出答案：能编译、59 项单测通过、universal dmg 能出，见 §5.1**）；本地能保证的只有 `rustfmt --edition 2021 --check` 无语法错误 + Windows 侧 `cargo test` 不回归。
+**本机验证边界**：本机没有 macOS，交叉检查也做不了 —— 没有 `cc`，`cargo check --target aarch64-apple-darwin` 会死在 `objc2-exception-helper` 的 build script（`failed to find tool "cc"`）。所以"macOS 能不能编译"只能由 CI 回答（**CI 已给出答案：能编译、59 项单测通过、dmg 能出——当时为 universal 构建，见 §5.1**）；本地能保证的只有 `rustfmt --edition 2021 --check` 无语法错误 + Windows 侧 `cargo test` 不回归。
 
 **Mac 实测清单（拿到 mac 后按顺序跑）**
-1. `npm ci` → `npm run tauri -- build -- --target universal-apple-darwin --bundles dmg` → 装 dmg（首次要在「系统设置 → 隐私与安全性」放行）。
+1. `npm ci` → `npm run tauri -- build -- --target aarch64-apple-darwin --bundles dmg`（Intel 机器换 `x86_64-apple-darwin`）→ 装 dmg（首次要在「系统设置 → 隐私与安全性」放行）。
 2. `cd src-tauri && cargo test` → 预期 **59 项**（66 − 7 项 Windows 专属）。
 3. 启动三态冒烟：裸启 / `--minimized` / `--panel`；日志无 error；托盘菜单与 ⌘ 组合热键可用。
 4. hosts：写入 → `cat /etc/hosts` 看托管区块 → 还原 → 区块消失；`ls -l /etc/hosts` 应为 `root wheel` `0644`。

@@ -257,16 +257,21 @@ export async function renderDns(root: HTMLElement, ctx: TabCtx): Promise<void> {
     await loadCurrent();
     updatePreview();
   });
+  // 搜索输入防抖：预设表可能很长，逐键重建整份列表既费 DOM 也费布局
+  let searchTimer: number | undefined;
   $<HTMLInputElement>("#dn-search").addEventListener("input", (ev) => {
     const q = (ev.target as HTMLInputElement).value.toLowerCase();
-    currentList = presets.filter(
-      (p) =>
-        p.name.toLowerCase().includes(q) ||
-        p.note.toLowerCase().includes(q) ||
-        p.v4.some((a) => a.includes(q)) ||
-        p.v6.some((a) => a.includes(q)),
-    );
-    renderPresets(currentList);
+    if (searchTimer !== undefined) window.clearTimeout(searchTimer);
+    searchTimer = window.setTimeout(() => {
+      currentList = presets.filter(
+        (p) =>
+          p.name.toLowerCase().includes(q) ||
+          p.note.toLowerCase().includes(q) ||
+          p.v4.some((a) => a.includes(q)) ||
+          p.v6.some((a) => a.includes(q)),
+      );
+      renderPresets(currentList);
+    }, 120);
   });
   $<HTMLInputElement>("#dn-v4").addEventListener("input", (ev) => {
     draft.v4 = (ev.target as HTMLInputElement).value;

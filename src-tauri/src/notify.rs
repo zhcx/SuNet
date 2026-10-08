@@ -80,12 +80,14 @@ pub fn send(
         log::info!(target: "notify", "前端未接收通知事件，降级为托盘 tooltip 前缀");
     }
 
+    // 只有非 Info 才会置「未读警告」标记，进而改变托盘 tooltip 的「⚠ 」前缀；
+    // Info 通知（后台完成等）不影响托盘状态，跳过刷新省掉一次整份 hosts 读盘。
     if level != Level::Info {
         if let Some(state) = app.try_state::<crate::state::AppState>() {
             state.mark_warn_unread();
         }
+        crate::tray::refresh(app);
     }
-    crate::tray::refresh(app);
 }
 
 pub fn action(label: &str, action: &str) -> NotifyAction {

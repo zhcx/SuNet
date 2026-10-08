@@ -8,7 +8,7 @@
 //!      菜单弹出前重新读真实状态，保证"菜单说开着、实际已经关了"不可能出现
 
 use crate::error::AppError;
-use crate::os::system_proxy;
+use crate::os::system_proxy::{self, ProxyState};
 use crate::state::AppState;
 use serde::Serialize;
 use tauri::image::Image;
@@ -445,6 +445,16 @@ pub fn status(app: &AppHandle) -> TrayStatus {
 /// 与 status 相同，但 hosts 条目数由调用方提供。
 /// get_app_state 已经为 hosts_pending 读过一次文件，避免同样的内容读两遍。
 pub fn status_with_hosts(app: &AppHandle, hosts_enabled_entries: usize) -> TrayStatus {
+    status_with(app, hosts_enabled_entries, system_proxy::read().ok())
+}
+
+/// 与 `status_with_hosts` 相同，但代理状态也由调用方提供：
+/// `get_app_state` 本来就要返回 `proxy` 字段，读一次即可，没必要再读第二遍。
+pub fn status_with(
+    app: &AppHandle,
+    hosts_enabled_entries: usize,
+    proxy: Option<ProxyState>,
+) -> TrayStatus {
     let mut out = TrayStatus::default();
     if let Some(state) = app.try_state::<AppState>() {
         if let Ok(cfg) = state.cfg_clone() {
@@ -465,8 +475,8 @@ pub fn status_with_hosts(app: &AppHandle, hosts_enabled_entries: usize) -> TrayS
         out.dns_v6 = "自动(v6)".into();
     }
     out.hosts_count = hosts_enabled_entries;
-    match system_proxy::read() {
-        Ok(p) => {
+    match proxy {
+        Some(p) => {
             out.proxy_on = p.is_on();
             out.proxy = if p.pac_present {
                 "代理 PAC".into()
@@ -479,7 +489,7 @@ pub fn status_with_hosts(app: &AppHandle, hosts_enabled_entries: usize) -> TrayS
                 "代理 关闭".into()
             };
         }
-        Err(_) => out.proxy = "代理 未知".into(),
+        None => out.proxy = "代理 未知".into(),
     }
     out
 }
@@ -512,14 +522,28 @@ pub fn remember_dns(app: &AppHandle, alias: &str) {
     }
 }
 
+/// 生效状态标题（与主界面「当前生效」同一口径，见 src/tabs/profiles.ts）：
+///   1. 有活动方案 → 方案名；
+///   2. 没有活动方案，但三层里已有实际生效的（代理开着 / 有托管 hosts 条目 /
+///      DNS 手动）→ 「自定义设置」——这些是用户手动改过的，不能再报「未启用方案」；
+///   3. 都没有 → 回落内置直连（它本身就是真实生效状态）。
+fn effective_headline(s: &TrayStatus) -> String {
+    if let Some(name) = s.profile_name.as_ref() {
+        return name.clone();
+    }
+    let dns_manual = !s.dns_v4.contains("自动") || !s.dns_v6.contains("自动");
+    if s.proxy_on || s.hosts_count > 0 || dns_manual {
+        "自定义设置".to_string()
+    } else {
+        "默认 · 直连".to_string()
+    }
+}
+
 /// Tooltip 文案（§5.4.2）：单行、`·` 分隔、固定字段顺序、≤127 字符，
 /// 超长时截断 DNS 部分而不截断代理 —— 代理是唯一会"全局断网"的层
 pub fn tooltip_text(s: &TrayStatus) -> String {
     let mut parts = Vec::new();
-    parts.push(match &s.profile_name {
-        Some(n) => n.clone(),
-        None => "未启用任何方案".to_string(),
-    });
+    parts.push(effective_headline(s));
     parts.push(s.proxy.clone());
     parts.push(s.dns_v4.clone());
     parts.push(s.dns_v6.clone());
@@ -558,10 +582,7 @@ fn refresh_now(app: &AppHandle) {
         let _ = tray.set_tooltip(Some(tooltip_text(&s)));
     }
     if let Some(handles) = app.try_state::<TrayHandles>() {
-        let _ = handles.status.set_text(format!(
-            "当前：{}",
-            s.profile_name.clone().unwrap_or_else(|| "未启用任何方案".into())
-        ));
+        let _ = handles.status.set_text(format!("当前：{}", effective_headline(&s)));
         let _ = handles.proxy.set_checked(s.proxy_on);
         let _ = handles.autostart.set_checked(s.autostart_enabled);
     }

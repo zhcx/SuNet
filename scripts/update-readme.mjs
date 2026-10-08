@@ -56,7 +56,7 @@ const bodies = {
     '| 平台 | 安装包 | 状态 | 说明 |',
     '| --- | --- | --- | --- |',
     `| Windows 10 / 11 · x64 | \`SuNet_<版本>_x64-setup.exe\`（NSIS）、\`SuNet_<版本>_x64_en-US.msi\`（WiX），以及免安装的 \`SuNet_windows_x64.exe\` | ✅ 已支持 | 三件套（hosts / 系统代理 / DNS）全功能，托盘常驻与全局热键可用；安装包由 GitHub Actions 在打 tag 时自动构建，见 [Releases](${REPO_URL}/releases) |`,
-    `| macOS 10.15+ · Apple Silicon / Intel | \`SuNet_<版本>_universal.dmg\`（通用二进制，内含 \`SuNet.app\`） | ✅ 已支持（未签名） | 三件套（hosts / 系统代理 / DNS）与托盘、全局热键可用；写 hosts / 系统代理 / DNS 会弹一次系统授权框（输入登录密码，安装后台助手后免密码）；未做代码签名与公证，首次打开需在「系统设置 → 隐私与安全性」里放行，见 [Releases](${REPO_URL}/releases) |`,
+    `| macOS 10.15+ · Apple Silicon / Intel | \`SuNet_<版本>_aarch64.dmg\`（Apple Silicon）、\`SuNet_<版本>_x86_64.dmg\`（Intel），均内含 \`SuNet.app\` | ✅ 已支持（未签名） | 三件套（hosts / 系统代理 / DNS）与托盘、全局热键可用；写 hosts / 系统代理 / DNS 会弹一次系统授权框（输入登录密码，安装后台助手后免密码）；未做代码签名与公证，首次打开需在「系统设置 → 隐私与安全性」里放行，见 [Releases](${REPO_URL}/releases) |`,
     '| Linux | — | ❌ 未支持 | 平台层、托盘、全局热键与提权模型都需要重新设计 |',
   ].join('\n'),
 };

@@ -212,16 +212,18 @@ export function openModal(title: string, iconName: IconName = "gear"): { box: HT
   box.appendChild(h);
   back.appendChild(box);
   root.appendChild(back);
-  const close = () => back.remove();
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Escape") close();
+  };
+  // 关闭时必须把 document 上的 Esc 监听摘掉：否则每开一次弹层就永久残留一个，
+  // 长会话里按一次 Esc 会顺序触发所有残留闭包（内存与行为都会持续退化）
+  const close = () => {
+    document.removeEventListener("keydown", onKey);
+    back.remove();
+  };
   back.addEventListener("click", (e) => {
     if (e.target === back) close();
   });
-  const onKey = (e: KeyboardEvent) => {
-    if (e.key === "Escape") {
-      close();
-      document.removeEventListener("keydown", onKey);
-    }
-  };
   document.addEventListener("keydown", onKey);
   return { box, close };
 }

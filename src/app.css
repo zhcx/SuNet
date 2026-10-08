@@ -1667,13 +1667,16 @@ details.help summary {
   flex: 1;
 }
 
-.chip-row {
+/* 飞行面板专属的 chip 外观（更高、选中态更醒目）。
+   必须加 `.flyout` 作用域：这些选择器与主窗口「方案快捷 chip」（见上方 .chip-row）
+   同名，若不加限定会按源码顺序**全局覆盖**，把主窗口的 chip 也变成面板样式。 */
+.flyout .chip-row {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
 }
 
-.chip {
+.flyout .chip {
   height: 30px;
   padding: 0 12px;
   border-radius: var(--r-full);
@@ -1683,14 +1686,14 @@ details.help summary {
   color: var(--fg-muted);
 }
 
-.chip.active {
+.flyout .chip.active {
   background: var(--accent);
   border-color: transparent;
   color: var(--accent-fg);
   font-weight: 650;
 }
 
-.chip.add {
+.flyout .chip.add {
   padding: 0 10px;
   color: var(--fg-faint);
 }

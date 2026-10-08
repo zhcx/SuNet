@@ -44,15 +44,39 @@ function h(id: string): HTMLElement {
   return document.getElementById(id) as HTMLElement;
 }
 
+/**
+ * 正在进行的刷新。一次操作往往会连着触发好几路刷新（`sunet://report` 事件、
+ * 命令返回后的显式 ctx.refresh、托盘动作……），每路都整页重渲是纯浪费；
+ * 这里把同一时间窗内的刷新合并成一次，期间提出的 deep 请求补跑一次。
+ */
+let refreshing: Promise<void> | null = null;
+let refreshQueuedDeep = false;
+
 async function refreshState(deep = false): Promise<void> {
+  if (refreshing) {
+    refreshQueuedDeep = refreshQueuedDeep || deep;
+    return refreshing;
+  }
+  refreshing = (async () => {
+    try {
+      state = await api.getAppState();
+      ui.setElevated(state.prand.is_elevated);
+      renderHeader();
+      renderFooter();
+      if (deep) await renderActiveTab();
+    } catch (e) {
+      ui.toast("error", "无法读取程序状态", errText(e));
+    }
+  })();
   try {
-    state = await api.getAppState();
-    ui.setElevated(state.prand.is_elevated);
-    renderHeader();
-    renderFooter();
-    if (deep) await renderActiveTab();
-  } catch (e) {
-    ui.toast("error", "无法读取程序状态", errText(e));
+    await refreshing;
+  } finally {
+    refreshing = null;
+  }
+  // 刷新期间又被要求刷新过 → 合并成一次补跑（只补一次，不会自增）
+  if (refreshQueuedDeep) {
+    refreshQueuedDeep = false;
+    await refreshState(true);
   }
 }
 
@@ -90,14 +114,22 @@ function renderHeader(): void {
 
   const select = h("active-profile") as HTMLSelectElement;
   const prev = select.value;
-  select.innerHTML = "";
-  // 不再放「未启用任何方案」这种空选项：没有活动方案时直接显示内置直连（它才是真实状态），
-  // 而且空选项会让 select.value="" 把下面的「切换」按钮永久置灰。
-  for (const p of state.profiles) {
-    const o = document.createElement("option");
-    o.value = p.id;
-    o.textContent = p.is_builtin ? `${p.name}（内置）` : p.name;
-    select.appendChild(o);
+  // 只在「方案集合真的变了」时重建 <option>：状态刷新很频繁，每次都重建会把用户
+  // 正展开的下拉关掉、滚动位置也重置。
+  const sig = state.profiles
+    .map((p) => `${p.id}\u0000${p.name}\u0000${p.is_builtin ? 1 : 0}`)
+    .join("\u0001");
+  if (select.dataset.sig !== sig) {
+    select.innerHTML = "";
+    // 不再放「未启用任何方案」这种空选项：没有活动方案时直接显示内置直连（它才是真实状态），
+    // 而且空选项会让 select.value="" 把下面的「切换」按钮永久置灰。
+    for (const p of state.profiles) {
+      const o = document.createElement("option");
+      o.value = p.id;
+      o.textContent = p.is_builtin ? `${p.name}（内置）` : p.name;
+      select.appendChild(o);
+    }
+    select.dataset.sig = sig;
   }
   const wanted = state.active_profile_id ?? prev;
   const fallback = state.profiles.find((p) => p.is_builtin)?.id ?? state.profiles[0]?.id ?? "";
@@ -151,7 +183,15 @@ async function renderActiveTab(): Promise<void> {
   }
   const view = h("view");
   const tab = TABS.find((t) => t.id === activeTab) ?? TABS[0];
-  view.innerHTML = `<div class="empty">加载中…</div>`;
+  const sameTab = view.dataset.tab === activeTab;
+  // 只有「真的换页」才显示占位符：deep 刷新同一页时保留现有内容，
+  // 否则每次后台刷新都会闪一下"加载中…"（观感上的卡顿）
+  if (!sameTab) {
+    view.dataset.tab = activeTab;
+    view.innerHTML = `<div class="empty">加载中…</div>`;
+  }
+  // 同页刷新要保住滚动位置：后台刷新不该把用户正在看的地方弹回顶部
+  const keepScroll = sameTab ? view.scrollTop : 0;
   const ctx: TabCtx = {
     state,
     refresh: refreshState,
@@ -165,20 +205,38 @@ async function renderActiveTab(): Promise<void> {
       errText(e),
     )}</div></div>`;
   }
+  if (keepScroll && view.scrollTop !== keepScroll) {
+    // 临时关掉平滑滚动，否则恢复位置会被动画成"自己滑一下"
+    const prev = view.style.scrollBehavior;
+    view.style.scrollBehavior = "auto";
+    view.scrollTop = keepScroll;
+    view.style.scrollBehavior = prev;
+  }
   renderTabs();
 }
 
+let tabsBuilt = false;
+
 function renderTabs(): void {
   const nav = h("tabs");
-  ui.clear(nav);
-  for (const t of TABS) {
-    const btn = document.createElement("button");
-    btn.innerHTML = `${ic(t.icon)}<span>${t.label}</span>`;
-    btn.className = t.id === activeTab ? "active" : "";
-    btn.setAttribute("role", "tab");
-    btn.setAttribute("aria-selected", String(t.id === activeTab));
-    btn.addEventListener("click", () => navigate(t.id));
-    nav.appendChild(btn);
+  // 标签栏内容是静态的：只构建一次，之后仅切换 active 状态。
+  // 之前每次 deep 刷新都 ui.clear + 重建 5 个按钮并重新绑定事件，纯浪费。
+  if (!tabsBuilt) {
+    ui.clear(nav);
+    for (const t of TABS) {
+      const btn = document.createElement("button");
+      btn.dataset.tab = t.id;
+      btn.innerHTML = `${ic(t.icon)}<span>${t.label}</span>`;
+      btn.setAttribute("role", "tab");
+      btn.addEventListener("click", () => navigate(t.id));
+      nav.appendChild(btn);
+    }
+    tabsBuilt = true;
+  }
+  for (const btn of Array.from(nav.children) as HTMLElement[]) {
+    const on = btn.dataset.tab === activeTab;
+    btn.className = on ? "active" : "";
+    btn.setAttribute("aria-selected", String(on));
   }
 }
 
@@ -190,65 +248,21 @@ async function navigate(tab: string): Promise<void> {
 
 // ---------------- 首次运行（§15.1） ----------------
 
+/**
+ * 首次运行只做一件事：把「已完成引导」标记写回配置。
+ *
+ * 不再弹「把当前系统状态存成方案」的引导：默认基线就是干净的直连状态
+ * （不写 hosts、不开系统代理、不改 DNS），需要什么由用户主动开启。
+ * 也不再枚举网卡（旧的 first_run_report 是首屏变慢的主因之一，已随引导一并移除）。
+ */
 async function maybeFirstRun(): Promise<void> {
-  // 已初始化就完全不发这个请求：first_run_report 内部要枚举网卡（带子进程开销），
-  // 主窗口每次打开都为它阻塞数秒是启动慢的主要来源之一
   if (state?.initialized) return;
-  const report = await api.firstRunReport();
-  if (report.initialized) return;
-  const view = h("view");
-  activeTab = "profiles";
-  renderTabs();
-  view.innerHTML = `
-    <div class="card">
-      <h2>欢迎使用速网 SuNet</h2>
-      <p class="hint">检测到你的系统当前已有配置。速网不会在你主动操作前修改任何一项。</p>
-      <div class="kv"><span class="k">hosts</span><span>${
-        report.hosts_custom_lines > 0
-          ? `已有 ${report.hosts_custom_lines} 行自定义内容（不在本工具管理范围内，不会被改动）`
-          : "无自定义内容"
-      }${report.hosts_block_lines > 0 ? `，托管区块已有 ${report.hosts_block_lines} 条` : ""}</span></div>
-      <div class="kv"><span class="k">系统代理</span><span>${
-        report.proxy.pac_present
-          ? "已存在 PAC 配置（AutoConfigURL），速网不会在你动手前覆盖它"
-          : report.proxy.enable
-            ? `已开启（${ui.esc(report.proxy.server || "未知地址")}，来源可能是其他软件）`
-            : "未开启"
-      }</span></div>
-      <div class="kv"><span class="k">系统 DNS</span><span>${
-        report.dns.length
-          ? report.dns
-              .slice(0, 3)
-              .map(([alias, s]) => `${ui.esc(alias)}：${ui.esc(s)}`)
-              .join("；")
-          : "未检测到已连接网卡"
-      }</span></div>
-      <div class="section-title">接下来</div>
-      <p class="hint">把当前状态存成一个方案，你就有了一个「回到原点」的落点。</p>
-      <div class="actions">
-        <input type="text" id="first-run-name" placeholder="方案名称" value="当前配置（${new Date()
-          .toLocaleDateString("zh-CN")
-          .replace(/\//g, "-")}）" style="width:240px" />
-        <button class="primary" id="first-run-go">保存并开始使用</button>
-        <button id="first-run-skip">跳过</button>
-      </div>
-      <p class="hint" style="margin-top:8px">权限说明：${os.PERM_HINT}</p>
-    </div>`;
-
-  document.getElementById("first-run-skip")?.addEventListener("click", async () => {
-    await api.firstRunFinish("当前配置（未命名）");
-    await refreshState(true);
-  });
-  document.getElementById("first-run-go")?.addEventListener("click", async () => {
-    const name = (document.getElementById("first-run-name") as HTMLInputElement).value.trim();
-    try {
-      await api.firstRunFinish(name || null);
-      ui.toast("info", "已保存为方案", "可用它在任何时候回到当前状态");
-      await refreshState(true);
-    } catch (e) {
-      ui.toast("error", "保存失败", errText(e));
-    }
-  });
+  try {
+    await api.firstRunFinish();
+  } catch (e) {
+    // 标记失败（例如配置只读）不该挡住启动，下次启动再试
+    console.warn("首次运行标记失败：", errText(e));
+  }
 }
 
 // ---------------- 崩溃恢复提示（§6.3） ----------------
@@ -345,13 +359,9 @@ async function boot(): Promise<void> {
 
   renderTabs();
   await refreshState();
-  // 先渲染当前标签页再做首启检测：后者在"未初始化"时才需要跑，
-  // 若先跑它，主窗口首屏会在"加载中…"上卡住数秒（含网卡枚举开销）
-  if (state?.initialized) {
-    await renderActiveTab();
-  } else {
-    await maybeFirstRun();
-  }
+  // 首次运行只写一个「已完成引导」标记（不弹向导、不枚举网卡），然后照常渲染界面
+  await maybeFirstRun();
+  await renderActiveTab();
   await maybeCrashRecovery();
   // 订阅到期的同步与热键状态在启动后 2 秒内自查一次
   setTimeout(async () => {

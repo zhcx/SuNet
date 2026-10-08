@@ -107,6 +107,12 @@ function view(): View {
   };
 }
 
+/** 生效状态标题：口径与主界面 / 托盘一致 —— 没有活动方案时按真实生效状态显示 */
+function effectiveHeadline(v: View): string {
+  if (v.active) return v.active.name;
+  return v.proxyOn || v.hostsOn || v.dnsManual ? "自定义设置" : "默认 · 直连";
+}
+
 function render(): void {
   if (!state) return;
   const v = view();
@@ -125,7 +131,7 @@ function render(): void {
     </div>
 
     <div class="flyout-status">
-      <span class="badge plain">${v.active ? esc(v.active.name) : "未启用方案"}</span>
+      <span class="badge plain">${esc(effectiveHeadline(v))}</span>
       ${s.prand.is_elevated ? `<span class="badge ok plain">已提权</span>` : ""}
       ${s.runtime.dirty ? `<span class="badge warn plain">已改系统配置</span>` : ""}
       ${s.runtime.lock_contended ? `<span class="badge warn plain">另一进程写入中</span>` : ""}
@@ -155,6 +161,9 @@ function render(): void {
   fitHeight();
 }
 
+/** 上一次已生效的面板高度：用来避免高度没变时反复发窗口 resize IPC */
+let lastFitHeight = 0;
+
 /** 飞行面板贴内容：量出自然高度交给主进程调整窗口（底边不动） */
 function fitHeight(): void {
   const head = document.querySelector(".flyout-head") as HTMLElement | null;
@@ -176,7 +185,15 @@ function fitHeight(): void {
   const natural = Math.ceil(
     head.offsetHeight + status.offsetHeight + foot.offsetHeight + content + 2,
   );
-  void api.quickFit(natural).catch(() => undefined);
+  // 高度没变就不再发 IPC（每次操作结束都会走到这里）；只有真正生效才记下来，
+  // 失败时保留旧值以便下次重试。
+  if (natural === lastFitHeight) return;
+  void api
+    .quickFit(natural)
+    .then(() => {
+      lastFitHeight = natural;
+    })
+    .catch(() => undefined);
 }
 
 function themeLabel(): string {

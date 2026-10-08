@@ -14,6 +14,7 @@ use crate::config::{Config, Profile};
 use crate::elevation;
 use crate::error::{AppError, Result, E3001, E3002, E4002};
 use crate::ipc::ApplyStep;
+use crate::os::dns_client::DnsFamilyState;
 use crate::os::hosts_file::HostsEntry;
 use crate::os::system_proxy::{self, ProxyState};
 use crate::paths;
@@ -24,6 +25,8 @@ use serde_json::json;
 use std::time::Duration;
 
 const DNS_TASK_TIMEOUT: Duration = Duration::from_secs(60);
+/// 批处理（hosts + DNS 合并成一次提权）的超时：两层各自超时之和再留余量
+const BATCH_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Serialize, Clone, Debug)]
 pub struct ApplyReport {
@@ -136,6 +139,79 @@ pub fn build_targets(cfg: &Config, p: &Profile) -> ApplyTargets {
 }
 
 // ---------------------------------------------------------------------------
+// no-op 剪枝
+// ---------------------------------------------------------------------------
+
+/// 剪掉「当前已经是目标状态」的层。
+///
+/// 这些层写下去也只能是 no-op，却要为它提权一次 —— Windows 上就是白弹一个 UAC。
+/// 读当前状态不需要权限（FFI 枚举 + 读注册表/配置文件），所以这一步很便宜。
+fn prune_satisfied(targets: &ApplyTargets) -> ApplyTargets {
+    let mut out = targets.clone();
+
+    // hosts：目标是「清空托管区块」且当前本来就没有区块 → 无事可做
+    if out.hosts.as_ref().map_or(false, |e| e.is_empty()) {
+        if let Ok(st) = crate::os::hosts_file::stats() {
+            if !st.block_present && st.enabled_entries == 0 {
+                out.hosts = None;
+            }
+        }
+    }
+
+    // proxy：目标是「关闭」且当前本来就关着、也没有待还原的接管前快照 → 无事可做。
+    // 有快照时**不能剪**：关代理的语义是「按接管前的快照还原」，那一步可能反而是打开。
+    if let Some(p) = out.proxy.as_ref() {
+        if !p.enable && !crate::paths::proxy_snapshot_path().exists() {
+            if let Ok(cur) = system_proxy::read() {
+                if !cur.enable && !cur.pac_present {
+                    out.proxy = None;
+                }
+            }
+        }
+    }
+
+    // dns：逐族与当前状态比对，已一致的族不再下发
+    if let Some(dns) = out.dns.as_ref() {
+        let mut d = dns.clone();
+        if let Some((cur4, cur6)) = current_dns_state(&d.alias) {
+            d.v4 = prune_family(d.v4, &cur4);
+            d.v6 = prune_family(d.v6, &cur6);
+        }
+        out.dns = if d.v4.is_none() && d.v6.is_none() {
+            None
+        } else {
+            Some(d)
+        };
+    }
+    out
+}
+
+/// 目标族与当前族一致 → 不需要写（None）；否则原样保留
+fn prune_family(desired: Option<Vec<String>>, cur: &DnsFamilyState) -> Option<Vec<String>> {
+    let want = desired?;
+    if want.is_empty() {
+        // 目标 = 还原为自动获取；当前已经是 DHCP → no-op
+        return if cur.is_dhcp { None } else { Some(want) };
+    }
+    if !cur.is_dhcp && cur.servers == want {
+        return None;
+    }
+    Some(want)
+}
+
+/// 当前 DNS 状态（v4, v6）。alias 为空时按「当前在用网卡」取，与 step_dns 的落点保持一致。
+fn current_dns_state(alias: &str) -> Option<(DnsFamilyState, DnsFamilyState)> {
+    let target = if alias.trim().is_empty() {
+        let list = crate::os::dns_client::list_interfaces().ok()?;
+        crate::os::dns_client::pick_in_use(&list)?.alias
+    } else {
+        alias.to_string()
+    };
+    let st = crate::os::dns_client::get(&target).ok()?;
+    Some((st.v4, st.v6))
+}
+
+// ---------------------------------------------------------------------------
 // 主流程
 // ---------------------------------------------------------------------------
 
@@ -173,6 +249,9 @@ pub fn apply(state: &AppState, targets: &ApplyTargets, reason: &str) -> Result<A
     let keep = cfg.settings.hosts_backup_keep.max(3) as usize;
     let active_id = cfg.active_profile_id.clone();
 
+    // 先剪掉「已经是目标状态」的层：避免为一次 no-op 白弹提权框、白起一个提权子进程
+    let targets = &prune_satisfied(targets);
+
     if targets.hosts.is_none() && targets.proxy.is_none() && targets.dns.is_none() {
         return Ok(ApplyReport {
             ok: true,
@@ -199,23 +278,14 @@ pub fn apply(state: &AppState, targets: &ApplyTargets, reason: &str) -> Result<A
     let mut applied: Vec<&'static str> = Vec::new();
     let mut failure: Option<AppError> = None;
 
-    // ── Apply ① hosts ──
-    if failure.is_none() {
-        if let Some(entries) = targets.hosts.as_ref() {
-            match step_hosts(entries) {
-                Ok(s) => {
-                    steps.push(s);
-                    applied.push("hosts");
-                }
-                Err(e) => {
-                    steps.push(step_err("hosts", &e));
-                    failure = Some(e);
-                }
-            }
-        }
-    }
-
-    // ── Apply ② proxy（不弹 UAC 的一层）──
+    // ── Apply ① proxy（不弹 UAC 的一层，先落地）──
+    //
+    // 顺序说明（2026-10-08 调整）：代理改到 hosts / DNS 之前。
+    //   · 代理的失败模式最多 —— 前置连通性自检（§3.4）本身就可能直接失败。先做它，
+    //     "代理不通"时一个提权层都不用写，也就没有东西需要回滚；
+    //   · 回滚是 apply 的逆序，于是变成 hosts → DNS → proxy，正好是设计方案要的
+    //     "先恢复解析层（dns/hosts），再恢复传输层（proxy）"；
+    //   · 旧顺序（hosts → proxy → dns）的逆序是 dns → proxy → hosts，与文档口径相悖。
     if failure.is_none() {
         if let Some(t) = targets.proxy.as_ref() {
             match step_proxy(t) {
@@ -236,18 +306,24 @@ pub fn apply(state: &AppState, targets: &ApplyTargets, reason: &str) -> Result<A
         }
     }
 
-    // ── Apply ③ dns ──
-    if failure.is_none() {
-        if let Some(t) = targets.dns.as_ref() {
-            match step_dns(t) {
-                Ok(s) => {
-                    steps.push(s);
-                    applied.push("dns");
+    // ── Apply ②③ hosts + DNS：打包成一次提权 ──
+    //
+    // 两层都必须提权，原先各起一个提权进程（Windows = 连着两次 UAC），现在合并成一次。
+    // 客户端顺序、失败即停、逐层回滚的语义都不变：子进程把已完成的步骤如实上报。
+    if failure.is_none() && (targets.hosts.is_some() || targets.dns.is_some()) {
+        match step_privileged_layers(targets) {
+            Ok(o) => {
+                steps.extend(o.steps);
+                applied.extend(o.applied);
+                if o.failure.is_some() {
+                    failure = o.failure;
                 }
-                Err(e) => {
-                    steps.push(step_err("dns", &e));
-                    failure = Some(e);
-                }
+            }
+            Err(e) => {
+                // 基础设施失败（启动 / 超时 / 取消）：一步都没执行，按第一个目标层报错
+                let kind = if targets.hosts.is_some() { "hosts" } else { "dns" };
+                steps.push(step_err(kind, &e));
+                failure = Some(e);
             }
         }
     }
@@ -324,25 +400,6 @@ pub fn apply(state: &AppState, targets: &ApplyTargets, reason: &str) -> Result<A
 // ---------------------------------------------------------------------------
 // 单层执行
 // ---------------------------------------------------------------------------
-
-fn step_hosts(entries: &[HostsEntry]) -> Result<ApplyStep> {
-    let out = elevation::run_elevated(
-        "hosts_apply",
-        json!({ "entries": entries }),
-        elevation::TASK_TIMEOUT,
-    )?;
-    if !out.ok {
-        return Err(out
-            .error
-            .unwrap_or_else(|| AppError::internal("hosts 写入失败")));
-    }
-    Ok(out.steps.into_iter().next().unwrap_or_else(|| {
-        step_ok(
-            "hosts",
-            format!("写入 {} 条托管条目", entries.len()),
-        )
-    }))
-}
 
 fn proxy_snapshot_file() -> std::path::PathBuf {
     paths::proxy_snapshot_path()
@@ -469,46 +526,93 @@ fn step_proxy(t: &ProxyTarget) -> Result<ApplyStep> {
     }
 }
 
-fn step_dns(t: &DnsTarget) -> Result<ApplyStep> {
-    // 方案未指定网卡（内置直连就是空网卡）时的语义：
-    //   - 要写手动地址 → 没有落点，必须报错让用户去选；
-    //   - 纯还原为自动（两族列表皆空）→ 自动选择"当前正在使用"的网卡
-    //     （物理 + 已连接 + 有默认网关优先，2026-10-07 用户要求）。
+#[derive(Default)]
+struct LayersOutcome {
+    steps: Vec<ApplyStep>,
+    /// 已落地的层（顺序即落地顺序，回滚按它的逆序走）
+    applied: Vec<&'static str>,
+    /// 子进程上报的失败（None = 全部成功）
+    failure: Option<AppError>,
+}
+
+/// 把 hosts 与 DNS 打包进**同一个提权子进程**执行（顺序：hosts → DNS，与逐层调用一致）。
+///
+/// 这两层都必须提权：原先各起一个提权进程，Windows 上就是连着弹两次 UAC；合并后只起一次。
+/// `Err` 只表示"基础设施失败"（启动失败 / 超时 / 用户取消），此时一步都没执行；
+/// 子任务本身的失败放在 [`LayersOutcome::failure`] 里返回，并把已完成的步骤一并带回来，
+/// 父进程据此决定回滚哪些层。
+fn step_privileged_layers(targets: &ApplyTargets) -> Result<LayersOutcome> {
+    let mut ops: Vec<serde_json::Value> = Vec::new();
+    if let Some(entries) = targets.hosts.as_ref() {
+        ops.push(json!({ "task": "hosts_apply", "data": { "entries": entries } }));
+    }
+    if let Some(t) = targets.dns.as_ref() {
+        // 网卡在父进程侧先解析：task_runner 的 dns_set 要求 alias 非空
+        let alias = match resolve_dns_alias(t) {
+            Ok(a) => a,
+            Err(e) => {
+                return Ok(LayersOutcome {
+                    steps: vec![step_err("dns", &e)],
+                    applied: Vec::new(),
+                    failure: Some(e),
+                })
+            }
+        };
+        ops.push(json!({
+            "task": "dns_set",
+            "data": { "alias": alias, "v4": t.v4, "v6": t.v6 }
+        }));
+    }
+    if ops.is_empty() {
+        return Ok(LayersOutcome::default());
+    }
+
+    let out = elevation::run_elevated_raw("batch", json!({ "ops": ops }), BATCH_TIMEOUT)?;
+
+    // 从子进程上报的步骤里反推哪些层已落地（顺序即 apply 的落地顺序）
+    let mut applied: Vec<&'static str> = Vec::new();
+    for s in &out.steps {
+        if !s.applied {
+            continue;
+        }
+        match s.kind.as_str() {
+            "hosts" => applied.push("hosts"),
+            "dns" => applied.push("dns"),
+            _ => {}
+        }
+    }
+    Ok(LayersOutcome {
+        steps: out.steps,
+        applied,
+        failure: if out.ok {
+            None
+        } else {
+            Some(out.error.unwrap_or_else(|| AppError::internal("提权任务失败")))
+        },
+    })
+}
+
+/// 方案未指定网卡（内置直连就是空网卡）时的语义：
+///   - 要写手动地址 → 没有落点，必须报错让用户去选；
+///   - 纯还原为自动（两族列表皆空）→ 自动选择"当前正在使用"的网卡
+///     （物理 + 已连接 + 有默认网关优先，2026-10-07 用户要求）。
+fn resolve_dns_alias(t: &DnsTarget) -> Result<String> {
+    if !t.alias.trim().is_empty() {
+        return Ok(t.alias.clone());
+    }
     let wants_manual = t.v4.as_ref().map_or(false, |l| !l.is_empty())
         || t.v6.as_ref().map_or(false, |l| !l.is_empty());
-    let alias = if t.alias.trim().is_empty() {
-        if wants_manual {
-            return Err(AppError::coded(crate::error::E4001).with_detail(
-                "方案未指定网卡：请编辑方案选择网卡，或将 DNS 模式改为「还原为自动获取」",
-            ));
-        }
-        let list = crate::os::dns_client::list_interfaces()?;
-        let picked = crate::os::dns_client::pick_in_use(&list)
-            .map(|i| i.alias)
-            .ok_or_else(|| {
-                AppError::coded(crate::error::E4001).with_detail("没有可用网卡")
-            })?;
-        log::info!(target: "apply", "方案未指定网卡，DNS 自动落点到当前使用网卡：{picked}");
-        picked
-    } else {
-        t.alias.clone()
-    };
-    let out = elevation::run_elevated(
-        "dns_set",
-        json!({ "alias": alias, "v4": t.v4, "v6": t.v6 }),
-        DNS_TASK_TIMEOUT,
-    )?;
-    if !out.ok {
-        return Err(out
-            .error
-            .unwrap_or_else(|| AppError::internal("DNS 设置失败")));
+    if wants_manual {
+        return Err(AppError::coded(crate::error::E4001).with_detail(
+            "方案未指定网卡：请编辑方案选择网卡，或将 DNS 模式改为「还原为自动获取」",
+        ));
     }
-    Ok(out.steps.into_iter().next().unwrap_or_else(|| {
-        step_ok(
-            "dns",
-            format!("DNS 已更新（网卡 {alias}）"),
-        )
-    }))
+    let list = crate::os::dns_client::list_interfaces()?;
+    let picked = crate::os::dns_client::pick_in_use(&list)
+        .map(|i| i.alias)
+        .ok_or_else(|| AppError::coded(crate::error::E4001).with_detail("没有可用网卡"))?;
+    log::info!(target: "apply", "方案未指定网卡，DNS 自动落点到当前使用网卡：{picked}");
+    Ok(picked)
 }
 
 // ---------------------------------------------------------------------------

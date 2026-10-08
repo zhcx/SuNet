@@ -228,6 +228,18 @@ export interface Settings {
   log_level: string;
   log_redact: boolean;
   shortcuts: { clear_proxy: ShortcutBinding };
+  /** 静默提权通道（Windows，默认关）：安装后 hosts / DNS 写入不再弹 UAC */
+  silent_elevation: boolean;
+}
+
+export interface SilentElevationStatus {
+  supported: boolean;
+  enabled: boolean;
+  installed: boolean;
+  /** 界面上这条通道叫什么（「静默提权通道」/「免密提权助手」） */
+  noun: string;
+  /** 状态说明；平台差异由后端收口，前端不判断平台 */
+  detail: string;
 }
 
 export interface PrivilegeState {
@@ -377,16 +389,6 @@ export interface DirInfo {
   hosts_path: string;
 }
 
-export interface FirstRunReport {
-  initialized: boolean;
-  hosts_path: string;
-  hosts_custom_lines: number;
-  hosts_block_lines: number;
-  proxy: ProxyState;
-  dns: [string, string][];
-  interfaces: number;
-}
-
 export interface ResolveResult {
   host: string;
   source: string;
@@ -476,9 +478,11 @@ export const api = {
   quickOpenMain: (tab?: string | null) => call<void>("quick_open_main", { tab: tab ?? null }),
   quickSetPinned: (pinned: boolean) => call<void>("quick_set_pinned", { pinned }),
   markNotificationsRead: () => call<void>("mark_notifications_read"),
-  firstRunReport: () => call<FirstRunReport>("first_run_report"),
-  firstRunFinish: (name?: string | null) =>
-    call<string>("first_run_finish", { name: name ?? null }),
+  /** 首次运行收尾：只写「已完成引导」标记，不再抓取/保存原始设置 */
+  firstRunFinish: () => call<void>("first_run_finish"),
+  silentElevationStatus: () => call<SilentElevationStatus>("silent_elevation_status"),
+  silentElevationInstall: () => call<SilentElevationStatus>("silent_elevation_install"),
+  silentElevationUninstall: () => call<SilentElevationStatus>("silent_elevation_uninstall"),
 };
 
 export function errText(e: unknown): string {

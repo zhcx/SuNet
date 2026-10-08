@@ -84,6 +84,10 @@ pub struct Settings {
     pub log_level: String,
     pub log_redact: bool,
     pub shortcuts: Shortcuts,
+    /// 静默提权通道（Windows：计划任务版）。**默认关**：
+    /// 它等价于「一次授权、长期有效」，会绕过后续的 UAC 确认，
+    /// 安全边界详见 `elevation_task.rs` 的模块说明。
+    pub silent_elevation: bool,
 }
 
 impl Default for Settings {
@@ -102,6 +106,7 @@ impl Default for Settings {
             log_level: "info".into(),
             log_redact: true,
             shortcuts: Shortcuts::default(),
+            silent_elevation: false,
         }
     }
 }

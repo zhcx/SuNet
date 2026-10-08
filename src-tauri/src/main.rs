@@ -12,6 +12,7 @@ mod cmd;
 mod config;
 mod critsec;
 mod elevation;
+mod elevation_task;
 mod error;
 #[cfg(target_os = "macos")]
 mod helper;
@@ -39,6 +40,11 @@ fn main() {
     #[cfg(target_os = "macos")]
     if let Some(code) = helper_entry() {
         std::process::exit(code);
+    }
+    // ⓪.5 静默提权工作进程（Windows）：由计划任务以最高权限拉起，
+    //      读走 ipc 目录里刚写下的载荷、执行、写回结果，做完即退（不常驻）。
+    if std::env::args().any(|a| a == "--silent-worker") {
+        std::process::exit(elevation_task::worker_main());
     }
     // ① 提权子进程分流（必须在最前面）
     if let Some(args) = task_runner::parse_task_arg() {
@@ -114,6 +120,8 @@ fn run_gui() {
         config::LoadOutcome::Ready(c) => (c, None),
         config::LoadOutcome::ReadOnly(c, e) => (c, Some(e)),
     };
+    // 静默提权通道的开关随配置同步：elevation 在写入热路径上，不该反复去读配置
+    elevation_task::set_enabled(cfg.settings.silent_elevation);
 
     logging::init(
         &paths::logs_dir(),
@@ -276,16 +284,23 @@ fn run_gui() {
                 let h = handle.clone();
                 std::thread::spawn(move || {
                     let mut last_light = tray::taskbar_is_light();
+                    let mut ticks: u64 = 0;
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(1));
                         if let Some(s) = h.try_state::<state::SharedState>() {
                             apply::expire_clear_undo(&s);
                         }
-                        let now_light = tray::taskbar_is_light();
-                        if now_light != last_light {
-                            last_light = now_light;
-                            tray::refresh_icon_theme(&h);
-                            tray::refresh(&h);
+                        // 主题检查放慢到 5 秒：macOS 的 taskbar_is_light() 每次都会 fork
+                        // 一个 `defaults` 子进程，每秒一次纯属空转；Windows 的注册表读
+                        // 同样没必要每秒一次。用户切深浅色后最多晚 5 秒跟随。
+                        ticks += 1;
+                        if ticks % 5 == 0 {
+                            let now_light = tray::taskbar_is_light();
+                            if now_light != last_light {
+                                last_light = now_light;
+                                tray::refresh_icon_theme(&h);
+                                tray::refresh(&h);
+                            }
                         }
                         if h.get_webview_window("main").is_none() {
                             break;
@@ -413,8 +428,10 @@ fn run_gui() {
             cmd::system::quick_open_main,
             cmd::system::quick_set_pinned,
             cmd::system::mark_notifications_read,
-            cmd::system::first_run_report,
             cmd::system::first_run_finish,
+            cmd::system::silent_elevation_status,
+            cmd::system::silent_elevation_install,
+            cmd::system::silent_elevation_uninstall,
         ])
         .run(tauri::generate_context!())
         .expect("SuNet 启动失败");

@@ -1,6 +1,6 @@
 [package]
 name = "sunet"
-version = "0.0.1"
+version = "0.0.2"
 description = "速网 SuNet · 网络配置切换器"
 authors = ["SuNet"]
 edition = "2021"

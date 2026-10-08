@@ -1,6 +1,12 @@
 // 设置弹层：自启 / 全局热键 / 退出行为 / 日志 / 目录与诊断包
 
-import { api, errText, type Settings, type ShortcutStatus } from "./api";
+import {
+  api,
+  errText,
+  type Settings,
+  type ShortcutStatus,
+  type SilentElevationStatus,
+} from "./api";
 import * as ui from "./ui";
 import * as os from "./platform";
 
@@ -37,8 +43,10 @@ export async function openSettingsModal(): Promise<void> {
         <label class="row"><input type="checkbox" id="set-restore-launch" /> 启动后自动恢复上次方案（含 hosts/DNS 时${os.AUTH_HINT}）</label>
       </div>
       <span>提权</span>
-      <div class="actions">
+      <div class="actions" style="flex-direction:column;align-items:flex-start">
         <label class="row"><input type="checkbox" id="set-elev-notice" /> 修改 hosts/DNS 前先显示说明对话框</label>
+        <button class="sm" id="set-silent-toggle" type="button" hidden>安装静默提权通道</button>
+        <span class="hint" id="set-silent-hint"></span>
       </div>
       <span>开机自启</span>
       <div class="actions">
@@ -105,6 +113,48 @@ export async function openSettingsModal(): Promise<void> {
   q<HTMLInputElement>("#set-log-days").value = String(s.log_keep_days);
   q<HTMLInputElement>("#set-snap-keep").value = String(s.hosts_backup_keep);
   q("#set-version").textContent = `程序版本 ${st.version} · 配置目录 ${st.read_only ? "（只读模式）" : ""}`;
+
+  // 静默提权通道（Windows）：装 / 卸各需要一次提权确认；装好后 hosts / DNS 写入不再弹 UAC。
+  // 开关状态由后端在安装 / 卸载时写进配置，这里用本地变量记住，保存设置时原样带回，
+  // 免得用弹层打开时的旧快照把它覆盖回去。
+  const silentHint = q<HTMLElement>("#set-silent-hint");
+  const silentBtn = q<HTMLButtonElement>("#set-silent-toggle");
+  let silentEnabled = s.silent_elevation;
+  const renderSilent = (v: SilentElevationStatus) => {
+    silentEnabled = v.installed && v.enabled;
+    silentBtn.hidden = !v.supported;
+    if (!v.supported) {
+      silentHint.textContent = v.detail || "本平台不支持";
+      return;
+    }
+    // 名称与说明都由后端按平台给出：Windows = 静默提权通道（计划任务），
+    // macOS = 免密提权助手（LaunchDaemon）—— 前端不做平台判断
+    silentBtn.textContent = `${v.installed ? "卸载" : "安装"}${v.noun}`;
+    silentHint.textContent = v.detail;
+  };
+  try {
+    renderSilent(await api.silentElevationStatus());
+  } catch {
+    silentHint.textContent = "无法读取静默提权状态";
+  }
+  silentBtn.addEventListener("click", async () => {
+    silentBtn.disabled = true;
+    try {
+      const v = silentBtn.textContent?.startsWith("卸载")
+        ? await api.silentElevationUninstall()
+        : await api.silentElevationInstall();
+      renderSilent(v);
+      ui.toast(
+        "info",
+        `${v.installed ? "已安装" : "已卸载"}${v.noun}`,
+        v.installed ? "之后的写入不再弹 UAC / 不再输密码" : "已恢复为逐次确认",
+      );
+    } catch (e) {
+      ui.toast("error", "静默提权通道操作失败", errText(e));
+    } finally {
+      silentBtn.disabled = false;
+    }
+  });
 
   // ------------------------------------------------------------------
   // 全局热键：按键捕获（不再要求用户手打 "Ctrl+Alt+S"）
@@ -433,6 +483,7 @@ export async function openSettingsModal(): Promise<void> {
       start_minimized: q<HTMLInputElement>("#set-start-min").checked,
       restore_on_launch: q<HTMLInputElement>("#set-restore-launch").checked,
       confirm_elevation_notice: q<HTMLInputElement>("#set-elev-notice").checked,
+      silent_elevation: silentEnabled,
       proxy_probe_before_enable: q<HTMLInputElement>("#set-probe").checked,
       log_level: q<HTMLSelectElement>("#set-log-level").value,
       log_redact: q<HTMLInputElement>("#set-log-redact").checked,

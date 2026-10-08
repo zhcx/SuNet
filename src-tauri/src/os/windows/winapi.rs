@@ -146,6 +146,8 @@ extern "system" {
 
 pub const SEE_MASK_NOCLOSEPROCESS: DWORD = 0x0000_0040;
 pub const SEE_MASK_NOASYNC: DWORD = 0x0000_0100;
+/// 提权子进程是纯后台任务，隐藏其窗口避免任务栏闪一下
+pub const SW_HIDE: c_int = 0;
 pub const SW_SHOWNORMAL: c_int = 1;
 pub const ERROR_CANCELLED: DWORD = 1223;
 pub const ERROR_ELEVATION_REQUIRED: DWORD = 740;
