@@ -46,6 +46,12 @@ git tag v0.0.1 && git push origin v0.0.1
 > · 上面那条「静默提权通道」不再只有 Windows 有实现 —— `elevation_task.rs` 现在是三个实现：`imp`（Windows，计划任务）、**`macos_impl`（macOS，映射到常驻 root 助手）**、`unsupported`（兜底）。`noun()/detail()` 由后端按平台给文案，前端不做平台判断，于是「设置 → 提权」的按钮在两个平台都可用：Windows 显示「安装静默提权通道」，macOS 显示「安装免密提权助手」。
 > · **补上的真实缺口**：macOS 的常驻助手此前**只有命令行入口**（`SuNet --helper-install` / `--helper-uninstall` / `--helper-status`，见 `main.rs` 的 `helper_entry`），界面上装不了。现在 `elevation::run_self_command_elevated(&["--helper-install"])` 用 `osascript ... with administrator privileges` 跑这条自身子命令（不改 `--task` 协议、不接受任意命令、不计 timeout），设置页可一键安装/卸载。
 > · 其余两项（`batch` 合并提权、刷新合并、no-op 剪枝、memoize、主题轮询降频等）本来就写在共享代码里，macOS 同样生效；`batch` 在 macOS 上可用是因为 helper 守护进程也是调 `task_runner::execute`（见 `helper/daemon.rs`），无需另做适配。
+> 2026-10-08 开机自启修复（用户实测截图报出）：
+> · **症状**：开「开机自启动」必报「创建计划任务失败（退出码 1）」。
+> · **根因**：`platform_autostart`（Windows）在**主进程**（asInvoker）里直接调 `schtasks /Create`，而任务库 `C:\Windows\System32\Tasks` 只有管理员可写。用未提权 shell 跑同样参数复现：`exit=1` + `ERROR: Access is denied.`。
+> · **修法**：新增提权任务 `autostart_set`，实现抽到 `os/windows/autostart.rs::apply()`；`cmd/system.rs` 的 `platform_autostart` 改为 `elevation::run_elevated("autostart_set", …)`（装过静默通道则静默，否则一次 UAC）。macOS 侧本来就是 LaunchAgent，不需要提权，未动。
+> · **顺带修掉乱码**：schtasks / netsh 的输出按 **OEM 代码页**（简中 = 936）编码，代码却用 `from_utf8_lossy`，中文系统上界面上只能看到一片方块、真正的报错全丢。新增 `winapi::decode_console_output` 并替换三处调用点（自启、静默通道、netsh DNS 写入）。
+> · **发布流程加固**：`prepare-release` 在同 tag 重发时会先清掉旧资产再刷新说明（否则 tauri-action 上传同名资产会撞名字），参考 zeditor 的同类步骤。
 
 | 事实 | 值 |
 |---|---|

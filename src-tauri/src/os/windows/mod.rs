@@ -4,6 +4,7 @@
 //! 约定：本层**不持有 UI 状态、不依赖 WebView2**，只做系统调用与数据读写
 //! —— 这是设计方案 §1.4.8「服务端升级路径」的前提。
 
+pub mod autostart;
 pub mod dns_client;
 pub mod fs_security;
 pub mod hosts_io;

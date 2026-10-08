@@ -23,6 +23,8 @@ const KNOWN_TASKS: &[&str] = &[
     "proxy_restore",
     "proxy_clear",
     "probe",
+    // 登录自启计划任务（任务库只有管理员可写 → 只能在提权进程里做）
+    "autostart_set",
     // 批处理外壳：内部只允许上面这些子任务，且不允许嵌套自己
     "batch",
     // 静默提权通道的安装 / 卸载（仅 Windows 有效；必须在提权进程里执行）
@@ -157,6 +159,8 @@ pub fn execute(task: &str, data: &Value) -> TaskOutput {
         "proxy_write" => proxy_write(data),
         "proxy_restore" => proxy_restore(data),
         "proxy_clear" => proxy_clear(),
+        // ── 登录自启的计划任务（任务库只有管理员可写）──
+        "autostart_set" => autostart_set(data),
         // ── 静默提权通道（Windows 计划任务）的安装 / 卸载 ──
         // 装/删一个 `RL HIGHEST` 的计划任务本身就需要管理员，所以只能在提权进程里做。
         "silent_install" | "silent_uninstall" => silent_channel(task == "silent_install"),
@@ -164,6 +168,36 @@ pub fn execute(task: &str, data: &Value) -> TaskOutput {
             AppError::coded(E1004).with_detail(format!("未知任务名：{other}")),
         ),
     }
+}
+
+/// autostart_set：创建 / 删除「登录时静默启动」的计划任务（载荷 `{ enable: bool }`）。
+///
+/// 必须在提权进程里执行：任务库 `C:\Windows\System32\Tasks` 只有管理员可写，
+/// 主进程是 asInvoker，直接调 `schtasks /Create` 必定被拒（实测退出码 1）。
+#[cfg(target_os = "windows")]
+fn autostart_set(data: &Value) -> TaskOutput {
+    let enable = data["enable"].as_bool().unwrap_or(false);
+    match crate::os::autostart::apply(enable) {
+        Ok(()) => TaskOutput::ok().with_step(ok_step(
+            "autostart",
+            if enable {
+                "已创建登录自启计划任务（SuNet）"
+            } else {
+                "已删除登录自启计划任务"
+            },
+        )),
+        Err(e) => {
+            let mut out = TaskOutput::fail(e.clone());
+            out.steps.push(bad_step("autostart", e.to_string()));
+            out
+        }
+    }
+}
+
+/// 非 Windows 不会走到这里（macOS 的自启用 LaunchAgent，在命令层直接处理）
+#[cfg(not(target_os = "windows"))]
+fn autostart_set(_data: &Value) -> TaskOutput {
+    TaskOutput::fail(AppError::coded(E1004).with_detail("该任务仅 Windows 可用"))
 }
 
 /// 静默提权通道（Windows 计划任务）的安装 / 卸载。

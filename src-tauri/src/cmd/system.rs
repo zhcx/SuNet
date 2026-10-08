@@ -169,25 +169,6 @@ pub async fn settings_save(
 // 开机自启（计划任务，§5.2）
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "windows")]
-fn safe_account_name() -> Result<String> {
-    let user = std::env::var("USERNAME").map_err(|_| AppError::internal("无法获取当前用户名"))?;
-    let domain = std::env::var("USERDOMAIN").unwrap_or_default();
-    let name = if domain.is_empty() {
-        user
-    } else {
-        format!("{domain}\\{user}")
-    };
-    // 只允许常见账户名字符（防止把奇怪内容塞进 schtasks 参数）
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '\\' || c == '-' || c == '_' || c == '.' || c == '$')
-    {
-        return Err(AppError::internal("账户名包含非预期字符，已拒绝"));
-    }
-    Ok(name)
-}
-
 pub fn set_autostart(app: &AppHandle, enable: bool) -> Result<()> {
     platform_autostart(enable)?;
     log::info!(target: "autostart", "开机自启动 → {enable}");
@@ -202,44 +183,19 @@ pub fn set_autostart(app: &AppHandle, enable: bool) -> Result<()> {
     Ok(())
 }
 
-/// Windows：计划任务（schtasks），`/RL LIMITED` —— 主进程是 asInvoker，
-/// 用 HIGHEST 反而会让 UAC 弹回来。
+/// Windows：登录时计划任务（实现见 `os::autostart`，`/RL LIMITED`）。
+///
+/// **必须提权**：任务库 `C:\Windows\System32\Tasks` 只有管理员可写，
+/// 而主进程是 asInvoker —— 之前在主进程里直接调 `schtasks /Create`，
+/// 结果是必定被拒（退出码 1 + 拒绝访问）。现在走提权任务通道：
+/// 装过静默提权通道时这一步是静默的，否则会弹一次 UAC。
 #[cfg(target_os = "windows")]
 fn platform_autostart(enable: bool) -> Result<()> {
-    let mut cmd = std::process::Command::new("schtasks.exe");
-    if enable {
-        let exe = crate::paths::exe_path()?;
-        let account = safe_account_name()?;
-        cmd.args([
-            "/Create",
-            "/TN",
-            "SuNet",
-            "/TR",
-            &format!("\"{}\" --minimized", exe.display()),
-            "/SC",
-            "ONLOGON",
-            "/RL",
-            "LIMITED",
-            "/RU",
-            &account,
-            "/IT",
-            "/F",
-        ]);
-    } else {
-        cmd.args(["/Delete", "/TN", "SuNet", "/F"]);
-    }
-    let out = cmd
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| AppError::internal(format!("调用 schtasks 失败：{e}")))?;
-    let code = out.status.code().unwrap_or(-1);
-    if enable && code != 0 {
-        let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(AppError::coded("E1002")
-            .with_detail(format!("创建计划任务失败（退出码 {code}）：{msg}")));
-    }
-    // 关闭时"任务不存在"不算错误
-    log::info!(target: "autostart", "schtasks 退出码 {code}");
+    crate::elevation::run_elevated(
+        "autostart_set",
+        serde_json::json!({ "enable": enable }),
+        crate::elevation::TASK_TIMEOUT,
+    )?;
     Ok(())
 }
 

@@ -48,6 +48,13 @@
 
 ### 修复
 
+- **Windows 开机自启动必定失败**：`schtasks /Create` 此前在**主进程**（asInvoker）里执行，
+  而任务库 `C:\Windows\System32\Tasks` 只有管理员可写 —— 实测必得 `ERROR: Access is denied.`
+  （退出码 1），界面上就是「创建计划任务失败」。现改为走提权任务通道（新增任务 `autostart_set`，
+  实现移到 `os/windows/autostart.rs`）：装过静默提权通道时静默完成，否则弹一次 UAC。
+- **schtasks / netsh 的报错在中文系统上显示为一片方块**：这两个工具的文本按 OEM 代码页
+  （简中 = 936）输出，代码却用 `String::from_utf8_lossy` 解码，于是真正的报错信息全丢了；
+  新增 `winapi::decode_console_output`（按 OEM 代码页转宽字符，失败再退回 lossy）并替换全部调用点。
 - `ui.openModal` 关闭时移除 Esc 监听：此前每开一次弹层都会在 `document` 上残留一个监听，长会话下持续累积。
 - 飞行面板的 `.chip` 样式收敛到 `.flyout` 作用域：此前未加限定，会按源码顺序**全局覆盖**主窗口的方案 chip 样式。
 

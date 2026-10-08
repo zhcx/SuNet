@@ -147,7 +147,8 @@ mod imp {
             .output()
             .map_err(|e| AppError::internal(format!("无法执行 schtasks：{e}")))?;
         if !out.status.success() {
-            let text = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            // schtasks 的输出按 OEM 代码页编码，必须按 OEM 解码（否则日志里是一片方块）
+            let text = crate::os::winapi::decode_console_output(&out.stderr);
             log::warn!(target: "elevation", "schtasks {args:?} 失败：{text}");
             return Ok(false);
         }

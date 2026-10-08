@@ -251,6 +251,9 @@ pub const IF_TYPE_IEEE80211: u32 = 71;
 pub const IP_PREFIX_ORIGIN_WELLKNOWN: u32 = 2;
 pub const IP_DAD_STATE_PREFERRED: u32 = 4;
 pub const CP_ACP: DWORD = 0;
+/// OEM 代码页（简中 = 936）。控制台程序把文本按这个代码页写出去，
+/// 见 `decode_console_output` 的说明。
+pub const CP_OEMCP: DWORD = 1;
 
 #[repr(C)]
 pub struct IpAdapterAddresses {
@@ -317,6 +320,33 @@ pub struct SocketAddress {
 // ---------------------------------------------------------------------------
 
 /// Rust &str → 以 NUL 结尾的 UTF-16 缓冲
+/// 控制台子进程输出的解码。
+///
+/// `schtasks` / `netsh` 这类系统工具把文本按 **OEM 代码页**（简中 = 936）写出，
+/// 直接 `String::from_utf8_lossy` 会得到一串替换字符 —— 界面上就是一片「方块」，
+/// 等于把真正的报错信息丢了（实测踩过）。
+pub fn decode_console_output(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    let len = bytes.len() as c_int;
+    let n = unsafe {
+        MultiByteToWideChar(CP_OEMCP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0)
+    };
+    if n <= 0 {
+        return String::from_utf8_lossy(bytes).trim().to_string();
+    }
+    let mut wide = vec![0u16; n as usize];
+    let written = unsafe {
+        MultiByteToWideChar(CP_OEMCP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n)
+    };
+    if written <= 0 {
+        return String::from_utf8_lossy(bytes).trim().to_string();
+    }
+    wide.truncate(written as usize);
+    String::from_utf16_lossy(&wide).trim().to_string()
+}
+
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }

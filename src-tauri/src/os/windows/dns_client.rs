@@ -482,8 +482,9 @@ fn run_netsh(args: &[String]) -> Result<()> {
         .output()
         .map_err(|e| AppError::internal(format!("无法启动 netsh：{e}")))?;
     if out.status.code() != Some(0) {
-        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // netsh 的文本按 OEM 代码页编码：按 UTF-8 解会变成一串方块
+        let stdout = winapi::decode_console_output(&out.stdout);
+        let stderr = winapi::decode_console_output(&out.stderr);
         return Err(AppError::internal(format!(
             "netsh {} 失败：{}",
             args.iter().take(4).cloned().collect::<Vec<_>>().join(" "),

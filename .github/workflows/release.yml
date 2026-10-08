@@ -75,7 +75,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $TAG 已存在，复用"
+            # 同一个 tag 重新发布（例如修完 bug 重跑）：先清掉旧资产、顺手刷新说明。
+            # 不清的话 tauri-action 上传同名资产会直接撞名字失败。
+            echo "Release $TAG 已存在：清掉旧资产并刷新说明"
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" --jq '.assets[].id' |
+              while read -r asset_id; do
+                gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+              done
+            gh release edit "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "速网 SuNet $TAG" \
+              --notes-file release-notes.md
           else
             gh release create "$TAG" \
               --repo "$GITHUB_REPOSITORY" \
