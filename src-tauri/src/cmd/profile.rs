@@ -88,6 +88,35 @@ pub async fn profile_delete(
     Ok(list)
 }
 
+/// 每个会话只提示一次「装了免密通道就不用再输密码」
+static NO_PASSWORD_HINTED: AtomicBool = AtomicBool::new(false);
+
+/// 免密提示：这次操作**确实弹了系统授权框 / UAC**（报告里的 `prompted` 由提权层标记），
+/// 而免密通道还没装（或装了没跑起来）→ 提示一次，并给一个「去设置」的入口。
+///
+/// 为什么不是每次切换都提示：那是骚扰。每个会话只在第一次真的让用户输了密码之后提示。
+/// 是否提示、提示什么由后端按平台决定（见 `elevation_task::no_password_hint`），
+/// 前端不需要判断平台。
+fn hint_no_password(app: &AppHandle, report: &ApplyReport) {
+    if !report.ok || !report.prompted {
+        return;
+    }
+    if NO_PASSWORD_HINTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let Some(body) = crate::elevation_task::no_password_hint() else {
+        return;
+    };
+    crate::notify::send(
+        app,
+        crate::notify::Level::Info, // Info：不置托盘警告，只在窗口里提示
+        "以后切换可以不用输密码",
+        &body,
+        vec![crate::notify::action("去设置", "open:settings")],
+        false,
+    );
+}
+
 #[tauri::command]
 pub async fn profile_apply(
     app: AppHandle,
@@ -122,6 +151,7 @@ pub async fn profile_apply(
         );
     } else {
         log::info!(target: "apply", "方案切换成功：{}", report.message);
+        hint_no_password(&app, &report);
     }
     Ok(report)
 }
@@ -186,14 +216,8 @@ pub fn hotkey_toggle_direct(app: &AppHandle) {
                 } else {
                     (format!("已切换回「{name}」"), crate::notify::Level::Info)
                 };
-                crate::notify::send(
-                    &a,
-                    level,
-                    &title,
-                    &message.message,
-                    vec![],
-                    false,
-                );
+                crate::notify::send(&a, level, &title, &message.message, vec![], false);
+                hint_no_password(&a, &message);
             }
             Ok(ToggleDirect::NoPrevious) => {
                 crate::notify::send(
@@ -366,6 +390,7 @@ pub async fn rollback(
             .await?;
     crate::cmd::emit_report(&app, &report);
     crate::tray::refresh(&app);
+    hint_no_password(&app, &report);
     Ok(report)
 }
 
@@ -376,6 +401,7 @@ pub async fn global_restore(app: AppHandle, state: State<'_, SharedState>) -> Re
     let report = crate::cmd::blocking(move || apply::global_restore(&s)).await?;
     crate::cmd::emit_report(&app, &report);
     crate::tray::refresh(&app);
+    hint_no_password(&app, &report);
     if !report.ok {
         crate::notify::send(
             &app,

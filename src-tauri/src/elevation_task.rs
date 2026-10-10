@@ -95,6 +95,14 @@ mod imp {
         enabled() && is_installed()
     }
 
+    /// 切换后是否提示"装一次就不用再输密码"。
+    ///
+    /// Windows 返回 `None`：静默通道等价于"一次授权、长期有效"（见模块头「安全边界」），
+    /// 必须由用户到设置页显式开启，代码里不主动引导。
+    pub fn no_password_hint() -> Option<String> {
+        None
+    }
+
     /// 计划任务存在，且指向当前这个 exe
     pub fn is_installed() -> bool {
         match STATE.load(Ordering::Relaxed) {
@@ -370,6 +378,29 @@ mod macos_impl {
         crate::helper::available()
     }
 
+    /// 切换后提示"装一次免密助手，之后就不用再输密码"。
+    ///
+    /// 返回正文（标题由调用方用 [`noun`] 拼）。已经装上并且守护进程在跑时返回 `None`
+    /// —— 那种情况下根本不会弹授权框。
+    pub fn no_password_hint() -> Option<String> {
+        if !is_installed() {
+            return Some(
+                "这次切换弹了系统授权框，之后每次写入都要再输一次密码。\
+                 到「设置 → 提权」装一次免密提权助手（只需授权一次），之后的切换就不用再输密码了。"
+                    .to_string(),
+            );
+        }
+        if !usable() {
+            // 装了却没生效：这正是"明明装了还要输密码"的常见原因
+            return Some(
+                "免密提权助手已安装，但后台守护进程没在运行，所以还是弹了授权框。\
+                 请到「系统设置 → 通用 → 登录项与扩展」放行它，或在「设置 → 提权」里重新安装。"
+                    .to_string(),
+            );
+        }
+        None
+    }
+
     pub fn is_installed() -> bool {
         crate::helper::installed()
     }
@@ -432,6 +463,9 @@ mod unsupported {
     pub fn invalidate_cache() {}
     pub fn usable() -> bool {
         false
+    }
+    pub fn no_password_hint() -> Option<String> {
+        None
     }
     pub fn is_installed() -> bool {
         false

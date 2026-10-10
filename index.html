@@ -4,6 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>速网 SuNet</title>
+    <!-- 首帧平台标记：给 macOS 交通灯让位、隐藏自绘窗口按钮都必须**首次绘制就对**，
+         所以放在样式表之前、且是经典脚本（非 module，不会被 deferred 到首次绘制之后）。
+         说明与判定条件见 public/os-mark.js；src/platform.ts 优先读这里打上的属性。 -->
+    <script src="/os-mark.js"></script>
     <link rel="stylesheet" href="/src/tokens.css" />
     <link rel="stylesheet" href="/src/app.css" />
   </head>

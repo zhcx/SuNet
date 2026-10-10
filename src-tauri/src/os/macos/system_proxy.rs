@@ -10,7 +10,9 @@
 //! 与 Windows 的语义差异（已记入 README/HANDOFF 平台对照）：
 //!   - WinINET `ProxyOverride` 是分号分隔且支持通配符；macOS 的例外列表是域名列表，
 //!     不接受 `127.*` 这种写法，也没有 `<local>` ⇒ `to_mac_exceptions` / `from_mac_exceptions`
-//!   - WinINET 的 `ProxyServer` 一个值服务所有协议 ⇒ macOS 显式设置 HTTP/HTTPS/SOCKS 三项
+//!   - WinINET 的 `ProxyServer` 一个值服务所有协议；macOS 的 HTTP / HTTPS / SOCKS 是
+//!     **三个独立开关** ⇒ 这里只写 HTTP 一项（见 [`MANUAL_PROTO`] 的说明），
+//!     HTTPS / SOCKS 只在"清残留"时被动关掉
 //!   - PAC 由 `-setautoproxyurl` / `-setautoproxystate` 管理（手动写入不动 PAC，同 Windows）
 
 use crate::error::{AppError, Result, E3003, E3004};
@@ -38,15 +40,104 @@ impl ProxyState {
     }
 }
 
+/// macOS 的三个代理协议：系统里是三个**互相独立的开关**
+/// （系统设置 → 网络 → 详细信息 → 代理）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Proto {
+    Web,
+    Secure,
+    Socks,
+}
+
+impl Proto {
+    /// 读服务器：`-getwebproxy` / `-getsecurewebproxy` / `-getsocksfirewallproxy`
+    fn get_cmd(self) -> &'static str {
+        match self {
+            Proto::Web => "-getwebproxy",
+            Proto::Secure => "-getsecurewebproxy",
+            Proto::Socks => "-getsocksfirewallproxy",
+        }
+    }
+
+    /// 写服务器（这个命令同时会把该项打开）
+    fn set_cmd(self) -> &'static str {
+        match self {
+            Proto::Web => "-setwebproxy",
+            Proto::Secure => "-setsecurewebproxy",
+            Proto::Socks => "-setsocksfirewallproxy",
+        }
+    }
+
+    /// 开关：`-setwebproxystate <服务> on|off`
+    fn state_cmd(self) -> &'static str {
+        match self {
+            Proto::Web => "-setwebproxystate",
+            Proto::Secure => "-setsecurewebproxystate",
+            Proto::Socks => "-setsocksfirewallproxystate",
+        }
+    }
+
+    /// 界面 / 日志里怎么称呼它
+    fn label(self) -> &'static str {
+        match self {
+            Proto::Web => "HTTP",
+            Proto::Secure => "HTTPS",
+            Proto::Socks => "SOCKS",
+        }
+    }
+}
+
+/// 「手动代理」写入时**只写 HTTP 这一项**（2026-10-10 用户实测修正）。
+///
+/// 原先三项都指到同一个 `host:port`：只支持 HTTP 的代理端口会收到 SOCKS / HTTPS 请求，
+/// 结果是一开代理就断网。HTTP 一项已经覆盖绝大多数场景 —— CFNetwork 在没有
+/// Secure Web Proxy 时，HTTPS 请求也会走 HTTP 代理（CONNECT）。
+///
+/// 想支持"SOCKS 走另一个端口"之类的玩法，就得先把方案里的代理地址拆成逐协议配置；
+/// 在那之前，多写协议只会制造上面那个故障。
+const MANUAL_PROTO: Proto = Proto::Web;
+
+/// 写入手动代理时**必须顺手关掉**的两项。
+///
+/// 旧版本（≤ 0.0.2）把 HTTPS / SOCKS 也指到了同一个端口：升级后不清掉的话，残留设置
+/// 会继续把 HTTPS / SOCKS 流量送去那个端口（用户看到的现象就是"升级了还是上不了网"）。
+const MANUAL_CLEAR: &[Proto] = &[Proto::Secure, Proto::Socks];
+
+/// 关闭手动代理时三项全关 —— 同样是为了清掉旧版本 / 用户手工留下的三项
+const MANUAL_OFF: &[Proto] = &[Proto::Web, Proto::Secure, Proto::Socks];
+
+/// 单个协议的代理项
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+struct ProtocolProxy {
+    enable: bool,
+    server: String,
+}
+
 /// 单个网络服务的代理设置（"所有服务"写入前先逐个快照，还原时才不会张冠李戴）
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct ServiceProxy {
     service: String,
-    enable: bool,
-    server: String,
+    /// 逐协议记录：还原时必须**分别回填**（三个独立开关，合并成一个值就是上面那个 bug）
+    web: ProtocolProxy,
+    secure: ProtocolProxy,
+    socks: ProtocolProxy,
     bypass: String,
     autoconfig_url: Option<String>,
     pac_present: bool,
+}
+
+/// 还原点文件格式版本。
+///
+/// 1 = 旧版（三个协议合并成一个 `enable` / `server`）；2 = 逐协议。
+/// 旧文件**不能**按新格式解读：`web` 等字段会缺省成"三个协议都没开"，还原时反而把
+/// 用户原有的代理设置一起抹掉。所以版本不匹配时整份丢弃（见 [`take_snapshot`]）。
+const SNAPSHOT_FMT: u8 = 2;
+
+/// 还原点文件内容
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ServiceSnapshot {
+    fmt: u8,
+    services: Vec<ServiceProxy>,
 }
 
 // ---------------------------------------------------------------------------
@@ -186,18 +277,9 @@ fn join_host_port(host: Option<String>, port: Option<String>) -> String {
 
 /// 读某个服务自身的代理设置（还原用）
 fn read_service(service: &str) -> Result<ServiceProxy> {
-    let web = parse_proxy_block(&net::networksetup(&[
-        "-getwebproxy".to_string(),
-        service.to_string(),
-    ])?);
-    let secure = parse_proxy_block(&net::networksetup(&[
-        "-getsecurewebproxy".to_string(),
-        service.to_string(),
-    ])?);
-    let socks = parse_proxy_block(&net::networksetup(&[
-        "-getsocksfirewallproxy".to_string(),
-        service.to_string(),
-    ])?);
+    let web = read_protocol(service, Proto::Web)?;
+    let secure = read_protocol(service, Proto::Secure)?;
+    let socks = read_protocol(service, Proto::Socks)?;
     let bypass = match net::networksetup_soft(&[
         "-getproxybypassdomains".to_string(),
         service.to_string(),
@@ -221,18 +303,11 @@ fn read_service(service: &str) -> Result<ServiceProxy> {
             .unwrap_or_default(),
     );
 
-    let enable = web.0 || secure.0 || socks.0;
-    let server = if !web.1.is_empty() {
-        web.1.clone()
-    } else if !secure.1.is_empty() {
-        secure.1.clone()
-    } else {
-        socks.1.clone()
-    };
     Ok(ServiceProxy {
         service: service.to_string(),
-        enable,
-        server,
+        web,
+        secure,
+        socks,
         bypass,
         autoconfig_url: if auto.1.is_empty() {
             None
@@ -241,6 +316,15 @@ fn read_service(service: &str) -> Result<ServiceProxy> {
         },
         pac_present: auto.0 && !auto.1.is_empty(),
     })
+}
+
+/// 读单个协议的 (是否开启, "host:port")
+fn read_protocol(service: &str, proto: Proto) -> Result<ProtocolProxy> {
+    let (enable, server) = parse_proxy_block(&net::networksetup(&[
+        proto.get_cmd().to_string(),
+        service.to_string(),
+    ])?);
+    Ok(ProtocolProxy { enable, server })
 }
 
 /// 解析 `-getwebproxy` 之类命令的输出：(Enabled, "host:port")
@@ -276,7 +360,8 @@ fn parse_proxy_block(text: &str) -> (bool, String) {
 // 写
 // ---------------------------------------------------------------------------
 
-/// 只写入手动代理三件套（不动 PAC）。对所有未停用服务生效。
+/// 只写入手动代理（不动 PAC）：**只写 HTTP 一项**（见 [`MANUAL_PROTO`]），
+/// 并顺手清掉旧版本留下的 HTTPS / SOCKS 残留。对所有未停用服务生效。
 pub fn write_manual(enable: bool, server: &str, bypass: &str) -> Result<()> {
     let services = active_services()?;
     snapshot_services(&services)?; // 先留还原点
@@ -304,17 +389,11 @@ pub fn restore(state: &ProxyState) -> Result<()> {
             None => Ok(()),
         };
     }
-    // 没有还原点：把给定状态写到所有服务（与 write_manual 对称）
+    // 没有还原点：按与 write_manual 相同的规则落到所有服务（只写 HTTP），PAC 单独回填
     let services = active_services()?;
     for svc in &services {
-        write_service_full(&ServiceProxy {
-            service: svc.clone(),
-            enable: state.enable,
-            server: state.server.clone(),
-            bypass: state.bypass.clone(),
-            autoconfig_url: state.autoconfig_url.clone(),
-            pac_present: state.pac_present,
-        })?;
+        write_service_manual(svc, state.enable, &state.server, &state.bypass)?;
+        write_pac(svc, state.autoconfig_url.as_deref(), state.pac_present)?;
     }
     Ok(())
 }
@@ -323,12 +402,8 @@ pub fn restore(state: &ProxyState) -> Result<()> {
 pub fn hard_clear() -> Result<()> {
     let services = active_services()?;
     for svc in &services {
-        for set in [
-            "-setwebproxystate",
-            "-setsecurewebproxystate",
-            "-setsocksfirewallproxystate",
-        ] {
-            net::networksetup(&[set.to_string(), svc.clone(), "off".to_string()])?;
+        for p in MANUAL_OFF {
+            set_proxy_state(svc, *p, false)?;
         }
         let _ = net::networksetup_soft(&[
             "-setautoproxystate".to_string(),
@@ -340,58 +415,99 @@ pub fn hard_clear() -> Result<()> {
     Ok(())
 }
 
+/// 手动代理：启用时**只写 HTTP**，关闭时三项全关。
+///
+/// 两种情况下都会顺手关掉"不该开"的项：启用时清掉旧版本留下的 HTTPS / SOCKS 残留
+/// （否则它们会把流量继续送去那个端口），关闭时把三项一起清掉（用户手工设过、或用过旧版本）。
 fn write_service_manual(service: &str, enable: bool, server: &str, bypass: &str) -> Result<()> {
     if enable {
         let (host, port) = parse_server(server).ok_or_else(|| {
             AppError::coded(E3003).with_detail(format!("代理地址格式不正确：{server}"))
         })?;
-        for cmd in [
-            "-setwebproxy",
-            "-setsecurewebproxy",
-            "-setsocksfirewallproxy",
-        ] {
-            net::networksetup(&[
-                cmd.to_string(),
-                service.to_string(),
-                host.clone(),
-                port.to_string(),
-            ])
-            .map_err(|e| {
-                AppError::coded(E3003).with_detail(format!("{cmd} 失败（{service}）：{e}"))
-            })?;
-        }
-    } else {
-        for cmd in [
-            "-setwebproxystate",
-            "-setsecurewebproxystate",
-            "-setsocksfirewallproxystate",
-        ] {
-            net::networksetup(&[cmd.to_string(), service.to_string(), "off".to_string()])?;
-        }
+        set_proxy(service, MANUAL_PROTO, &host, port)?;
+    }
+    for p in if enable { MANUAL_CLEAR } else { MANUAL_OFF } {
+        set_proxy_state(service, *p, false)?;
     }
     write_exceptions(service, bypass)
 }
 
+/// `networksetup -set*proxy <服务> <主机> <端口>`（这条命令同时会把该项打开）
+fn set_proxy(service: &str, proto: Proto, host: &str, port: u16) -> Result<()> {
+    net::networksetup(&[
+        proto.set_cmd().to_string(),
+        service.to_string(),
+        host.to_string(),
+        port.to_string(),
+    ])
+    .map_err(|e| {
+        AppError::coded(E3003)
+            .with_detail(format!("设置 {} 代理失败（{service}）：{e}", proto.label()))
+    })?;
+    Ok(())
+}
+
+/// `networksetup -set*proxystate <服务> on|off`
+fn set_proxy_state(service: &str, proto: Proto, on: bool) -> Result<()> {
+    net::networksetup(&[
+        proto.state_cmd().to_string(),
+        service.to_string(),
+        if on { "on" } else { "off" }.to_string(),
+    ])
+    .map_err(|e| {
+        AppError::coded(E3003)
+            .with_detail(format!("{} 代理开关失败（{service}）：{e}", proto.label()))
+    })?;
+    Ok(())
+}
+
+/// 按还原点回填：**逐协议**写（三个协议是独立开关，合并成一个值正是 2026-10-10 那个断网 bug）
 fn write_service_full(p: &ServiceProxy) -> Result<()> {
-    write_service_manual(&p.service, p.enable, &p.server, &p.bypass)?;
-    match p.autoconfig_url.as_ref().filter(|u| !u.trim().is_empty()) {
+    for (proto, want) in [
+        (Proto::Web, &p.web),
+        (Proto::Secure, &p.secure),
+        (Proto::Socks, &p.socks),
+    ] {
+        write_protocol(&p.service, proto, want)?;
+    }
+    write_pac(&p.service, p.autoconfig_url.as_deref(), p.pac_present)?;
+    write_exceptions(&p.service, &p.bypass)
+}
+
+/// 把某个协议恢复成还原点里的样子：开着就写回服务器，关着就显式关掉
+fn write_protocol(service: &str, proto: Proto, want: &ProtocolProxy) -> Result<()> {
+    if !want.enable {
+        return set_proxy_state(service, proto, false);
+    }
+    let (host, port) = parse_server(&want.server).ok_or_else(|| {
+        AppError::coded(E3003).with_detail(format!(
+            "还原点里的 {} 代理地址不合法：{}",
+            proto.label(),
+            want.server
+        ))
+    })?;
+    set_proxy(service, proto, &host, port)
+}
+
+/// PAC（`-setautoproxyurl` / `-setautoproxystate`）
+fn write_pac(service: &str, url: Option<&str>, pac_present: bool) -> Result<()> {
+    match url.filter(|u| !u.trim().is_empty()) {
         Some(url) => {
             net::networksetup(&[
                 "-setautoproxyurl".to_string(),
-                p.service.clone(),
-                url.clone(),
+                service.to_string(),
+                url.to_string(),
             ])?;
-            let state = if p.pac_present { "on" } else { "off" };
             net::networksetup(&[
                 "-setautoproxystate".to_string(),
-                p.service.clone(),
-                state.to_string(),
+                service.to_string(),
+                if pac_present { "on" } else { "off" }.to_string(),
             ])?;
         }
         None => {
             let _ = net::networksetup_soft(&[
                 "-setautoproxystate".to_string(),
-                p.service.clone(),
+                service.to_string(),
                 "off".to_string(),
             ]);
         }
@@ -422,6 +538,12 @@ fn snapshot_path() -> std::path::PathBuf {
 }
 
 fn snapshot_services(services: &[String]) -> Result<()> {
+    // 只在还没有还原点时留一份：开着代理再写一次、最后关闭，都不该把"接管前"的那份
+    // 覆盖成"接管后"的状态 —— 否则还原出来的是我们自己的代理配置（与 app 层的
+    // `ensure_proxy_snapshot` 同一约定）。
+    if snapshot_path().exists() {
+        return Ok(());
+    }
     let mut list = Vec::new();
     for svc in services {
         match read_service(svc) {
@@ -429,7 +551,11 @@ fn snapshot_services(services: &[String]) -> Result<()> {
             Err(e) => log::warn!(target: "proxy", "读取服务 {svc} 的代理设置失败（跳过）：{e}"),
         }
     }
-    let text = serde_json::to_string_pretty(&list)?;
+    let snap = ServiceSnapshot {
+        fmt: SNAPSHOT_FMT,
+        services: list,
+    };
+    let text = serde_json::to_string_pretty(&snap)?;
     std::fs::write(snapshot_path(), text.as_bytes())?;
     Ok(())
 }
@@ -440,19 +566,30 @@ fn take_snapshot() -> Result<Option<Vec<ServiceProxy>>> {
         return Ok(None);
     }
     let text = std::fs::read_to_string(&path)?;
-    let list: Vec<ServiceProxy> = match serde_json::from_str(&text) {
-        Ok(l) => l,
+    let snap: ServiceSnapshot = match serde_json::from_str(&text) {
+        Ok(s) => s,
         Err(e) => {
+            // 旧格式（裸数组）或文件损坏：一律按"没有还原点"处理，绝不硬解读
             log::warn!(target: "proxy", "代理还原点解析失败（按无还原点处理）：{e}");
             let _ = std::fs::remove_file(&path);
             return Ok(None);
         }
     };
+    if snap.fmt != SNAPSHOT_FMT {
+        log::warn!(
+            target: "proxy",
+            "代理还原点格式版本 {} 与当前 {} 不符（按无还原点处理）",
+            snap.fmt,
+            SNAPSHOT_FMT
+        );
+        let _ = std::fs::remove_file(&path);
+        return Ok(None);
+    }
     let _ = std::fs::remove_file(&path);
-    if list.is_empty() {
+    if snap.services.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(list))
+        Ok(Some(snap.services))
     }
 }
 
@@ -556,5 +693,63 @@ mod tests {
         assert!(st.is_on());
         st.pac_present = true;
         assert!(!st.is_on());
+    }
+
+    /// 回归（2026-10-10 用户实测）：手动代理**只许写 HTTP 一项**。
+    /// 旧版本把三项都指到同一个 host:port —— 只支持 HTTP 的代理端口会收到 SOCKS 请求，
+    /// 一开代理就断网。
+    #[test]
+    fn manual_proxy_only_writes_http() {
+        assert_eq!(MANUAL_PROTO, Proto::Web);
+        assert_eq!(MANUAL_PROTO.set_cmd(), "-setwebproxy");
+        // 启用时要顺手关掉的，正是旧版本多写的那两项
+        assert_eq!(MANUAL_CLEAR, [Proto::Secure, Proto::Socks].as_slice());
+        // 关闭时三项全关（旧版本 / 手工设置的残留也要清掉）
+        assert_eq!(MANUAL_OFF.len(), 3);
+        assert!(MANUAL_OFF.contains(&Proto::Web));
+    }
+
+    /// 三个协议的命令必须各不相同：否则"只关 HTTPS"会误伤别的协议
+    #[test]
+    fn protocol_commands_are_distinct() {
+        let all = [Proto::Web, Proto::Secure, Proto::Socks];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                assert_ne!(a.get_cmd(), b.get_cmd());
+                assert_ne!(a.set_cmd(), b.set_cmd());
+                assert_ne!(a.state_cmd(), b.state_cmd());
+                assert_ne!(a.label(), b.label());
+            }
+        }
+    }
+
+    /// 还原点必须逐协议记录（合并成一个值时，还原会把"本来没开的协议"也打开 ——
+    /// 那正是这次故障在"关代理"路径上的同一副面孔）
+    #[test]
+    fn snapshot_keeps_protocols_separate() {
+        let snap = ServiceSnapshot {
+            fmt: SNAPSHOT_FMT,
+            services: vec![ServiceProxy {
+                service: "Wi-Fi".into(),
+                web: ProtocolProxy {
+                    enable: true,
+                    server: "127.0.0.1:7890".into(),
+                },
+                secure: ProtocolProxy::default(),
+                socks: ProtocolProxy::default(),
+                bypass: "localhost".into(),
+                autoconfig_url: None,
+                pac_present: false,
+            }],
+        };
+        let text = serde_json::to_string(&snap).unwrap();
+        let back: ServiceSnapshot = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.fmt, SNAPSHOT_FMT);
+        assert!(back.services[0].web.enable);
+        assert!(!back.services[0].secure.enable);
+        assert!(!back.services[0].socks.enable);
     }
 }

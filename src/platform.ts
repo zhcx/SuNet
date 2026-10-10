@@ -3,13 +3,24 @@
 // 界面上有十几处写着「UAC」「计划任务」「HKCU\...\Internet Settings」——
 // 这些说法在 macOS 上全是错的。集中在这一处，改文案只改这一个文件。
 //
-// 判定用 UA：WKWebView 在 macOS 上恒报 "Macintosh; Intel Mac OS X ..."，
-// WebView2 在 Windows 上报 "Windows NT ..."。同步可得，脚本一加载就能定 CSS
-// （窗口按钮 / 交通灯留位必须首帧就对，不能等后端返回）。
+// 判定优先读 <html data-os>：它由 public/os-mark.js（<head> 里的经典脚本，不是 module）
+// 在**首次绘制之前**打好 —— 顶栏给交通灯让位、隐藏自绘窗口按钮都必须在首帧生效，
+// 而本模块是 deferred 的，等到它执行时第一帧早就画完了。
+// 那个脚本不在时（被删 / 页面被别的入口加载）回退 UA：WKWebView 在 macOS 上恒报
+// "Macintosh; Intel Mac OS X ..."，WebView2 在 Windows 上报 "Windows NT ..."。
+// 判定条件必须与 os-mark.js 一致 —— 改一处要改两处。
 
 const ua = typeof navigator === "undefined" ? "" : navigator.userAgent;
 
-export const IS_MACOS = /Macintosh|Mac OS X/.test(ua);
+function detectMacos(): boolean {
+  if (typeof document !== "undefined") {
+    const marked = document.documentElement.dataset.os;
+    if (marked) return marked === "macos";
+  }
+  return /Macintosh|Mac OS X/.test(ua);
+}
+
+export const IS_MACOS = detectMacos();
 
 /** 平台名（日志 / 关于页） */
 export const OS_NAME = IS_MACOS ? "macOS" : "Windows";
@@ -53,16 +64,16 @@ export const AUTOSTART_HINT = IS_MACOS
 
 /** 代理一层的落点（macOS 写系统代理要 root，与 Windows 的 HKCU 完全不同） */
 export const PROXY_NEEDS_ADMIN = IS_MACOS;
-export const PROXY_TITLE = IS_MACOS ? "系统代理（网络的 Web / 安全 Web / SOCKS 代理）" : "系统代理（WinINET 全局代理）";
+export const PROXY_TITLE = IS_MACOS ? "系统代理（网络设置里的 Web 代理）" : "系统代理（WinINET 全局代理）";
 export const PROXY_HINT = IS_MACOS
-  ? "对所有活动网络服务写入 HTTP / HTTPS / SOCKS 代理（networksetup），<b>需要一次管理员授权</b>。"
+  ? "对所有活动网络服务写入 <b>HTTP 代理</b>（networksetup）；只写这一项 —— HTTPS 请求由系统复用 HTTP 代理，多写 SOCKS / 安全 Web 反而会让只支持 HTTP 的代理端口收到错协议的请求。"
   : "写入 HKCU\\...\\Internet Settings 并调用 InternetSetOptionW 通知系统，<b>全程不需要管理员权限</b>。";
 export const PROXY_SWITCH_NOTICE = IS_MACOS ? "即将开关系统代理（需要一次管理员授权）" : "即将开关系统代理（无需管理员权限）";
 
 /** 代理页「为什么有的程序不跟随」的正文（各平台作用域完全不同） */
 export const PROXY_SCOPE_WHY = IS_MACOS
-  ? `系统代理写在各网络服务的 HTTP / HTTPS / SOCKS 设置里（由 configd 管理），
-          Safari / 系统 WebKit 与大多数原生应用都会读它；
+  ? `系统代理写在各网络服务的 Web 代理（HTTP）设置里（由 configd 管理），
+         Safari / 系统 WebKit 与大多数原生应用都会读它（HTTPS 请求也复用这一项）；
           而 <code>curl</code> / <code>git</code> / <code>npm</code> / Homebrew 等命令行工具默认不读系统代理
           （需要自己设 <code>http_proxy</code> 环境变量），App Store 与部分软件更新走独立通道。`
   : `系统代理位于 WinINET 层，Chrome / Edge / Electron 应用 / 大部分办公软件都会读它；
@@ -83,7 +94,12 @@ export const MOD_GLYPH: Record<string, string> = IS_MACOS
   ? { Ctrl: "⌃", Alt: "⌥", Shift: "⇧", Super: "⌘" }
   : {};
 
-/** 在 <html> 上标记平台，供 CSS 做差异（隐藏自绘窗口按钮、给交通灯让位） */
+/**
+ * 在 <html> 上标记平台，供 CSS 做差异（隐藏自绘窗口按钮、给交通灯让位）。
+ *
+ * 正常情况下 public/os-mark.js 已经打过了，这里是兜底重写（幂等）：那个脚本被删、
+ * 页面被别的入口加载时，界面也不会整块错位。
+ */
 export function markPlatform(): void {
   if (typeof document !== "undefined") {
     document.documentElement.dataset.os = IS_MACOS ? "macos" : "windows";

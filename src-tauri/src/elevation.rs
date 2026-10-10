@@ -19,6 +19,7 @@ use crate::error::{AppError, Result};
 use crate::ipc::{self, TaskOutput};
 use crate::paths;
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[cfg(target_os = "windows")]
@@ -26,6 +27,22 @@ use crate::os::winapi::*;
 
 /// 提权任务的整体超时（§1.4.10：30 秒）
 pub const TASK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 提权是否**走到了要用户交互的那条路**（Windows = `runas` 弹 UAC，
+/// macOS = `osascript` 弹系统授权框）。
+///
+/// 用途：填进 `ApplyReport.prompted` —— 界面据此提示"装一次静默通道 / 免密助手之后，
+/// 切换就不用再输密码了"。只记最近一次，由 [`take_prompted`] 取走并清零。
+static PROMPTED: AtomicBool = AtomicBool::new(false);
+
+/// 取走并清零「这次提权弹框了吗」
+pub fn take_prompted() -> bool {
+    PROMPTED.swap(false, Ordering::Relaxed)
+}
+
+fn mark_prompted() {
+    PROMPTED.store(true, Ordering::Relaxed);
+}
 
 /// 任务名白名单形状校验：任务名会被拼进命令行，必须限制字符集
 fn task_name_ok(task: &str) -> bool {
@@ -83,6 +100,9 @@ pub fn run_elevated_raw(task: &str, payload: Value, timeout: Duration) -> Result
             ),
         }
     }
+
+    // 走到这里就是要弹 UAC 了（静默通道不可用 / 没装）：记一笔，供上层提示
+    mark_prompted();
 
     let (in_path, out_path) = ipc::prepare(task, payload)?;
     let exe = paths::exe_path()?;
@@ -233,6 +253,9 @@ pub fn run_elevated_raw(task: &str, payload: Value, timeout: Duration) -> Result
 #[cfg(target_os = "macos")]
 fn run_via_osascript(task: &str, payload: Value) -> Result<TaskOutput> {
     use crate::os::macos::net;
+
+    // 用户马上要输密码了：记一笔，供上层提示"可以装免密助手"
+    mark_prompted();
 
     let (in_path, out_path) = ipc::prepare(task, payload)?;
     let exe = paths::exe_path()?;

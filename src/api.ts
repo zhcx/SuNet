@@ -87,6 +87,8 @@ export interface ApplyReport {
   recovery_required: boolean;
   snapshot_id?: string | null;
   message: string;
+  /** 这次操作弹了系统授权框 / UAC（用户输了密码） */
+  prompted: boolean;
 }
 
 export interface ClearReport {

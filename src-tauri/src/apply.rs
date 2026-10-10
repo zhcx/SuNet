@@ -36,6 +36,9 @@ pub struct ApplyReport {
     pub recovery_required: bool,
     pub snapshot_id: Option<String>,
     pub message: String,
+    /// 这次事务里**弹过系统授权框 / UAC**（用户输了密码）。
+    /// 界面据此提示"装一次免密通道（macOS 免密助手 / Windows 静默通道）就不用再输密码"。
+    pub prompted: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -245,6 +248,9 @@ pub fn apply(state: &AppState, targets: &ApplyTargets, reason: &str) -> Result<A
     // 进程内锁：锁包住整个事务，避免两个 apply 互相踩踏
     let _guard = state.lock_apply()?;
 
+    // 先清掉别处（刷 DNS 缓存、安装免密助手…）留下的提权标记，只统计本次事务自己弹的框
+    let _ = elevation::take_prompted();
+
     let cfg = state.cfg_clone()?;
     let keep = cfg.settings.hosts_backup_keep.max(3) as usize;
     let active_id = cfg.active_profile_id.clone();
@@ -260,6 +266,7 @@ pub fn apply(state: &AppState, targets: &ApplyTargets, reason: &str) -> Result<A
             recovery_required: false,
             snapshot_id: None,
             message: "没有需要变更的项目".into(),
+            prompted: false,
         });
     }
 
@@ -278,7 +285,7 @@ pub fn apply(state: &AppState, targets: &ApplyTargets, reason: &str) -> Result<A
     let mut applied: Vec<&'static str> = Vec::new();
     let mut failure: Option<AppError> = None;
 
-    // ── Apply ① proxy（不弹 UAC 的一层，先落地）──
+    // ── Apply ① proxy：父进程侧准备（校验 / 前置探测 / 快照）──
     //
     // 顺序说明（2026-10-08 调整）：代理改到 hosts / DNS 之前。
     //   · 代理的失败模式最多 —— 前置连通性自检（§3.4）本身就可能直接失败。先做它，
@@ -286,18 +293,11 @@ pub fn apply(state: &AppState, targets: &ApplyTargets, reason: &str) -> Result<A
     //   · 回滚是 apply 的逆序，于是变成 hosts → DNS → proxy，正好是设计方案要的
     //     "先恢复解析层（dns/hosts），再恢复传输层（proxy）"；
     //   · 旧顺序（hosts → proxy → dns）的逆序是 dns → proxy → hosts，与文档口径相悖。
+    let mut proxy_plan: Option<ProxyPlan> = None;
     if failure.is_none() {
         if let Some(t) = targets.proxy.as_ref() {
-            match step_proxy(t) {
-                Ok(s) => {
-                    // 关闭代理时若被 PAC 覆盖，这一步是"诚实失败"而非异常
-                    let verified = s.verified;
-                    steps.push(s);
-                    applied.push("proxy");
-                    if !verified && t.enable {
-                        log::warn!(target: "apply", "代理步骤未通过校验");
-                    }
-                }
+            match prepare_proxy(t) {
+                Ok(p) => proxy_plan = Some(p),
                 Err(e) => {
                     steps.push(step_err("proxy", &e));
                     failure = Some(e);
@@ -306,13 +306,52 @@ pub fn apply(state: &AppState, targets: &ApplyTargets, reason: &str) -> Result<A
         }
     }
 
-    // ── Apply ②③ hosts + DNS：打包成一次提权 ──
+    // 代理写入落在哪里：macOS 需要 root → 并入下面的提权批处理（一次切换只弹一次授权框）；
+    // Windows 不需要 → 本进程直接写，行为与从前完全一致（不弹 UAC）。
+    let proxy_needs_root = proxy_plan.as_ref().map_or(false, |p| p.write.needs_root());
+    if failure.is_none() && !proxy_needs_root {
+        if let Some(p) = proxy_plan.as_ref() {
+            match p.write.write_here() {
+                Ok(notified) => {
+                    let s = proxy_step(p, notified);
+                    // 关闭代理时若被 PAC 覆盖，这一步是"诚实失败"而非异常
+                    if !s.verified && matches!(p.report, ProxyReport::Enabled { .. }) {
+                        log::warn!(target: "apply", "代理步骤未通过校验");
+                    }
+                    steps.push(s);
+                    applied.push("proxy");
+                }
+                Err(e) => {
+                    steps.push(step_err("proxy", &e));
+                    failure = Some(e);
+                }
+            }
+        }
+    }
+    let batch_proxy: Option<&ProxyPlan> = match proxy_plan.as_ref() {
+        Some(p) if proxy_needs_root && failure.is_none() => Some(p),
+        _ => None,
+    };
+
+    // ── Apply ②③ hosts + DNS（macOS 上连 ① 代理一起）：打包成一次提权 ──
     //
-    // 两层都必须提权，原先各起一个提权进程（Windows = 连着两次 UAC），现在合并成一次。
+    // 这些层都必须提权，原先各起一个提权进程（Windows = 连着两次 UAC，macOS 上含
+    // hosts / DNS 的方案 = 连着两个授权框），现在合并成一次。
     // 客户端顺序、失败即停、逐层回滚的语义都不变：子进程把已完成的步骤如实上报。
-    if failure.is_none() && (targets.hosts.is_some() || targets.dns.is_some()) {
-        match step_privileged_layers(targets) {
-            Ok(o) => {
+    if failure.is_none()
+        && (batch_proxy.is_some() || targets.hosts.is_some() || targets.dns.is_some())
+    {
+        match step_privileged_layers(targets, batch_proxy) {
+            Ok(mut o) => {
+                // 代理那一步的收尾只能由父进程做：子进程只知道"写成功了"，回读要读系统当前状态。
+                // 子进程只写、不发变更通知（通知历来是调用方的事），这里补上，
+                // 与 proxy_ops::write_manual 的语义对齐（macOS 上本就是个 no-op）。
+                if let Some(p) = batch_proxy {
+                    if let Some(i) = o.steps.iter().position(|s| s.applied && s.kind == "proxy") {
+                        let notified = system_proxy::notify_changed();
+                        o.steps[i] = proxy_step(p, notified);
+                    }
+                }
                 steps.extend(o.steps);
                 applied.extend(o.applied);
                 if o.failure.is_some() {
@@ -321,7 +360,13 @@ pub fn apply(state: &AppState, targets: &ApplyTargets, reason: &str) -> Result<A
             }
             Err(e) => {
                 // 基础设施失败（启动 / 超时 / 取消）：一步都没执行，按第一个目标层报错
-                let kind = if targets.hosts.is_some() { "hosts" } else { "dns" };
+                let kind = if batch_proxy.is_some() {
+                    "proxy"
+                } else if targets.hosts.is_some() {
+                    "hosts"
+                } else {
+                    "dns"
+                };
                 steps.push(step_err(kind, &e));
                 failure = Some(e);
             }
@@ -394,6 +439,7 @@ pub fn apply(state: &AppState, targets: &ApplyTargets, reason: &str) -> Result<A
         recovery_required,
         snapshot_id: Some(snap.id),
         message,
+        prompted: elevation::take_prompted(),
     })
 }
 
@@ -437,8 +483,94 @@ fn valid_proxy_host(host: &str) -> bool {
         && !h.starts_with('-')
 }
 
-fn step_proxy(t: &ProxyTarget) -> Result<ApplyStep> {
-    let probe_first = t.probe;
+// ---------------------------------------------------------------------------
+// 代理层：准备 → 写入 → 收尾
+// ---------------------------------------------------------------------------
+//
+// 拆成三段，是为了让「写入落在哪里」由平台决定：
+//   · Windows 写 HKCU，普通权限即可 → 本进程直接写（与从前一致，不弹 UAC）；
+//   · macOS 的 networksetup 必须 root → 写入并入 hosts / DNS 的**同一个提权批处理**。
+// 从前 macOS 上代理独占一次提权，于是含 hosts / DNS 的方案一次切换要弹两次系统授权框
+// （hosts + DNS 早已合并成一次，代理这一路当时没跟上）。合并后只弹一次，而且校验 /
+// 前置探测 / 快照都留在父进程 —— 失败时连授权框都不用弹。
+
+/// 代理写入内容（父进程侧已完成校验、前置探测与快照落盘）
+enum ProxyWrite {
+    /// 写入手动代理（`enable=false` 即关闭手动代理）
+    Manual {
+        enable: bool,
+        server: String,
+        bypass: String,
+    },
+    /// 按接管前的快照原样还原（含 PAC）
+    Restore(ProxyState),
+}
+
+/// 代理层收尾（回读校验 + 报告文案）需要的语义信息
+enum ProxyReport {
+    Enabled {
+        host: String,
+        port: u16,
+        bypass: String,
+        /// 开启前是否做了 TCP 连通性自检（§3.4）
+        probe: bool,
+    },
+    /// 没有快照可还原：直接关掉手动开关
+    Disabled { pac_present: bool },
+    /// 已按快照还原
+    Restored { enable: bool, pac_present: bool },
+}
+
+struct ProxyPlan {
+    write: ProxyWrite,
+    report: ProxyReport,
+}
+
+impl ProxyWrite {
+    /// macOS 的 networksetup 要 root；Windows 写 HKCU 不需要（见 `os::system_proxy`）
+    fn needs_root(&self) -> bool {
+        system_proxy::proxy_write_needs_root()
+    }
+
+    /// 在本进程直接写（Windows，或进程本身已是管理员 / root）。
+    ///
+    /// 仍然走 `proxy_ops` 这个「系统代理写操作的唯一出口」，返回的是
+    /// 「系统配置变更通知是否成功」（E3004 降级用）。
+    fn write_here(&self) -> Result<bool> {
+        match self {
+            ProxyWrite::Manual {
+                enable,
+                server,
+                bypass,
+            } => crate::proxy_ops::write_manual(*enable, server, bypass),
+            ProxyWrite::Restore(state) => crate::proxy_ops::restore(state),
+        }
+    }
+
+    /// 提权批处理里的子任务载荷（任务名必须落在 `task_runner` 的白名单里）
+    fn op(&self) -> serde_json::Value {
+        match self {
+            ProxyWrite::Manual {
+                enable,
+                server,
+                bypass,
+            } => json!({
+                "task": crate::proxy_ops::TASK_WRITE,
+                "data": { "enable": enable, "server": server, "bypass": bypass },
+            }),
+            ProxyWrite::Restore(state) => json!({
+                "task": crate::proxy_ops::TASK_RESTORE,
+                "data": { "state": state },
+            }),
+        }
+    }
+}
+
+/// 代理层的父进程侧准备：校验 → 前置连通性自检 → 接管前快照。
+///
+/// 这一步**不碰系统代理配置**（写的部分见 [`ProxyWrite`]），所以授权框要等到
+/// 确定真要写的时候才弹。
+fn prepare_proxy(t: &ProxyTarget) -> Result<ProxyPlan> {
     if t.enable {
         let host = t.host.trim().to_string();
         if host.is_empty() || t.port == 0 {
@@ -449,7 +581,7 @@ fn step_proxy(t: &ProxyTarget) -> Result<ApplyStep> {
             return Err(AppError::coded(E4002).with_detail(format!("代理地址非法：{host}")));
         }
         // 前置连通性自检：没有这一条，这个功能会造成全网中断
-        if probe_first && !probe::probe_proxy(&host, t.port) {
+        if t.probe && !probe::probe_proxy(&host, t.port) {
             return Err(AppError::coded(E3001).with_detail(format!(
                 "无法连接到 {host}:{}，开启后所有应用将无法联网。请先启动代理软件，或检查端口。",
                 t.port
@@ -457,70 +589,121 @@ fn step_proxy(t: &ProxyTarget) -> Result<ApplyStep> {
         }
         let before = system_proxy::read()?;
         ensure_proxy_snapshot(&before)?;
-        let server = format!("{host}:{}", t.port);
-        // 写操作统一走 proxy_ops：macOS 需要 root（helper / osascript），Windows 直接写 HKCU
-        let notified = crate::proxy_ops::write_manual(true, &server, &t.bypass)?;
-        let verified = system_proxy::verify(true).unwrap_or(false);
-        let msg = if verified {
-            format!(
-                "已启用系统代理 ***:{}（绕过：{}）{}",
-                t.port,
-                t.bypass,
-                if notified { "" } else { "；[E3004] 变更通知失败，部分应用需重启" }
-            )
-        } else {
-            format!("代理已写入但回读校验不通过（***:{}）", t.port)
-        };
-        log::info!(
-            target: "proxy",
-            "代理变更：enable=true server={} bypass={} 前置探测={} 通知={} 回读={}",
-            crate::logging::redact_host_port(&host, t.port),
-            t.bypass,
-            probe_first,
-            notified,
-            verified
-        );
-        Ok(ApplyStep {
-            kind: "proxy".into(),
-            applied: true,
-            verified,
-            message: msg,
+        Ok(ProxyPlan {
+            write: ProxyWrite::Manual {
+                enable: true,
+                server: format!("{host}:{}", t.port),
+                bypass: t.bypass.clone(),
+            },
+            report: ProxyReport::Enabled {
+                host,
+                port: t.port,
+                bypass: t.bypass.clone(),
+                probe: t.probe,
+            },
         })
     } else {
         // 关闭代理：不用"ProxyEnable=0"简单粗暴，而是快照还原（§3.3）
         match take_proxy_snapshot_file() {
             Some(snap) => {
-                crate::proxy_ops::restore(&snap)?;
-                let verified = system_proxy::verify(snap.enable).unwrap_or(false);
-                log::info!(
-                    target: "proxy",
-                    "代理已按接管前快照还原：enable={} pac={}",
-                    snap.enable,
-                    snap.autoconfig_url.is_some()
-                );
-                Ok(ApplyStep {
-                    kind: "proxy".into(),
-                    applied: true,
-                    verified,
-                    message: if snap.pac_present {
-                        "已还原为接管前的代理配置（含 PAC）".into()
-                    } else {
-                        "已还原为接管前的代理配置".into()
-                    },
+                let report = ProxyReport::Restored {
+                    enable: snap.enable,
+                    pac_present: snap.pac_present,
+                };
+                Ok(ProxyPlan {
+                    write: ProxyWrite::Restore(snap),
+                    report,
                 })
             }
             None => {
                 let now = system_proxy::read()?;
-                crate::proxy_ops::write_manual(false, "", &now.bypass)?;
-                if now.pac_present {
-                    // 诚实报告：PAC 接管时 ProxyEnable=0 并不生效
-                    Ok(step_soft(
-                        "proxy",
-                        "[E3004] 已关闭手动代理，但系统存在 PAC（AutoConfigURL），代理仍由 PAC 接管；如需彻底清除请使用「清除代理设置」",
-                    ))
+                Ok(ProxyPlan {
+                    write: ProxyWrite::Manual {
+                        enable: false,
+                        server: String::new(),
+                        bypass: now.bypass.clone(),
+                    },
+                    report: ProxyReport::Disabled {
+                        pac_present: now.pac_present,
+                    },
+                })
+            }
+        }
+    }
+}
+
+/// 代理层的收尾：回读校验 + 报告文案（写入已经完成，无论落在本进程还是提权子进程）
+fn proxy_step(plan: &ProxyPlan, notified: bool) -> ApplyStep {
+    match &plan.report {
+        ProxyReport::Enabled {
+            host,
+            port,
+            bypass,
+            probe,
+        } => {
+            let verified = system_proxy::verify(true).unwrap_or(false);
+            let message = if verified {
+                format!(
+                    "已启用系统代理 ***:{}（绕过：{}）{}",
+                    port,
+                    bypass,
+                    if notified {
+                        ""
+                    } else {
+                        "；[E3004] 变更通知失败，部分应用需重启"
+                    }
+                )
+            } else {
+                format!("代理已写入但回读校验不通过（***:{}）", port)
+            };
+            log::info!(
+                target: "proxy",
+                "代理变更：enable=true server={} bypass={} 前置探测={} 通知={} 回读={}",
+                crate::logging::redact_host_port(host, *port),
+                bypass,
+                probe,
+                notified,
+                verified
+            );
+            ApplyStep {
+                kind: "proxy".into(),
+                applied: true,
+                verified,
+                message,
+            }
+        }
+        ProxyReport::Restored {
+            enable,
+            pac_present,
+        } => {
+            let verified = system_proxy::verify(*enable).unwrap_or(false);
+            log::info!(
+                target: "proxy",
+                "代理已按接管前快照还原：enable={} pac={} 回读={}",
+                enable,
+                pac_present,
+                verified
+            );
+            ApplyStep {
+                kind: "proxy".into(),
+                applied: true,
+                verified,
+                message: if *pac_present {
+                    "已还原为接管前的代理配置（含 PAC）".into()
                 } else {
-                    Ok(step_ok("proxy", "系统代理已关闭"))
-                }
+                    "已还原为接管前的代理配置".into()
+                },
+            }
+        }
+        ProxyReport::Disabled { pac_present } => {
+            if *pac_present {
+                // 诚实报告：PAC 接管时 ProxyEnable=0 并不生效
+                step_soft(
+                    "proxy",
+                    "[E3004] 已关闭手动代理，但系统存在 PAC（AutoConfigURL），代理仍由 PAC 接管；如需彻底清除请使用「清除代理设置」",
+                )
+            } else {
+                step_ok("proxy", "系统代理已关闭")
             }
         }
     }
@@ -535,34 +718,55 @@ struct LayersOutcome {
     failure: Option<AppError>,
 }
 
-/// 把 hosts 与 DNS 打包进**同一个提权子进程**执行（顺序：hosts → DNS，与逐层调用一致）。
+/// 一次提权要跑的子任务清单，顺序 = 落地顺序（回滚按它的逆序走）：
+/// 代理（仅当它需要提权）→ hosts → DNS。
 ///
-/// 这两层都必须提权：原先各起一个提权进程，Windows 上就是连着弹两次 UAC；合并后只起一次。
-/// `Err` 只表示"基础设施失败"（启动失败 / 超时 / 用户取消），此时一步都没执行；
-/// 子任务本身的失败放在 [`LayersOutcome::failure`] 里返回，并把已完成的步骤一并带回来，
-/// 父进程据此决定回滚哪些层。
-fn step_privileged_layers(targets: &ApplyTargets) -> Result<LayersOutcome> {
+/// 代理排在最前，是为了让落地顺序与逐层调用时**完全一致** —— 逆序回滚于是仍是
+/// dns → hosts → proxy，即设计方案要的"先恢复解析层，再恢复传输层"。
+fn privileged_ops(
+    targets: &ApplyTargets,
+    proxy: Option<&ProxyPlan>,
+) -> Result<Vec<serde_json::Value>> {
     let mut ops: Vec<serde_json::Value> = Vec::new();
+    if let Some(p) = proxy {
+        ops.push(p.write.op());
+    }
     if let Some(entries) = targets.hosts.as_ref() {
         ops.push(json!({ "task": "hosts_apply", "data": { "entries": entries } }));
     }
     if let Some(t) = targets.dns.as_ref() {
         // 网卡在父进程侧先解析：task_runner 的 dns_set 要求 alias 非空
-        let alias = match resolve_dns_alias(t) {
-            Ok(a) => a,
-            Err(e) => {
-                return Ok(LayersOutcome {
-                    steps: vec![step_err("dns", &e)],
-                    applied: Vec::new(),
-                    failure: Some(e),
-                })
-            }
-        };
+        let alias = resolve_dns_alias(t)?;
         ops.push(json!({
             "task": "dns_set",
             "data": { "alias": alias, "v4": t.v4, "v6": t.v6 }
         }));
     }
+    Ok(ops)
+}
+
+/// 把需要提权的层打包进**同一个提权子进程**执行。
+///
+/// 这些层都必须提权（hosts、DNS，以及 macOS 上的代理）：原先各起一个提权进程，
+/// 一次方案切换就要连着弹好几次 UAC / 授权框；合并后只起一次。
+/// `Err` 只表示"基础设施失败"（启动失败 / 超时 / 用户取消），此时一步都没执行；
+/// 子任务本身的失败放在 [`LayersOutcome::failure`] 里返回，并把已完成的步骤一并带回来，
+/// 父进程据此决定回滚哪些层。
+fn step_privileged_layers(
+    targets: &ApplyTargets,
+    proxy: Option<&ProxyPlan>,
+) -> Result<LayersOutcome> {
+    let ops = match privileged_ops(targets, proxy) {
+        Ok(ops) => ops,
+        // 组装阶段的失败只可能来自 DNS 网卡解析（代理 / hosts 的载荷是纯数据）
+        Err(e) => {
+            return Ok(LayersOutcome {
+                steps: vec![step_err("dns", &e)],
+                applied: Vec::new(),
+                failure: Some(e),
+            })
+        }
+    };
     if ops.is_empty() {
         return Ok(LayersOutcome::default());
     }
@@ -576,6 +780,7 @@ fn step_privileged_layers(targets: &ApplyTargets) -> Result<LayersOutcome> {
             continue;
         }
         match s.kind.as_str() {
+            "proxy" => applied.push("proxy"),
             "hosts" => applied.push("hosts"),
             "dns" => applied.push("dns"),
             _ => {}
@@ -712,6 +917,7 @@ fn rollback_layers(snap: &Snapshot, applied: &[&str]) -> (Vec<ApplyStep>, bool) 
 /// 按快照还原三层（§6.3 的「还原」入口）
 pub fn restore_from_snapshot(state: &AppState, snapshot_id: Option<&str>) -> Result<ApplyReport> {
     let _guard = state.lock_apply()?;
+    let _ = elevation::take_prompted(); // 只统计本次还原自己弹的框
     let snap = match snapshot_id {
         Some(id) => backup::load(id)?,
         None => backup::latest()?
@@ -743,6 +949,7 @@ pub fn restore_from_snapshot(state: &AppState, snapshot_id: Option<&str>) -> Res
         } else {
             format!("已还原到快照（{}）", snap.created_at)
         },
+        prompted: elevation::take_prompted(),
     })
 }
 
@@ -853,5 +1060,111 @@ pub fn expire_clear_undo(state: &AppState) {
             }
             rt.clear_deadline = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enabled_proxy_plan() -> ProxyPlan {
+        ProxyPlan {
+            write: ProxyWrite::Manual {
+                enable: true,
+                server: "127.0.0.1:7890".into(),
+                bypass: "localhost;127.*;<local>".into(),
+            },
+            report: ProxyReport::Enabled {
+                host: "127.0.0.1".into(),
+                port: 7890,
+                bypass: "localhost;127.*;<local>".into(),
+                probe: false,
+            },
+        }
+    }
+
+    fn targets_with_hosts_and_dns() -> ApplyTargets {
+        ApplyTargets {
+            hosts: Some(Vec::new()),
+            proxy: Some(ProxyTarget {
+                enable: true,
+                ..Default::default()
+            }),
+            dns: Some(DnsTarget {
+                alias: "Wi-Fi".into(),
+                v4: Some(vec!["1.1.1.1".into()]),
+                v6: None,
+            }),
+            strict_verify: true,
+        }
+    }
+
+    /// macOS 上代理必须和 hosts / DNS 落在**同一次**提权里 —— 从前代理独占一次提权，
+    /// 于是含 hosts / DNS 的方案一次切换要弹两次系统授权框。
+    /// 顺序也必须是 代理 → hosts → DNS：回滚按落地顺序的逆序走，才是 dns → hosts → proxy。
+    #[test]
+    fn privileged_ops_packs_proxy_with_hosts_and_dns_in_one_batch() {
+        let plan = enabled_proxy_plan();
+        let ops = privileged_ops(&targets_with_hosts_and_dns(), Some(&plan)).unwrap();
+
+        let tasks: Vec<&str> = ops.iter().map(|o| o["task"].as_str().unwrap()).collect();
+        assert_eq!(tasks, ["proxy_write", "hosts_apply", "dns_set"]);
+        assert_eq!(ops[0]["data"]["server"], "127.0.0.1:7890");
+
+        // 子任务名必须落在白名单里，否则整个 batch 会被子进程按 E1004 拒掉
+        for op in &ops {
+            let t = op["task"].as_str().unwrap();
+            assert!(
+                crate::task_runner::KNOWN_TASKS.contains(&t),
+                "{t} 不在任务白名单里"
+            );
+        }
+    }
+
+    /// 方案不含 hosts / DNS 时（只有代理要提权），批处理里就只该有代理一步
+    #[test]
+    fn privileged_ops_without_hosts_or_dns_has_only_proxy() {
+        let plan = enabled_proxy_plan();
+        let targets = ApplyTargets {
+            hosts: None,
+            proxy: Some(ProxyTarget {
+                enable: true,
+                ..Default::default()
+            }),
+            dns: None,
+            strict_verify: true,
+        };
+        let ops = privileged_ops(&targets, Some(&plan)).unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0]["task"], "proxy_write");
+    }
+
+    /// Windows（代理不需要提权）不会把代理塞进批处理：传 None 时清单里就没有它，
+    /// 行为与从前完全一致
+    #[test]
+    fn privileged_ops_skips_proxy_when_it_needs_no_root() {
+        let ops = privileged_ops(&targets_with_hosts_and_dns(), None).unwrap();
+        let tasks: Vec<&str> = ops.iter().map(|o| o["task"].as_str().unwrap()).collect();
+        assert_eq!(tasks, ["hosts_apply", "dns_set"]);
+    }
+
+    /// 还原路径（关闭代理 / 回滚）也可以进批处理，载荷形状必须是 `{ state: ProxyState }`
+    #[test]
+    fn proxy_restore_op_carries_snapshot_state() {
+        let plan = ProxyPlan {
+            write: ProxyWrite::Restore(ProxyState {
+                enable: true,
+                server: "10.0.0.1:1080".into(),
+                ..Default::default()
+            }),
+            report: ProxyReport::Restored {
+                enable: true,
+                pac_present: false,
+            },
+        };
+        let op = plan.write.op();
+        assert_eq!(op["task"], "proxy_restore");
+        assert_eq!(op["data"]["state"]["server"], "10.0.0.1:1080");
+        assert!(crate::task_runner::KNOWN_TASKS.contains(&op["task"].as_str().unwrap()));
     }
 }

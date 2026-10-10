@@ -1765,10 +1765,11 @@ details.help summary {
 
 /* ---------------------------------------------------------------------------
    macOS 差异（设计方案 §4.5.6）
-   <html data-os="macos"> 由 src/platform.ts 在启动时打上。只写"哪里不一样"：
+   <html data-os="macos"> 由 public/os-mark.js（<head> 里的经典脚本）在**首次绘制前**
+   打上（src/platform.ts 只做兜底重写）。只写"哪里不一样"：
    主窗口用原生交通灯（titleBarStyle: Overlay + hiddenTitle），所以
    · 自绘的最小化 / 关闭按钮必须藏起来，否则与红黄绿灯重复；
-   · 顶栏左侧要空出约三个灯的位置（trafficLightPosition x=14，三个 12px 按钮）。
+   · 顶栏左侧要给三个灯留出安全区。
    快捷面板是 decorations: false 的浮窗，两平台一致，不需要额外规则。
 --------------------------------------------------------------------------- */
 [data-os="macos"] #btn-min,
@@ -1777,5 +1778,11 @@ details.help summary {
 }
 
 [data-os="macos"] .topbar {
-  padding-left: 78px;
+  /* 交通灯安全区。落点来自 tauri.macos.conf.json 的 trafficLightPosition.x = 14，
+     三个 12px 按钮 + 两个 8px 间隙 = 66px，再留 22px 呼吸位 → 88px。
+     余量不是随手加的：tao 的定位是"每次 drawRect 打一次补丁"，AppKit 在标题变化 /
+     退出全屏后会先把按钮弹回系统默认位置（默认值随系统版本变，不保证是 14），
+     要等下一次重绘才回到配置值（tao 的 reapply_traffic_light_inset 就是补这个的）。
+     88px 时两种位置都不会压到 logo。改 conf 里的 x 时这里要同步。 */
+  padding-left: 88px;
 }

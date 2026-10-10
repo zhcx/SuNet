@@ -13,7 +13,11 @@ use crate::os::dns_client::{self, AddressFamily};
 use crate::os::system_proxy::{self, ProxyState};
 use serde_json::Value;
 
-const KNOWN_TASKS: &[&str] = &[
+/// 任务白名单：载荷校验与批处理都用它。
+///
+/// 对 crate 内可见，是为了让 `apply.rs` 的单测能断言"组装出来的子任务名一定在白名单里"
+/// —— 名字写错时整批会被子进程按 E1004 拒掉，这种错误不该等到运行时才发现。
+pub(crate) const KNOWN_TASKS: &[&str] = &[
     "hosts_apply",
     "hosts_restore",
     "dns_set",

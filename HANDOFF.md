@@ -52,6 +52,11 @@ git tag v0.0.1 && git push origin v0.0.1
 > · **修法**：新增提权任务 `autostart_set`，实现抽到 `os/windows/autostart.rs::apply()`；`cmd/system.rs` 的 `platform_autostart` 改为 `elevation::run_elevated("autostart_set", …)`（装过静默通道则静默，否则一次 UAC）。macOS 侧本来就是 LaunchAgent，不需要提权，未动。
 > · **顺带修掉乱码**：schtasks / netsh 的输出按 **OEM 代码页**（简中 = 936）编码，代码却用 `from_utf8_lossy`，中文系统上界面上只能看到一片方块、真正的报错全丢。新增 `winapi::decode_console_output` 并替换三处调用点（自启、静默通道、netsh DNS 写入）。
 > · **发布流程加固**：`prepare-release` 在同 tag 重发时会先清掉旧资产再刷新说明（否则 tauri-action 上传同名资产会撞名字），参考 zeditor 的同类步骤。
+> 2026-10-10 macOS 实测修复（用户报告，四项）：
+> · **左上角 logo 与系统交通灯重合 = 首帧问题**：`data-os` 由 `src/platform.ts`（deferred 模块）打上，**晚于首次绘制** —— 而主窗口在 `setup()` 里就 `show()` 出来了，于是会先画一帧"没给交通灯留白"的顶栏再跳到正确位置。改为首帧脚本 `public/os-mark.js`（两个 HTML 的 `<head>` 以**经典脚本**引入；**不能内联** —— 生产 CSP 是 `script-src 'self'`，内联会被拦，`devCsp` 里的 `'unsafe-inline'` 会掩盖这个坑）在首帧前打标，`platform.ts` 优先读该属性、缺失才回退 UA，顶栏安全区 78 → 88px（覆盖 AppKit 把按钮弹回默认位置的那一帧，见 tao 的 `reapply_traffic_light_inset`）。
+> · **一次方案切换要输两次密码 = 代理没并入提权批处理**：macOS 的系统代理写入（`networksetup`）要 root，此前 `step_proxy` 独占一次提权，与 hosts / DNS 的 `batch` 合计两次授权。现在代理层拆成 **准备（父进程：校验 / 前置探测 / 快照）→ 写入（`ProxyWrite::needs_root()` 决定本进程还是批处理）→ 收尾（父进程：回读校验 + 报告文案）**，macOS 上代理作为 `batch` 的第一个子任务（复用 `proxy_write` / `proxy_restore`）→ 一次切换只弹一次授权框。Windows 路径**完全不变**（代理不需要提权，仍在本进程写）。顺带把「组装子任务」的 `privileged_ops()` 抽出来并补了 4 条单测（顺序 = 代理 → hosts → DNS；`proxy` 传 `None` 时不含代理；名字都在 `task_runner::KNOWN_TASKS` 白名单里）。
+> · **macOS 一开代理就断网 = 三个协议被当成一个**：macOS 的 HTTP / HTTPS / SOCKS 是三个独立开关，`os/macos/system_proxy.rs` 原先三项都写同一个 `host:port` —— 只支持 HTTP 的代理端口收到 SOCKS 请求，其它程序就走不动了。改为**只写 HTTP**（`-setwebproxy`；CFNetwork 没有 Secure Web Proxy 时 HTTPS 也走 HTTP 代理），启用时顺手关掉旧版本留下的 HTTPS / SOCKS 残留、关闭时三项全关；命令表收敛成 `Proto`（get/set/state 三个命令 + 标签）+ `MANUAL_PROTO` / `MANUAL_CLEAR` / `MANUAL_OFF` 三个常量，补了 3 条 macOS 专属单测（只写 HTTP、三个协议命令互不相同、还原点逐协议）。**还原点也改成逐协议**（`proxy_prev.json` 加 `fmt=2`，旧格式整份丢弃）：合并成一个值时"切回原状态"会把本来没开的协议一起打开，是同一个故障的另一副面孔；另外 `snapshot_services` 不再覆盖已存在的还原点（与 app 层 `ensure_proxy_snapshot` 同一约定）。
+> · **输过密码后主动提示怎么免掉它**：`ApplyReport` 新增 `prompted`（提权层在走 `runas` / `osascript` 时打标记，事务开始先清零，只统计本次），`cmd/profile.rs` 的 `hint_no_password()` 在切换 / 还原确实弹过框、而免密通道还没装（或装了没跑起来）时提示一次并给「去设置」入口（`elevation_task::no_password_hint()`：macOS 给出安装/放行指引，Windows 返回 `None`——静默通道的安全边界要求显式开启，不主动引导）。每个会话只提示一次。
 
 | 事实 | 值 |
 |---|---|
@@ -112,7 +117,7 @@ git tag v0.0.1 && git push origin v0.0.1
 | 组件样式 | `src/app.css` |
 | 图标 | `src/icons.ts`（内联 SVG，`svg(name,size)`） |
 | 弹层/提示/忙碌态 | `src/ui.ts` |
-| **平台判定与文案/键名差异（前端）** | `src/platform.ts`（`IS_MACOS` / `AUTH_*` / `MOD_GLYPH` / `markPlatform()`）＋ `src/app.css` 末尾的 `[data-os="macos"]` 段 |
+| **平台判定与文案/键名差异（前端）** | 首帧脚本 `public/os-mark.js`（在 `<head>` 里给 `<html>` 打 `data-os`）＋ `src/platform.ts`（`IS_MACOS` / `AUTH_*` / `MOD_GLYPH` / `markPlatform()` 兜底）＋ `src/app.css` 末尾的 `[data-os="macos"]` 段 |
 
 ---
 
@@ -487,13 +492,13 @@ WinHTTP 代理、PAC 代理模式、TUN/虚拟网卡、hosts 通配符规则、�
 
 | 能力 | Windows（已实测） | macOS（已实现，**未真机验证**） |
 |---|---|---|
-| 系统代理 | 注册表 `Internet Settings` + `InternetSetOptionW` 通知 | `networksetup -setwebproxy` / `-setsecurewebproxy` / `-setsocksfirewallproxy` × **全部活动服务**；读回 `scutil --proxy`；还原点 `~/Library/Application Support/SuNet/proxy_prev.json` |
+| 系统代理 | 注册表 `Internet Settings` + `InternetSetOptionW` 通知 | **只写 HTTP**（`-setwebproxy`——2026-10-10：三项同端口会让只支持 HTTP 的代理端口收到 SOCKS 而断网）× 全部活动服务，并清掉 HTTPS / SOCKS 残留；读回 `scutil --proxy`；还原点 `~/Library/Application Support/SuNet/proxy_prev.json` 逐协议记录（`fmt=2`，旧格式整份丢弃） |
 | DNS | `GetAdaptersAddresses` 枚举（~8ms）+ `netsh` 分族写 | `networksetup -listnetworkserviceorder` + `-listallhardwareports` + `ifconfig`（2s 缓存）；`-setdnsservers` 分族写、写后回读校验；刷缓存 `dscacheutil -flushcache` + `killall -HUP mDNSResponder`（走提权任务 `dns_flush`） |
 | hosts | `…\drivers\etc\hosts` + `ReplaceFileW` | `/etc/hosts` + 同目录 `.tmp` → `rename` → `chown 0:0` / `chmod 0644` |
-| 提权 | `ShellExecuteExW` runas + `--task` 子进程 IPC | ① 常驻助手：root LaunchDaemon（`launchctl bootstrap system`）+ `/var/run/sunet-helper.sock`，按 peer uid（root 或 console 用户）校验，`--helper-install` 装一次免密码；② 回退 `osascript … with administrator privileges`，弹一次系统授权框（这条路径**没有超时**——等用户输密码不算卡死；取消按 `-128` 或 "User canceled" 判 `E1001`） |
+| 提权 | `ShellExecuteExW` runas + `--task` 子进程 IPC | ① 常驻助手：root LaunchDaemon（`launchctl bootstrap system`）+ `/var/run/sunet-helper.sock`，按 peer uid（root 或 console 用户）校验，`--helper-install` 装一次免密码；② 回退 `osascript … with administrator privileges`，弹一次系统授权框（这条路径**没有超时**——等用户输密码不算卡死；取消按 `-128` 或 "User canceled" 判 `E1001`）。一次方案切换最多弹**一次**（代理与 hosts / DNS 同批，见顶上 2026-10-10 那条） |
 | 自启动 | 计划任务（`/RL LIMITED` `/SC ONLOGON`） | `~/Library/LaunchAgents/com.sunet.desktop.autostart.plist` + `launchctl bootstrap gui/<uid>` |
 | 全局热键 | `global-shortcut`，展示 `Ctrl+Alt+S` | 同一个插件；⌘ 在录制里规范名为 `Super`（后端 `mods_of` → `MOD_WIN`，插件认识 `Super`），展示层由 `platform.ts` 的 `MOD_GLYPH` 渲染成 ⌃⌥⇧⌘ |
-| 窗口外观 | 无边框自绘顶栏（§4.18） | 原生交通灯：`tauri.macos.conf.json` 的 `titleBarStyle: "Overlay"` + `hiddenTitle` + `trafficLightPosition {x:14,y:18}`；CSS 隐藏自绘 `−` / `×` 并给 `.topbar` 留 78px 左内边距 |
+| 窗口外观 | 无边框自绘顶栏（§4.18） | 原生交通灯：`tauri.macos.conf.json` 的 `titleBarStyle: "Overlay"` + `hiddenTitle` + `trafficLightPosition {x:14,y:18}`；CSS 隐藏自绘 `−` / `×` 并给 `.topbar` 留 88px 左内边距。`data-os` 由首帧脚本 `public/os-mark.js`（两个 HTML 的 `<head>` 经典脚本引入）在**首帧前**打上（`src/platform.ts` 只做兜底重写） |
 | 签名 | 未签名（SmartScreen） | `signingIdentity: "-"`（ad-hoc；没有开发者证书，因此不签名不公证 → 首次打开要在系统设置里放行） |
 | 界面文案 | UAC / 计划任务 / WinINET | 系统授权框 / 登录项 / 网络服务代理（`src/platform.ts` 按 `navigator.userAgent` 切） |
 
@@ -502,7 +507,7 @@ WinHTTP 代理、PAC 代理模式、TUN/虚拟网卡、hosts 通配符规则、�
 2. 常驻助手的安装/鉴权/卸载：BTM 是否拦 `bootstrap system`、socket peer uid 校验、卸载残留。
 3. `pick_in_use()` 的服务选择：只有 Wi-Fi、或 Wi-Fi + 有线同时在用时，写到的服务是否是用户实际在用的那个。
 4. 按架构构建的 dmg 产物（`--target aarch64-apple-darwin` / `x86_64-apple-darwin`）、ad-hoc 签名后的 Gatekeeper 提示。
-5. 前端 `data-os="macos"` 的样式/文案分支是否完整（自绘按钮隐藏、顶栏留白、授权文案）。
+5. 前端 `data-os="macos"` 的样式/文案分支是否完整（自绘按钮隐藏、顶栏留白、授权文案）。用户实测反馈过"logo 与交通灯重合"，2026-10-10 按「首帧打标 + 安全区 88px」修，**仍需真机复核**（本机没有 macOS）。
 
 **本机验证边界**：本机没有 macOS，交叉检查也做不了 —— 没有 `cc`，`cargo check --target aarch64-apple-darwin` 会死在 `objc2-exception-helper` 的 build script（`failed to find tool "cc"`）。所以"macOS 能不能编译"只能由 CI 回答（**CI 已给出答案：能编译、59 项单测通过、dmg 能出——当时为 universal 构建，见 §5.1**）；本地能保证的只有 `rustfmt --edition 2021 --check` 无语法错误 + Windows 侧 `cargo test` 不回归。
 
