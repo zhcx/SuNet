@@ -4,6 +4,7 @@
 //! 约定：本层不持有 UI 状态、不依赖 WebView2/WKWebView，只做系统调用与数据读写。
 
 pub mod dns_client;
+pub mod dock;
 pub mod fs_security;
 pub mod hosts_io;
 pub mod net;

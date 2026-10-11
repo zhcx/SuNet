@@ -280,6 +280,9 @@ pub fn show_window(app: &AppHandle, tab: Option<&str>) {
     // 打开主窗口时收起快捷面板，避免两个窗口叠在一起
     hide_quick(app);
     if let Some(win) = app.get_webview_window("main") {
+        // macOS：先让 Dock 图标回来再显示窗口 —— UIElement → Foreground 是异步的，
+        // 顺序反了窗口可能"显示在别的应用后面"、也拿不到焦点（Windows 上是空实现）
+        crate::os::dock::show(app);
         let _ = win.unminimize();
         let _ = win.show();
         let _ = win.set_focus();

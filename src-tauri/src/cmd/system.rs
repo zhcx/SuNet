@@ -1043,6 +1043,8 @@ pub async fn logs_export(_app: AppHandle, state: State<'_, SharedState>) -> Resu
 pub async fn window_hide(app: AppHandle) -> Result<()> {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.hide();
+        // macOS：藏到托盘之后 Dock 里不再留图标（那时用户只在菜单栏看得到 SuNet）
+        crate::os::dock::hide(&app);
     }
     Ok(())
 }

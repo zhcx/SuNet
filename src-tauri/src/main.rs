@@ -208,7 +208,11 @@ fn run_gui() {
             if let Some(win) = handle.get_webview_window("main") {
                 if minimized || panel_only {
                     let _ = win.hide();
+                    // macOS：没有窗口就不留 Dock 图标（自启 / --panel 起就只见菜单栏图标）
+                    os::dock::hide(&handle);
                 } else {
+                    // macOS：Dock 图标先回来再显示窗口（UIElement → Foreground 是异步的）
+                    os::dock::show(&handle);
                     let _ = win.show();
                     let _ = win.set_focus();
                 }
@@ -350,6 +354,9 @@ fn run_gui() {
                     tray::set_quick_pinned(window.app_handle(), false);
                     return;
                 }
+                // 剩下的就是主窗口：藏到托盘之后 Dock 里不再留图标
+                // （macOS 切到 UIElement，仅菜单栏保留图标；Windows 上是空实现）
+                os::dock::hide(window.app_handle());
                 if let Some(s) = window.app_handle().try_state::<state::SharedState>() {
                     s.clear_warn_unread();
                 }

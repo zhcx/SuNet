@@ -6,6 +6,7 @@
 
 pub mod autostart;
 pub mod dns_client;
+pub mod dock;
 pub mod fs_security;
 pub mod hosts_io;
 pub mod privilege;
