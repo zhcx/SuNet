@@ -76,6 +76,57 @@ export interface ProxyEndpoint {
   port: number;
 }
 
+/**
+ * 开着的协议 → `{label, addr}`，顺序固定 HTTP → HTTPS → SOCKS（与系统设置一致）。
+ *
+ * macOS 的三个协议是互相独立的开关，可以同时开着且各指一个地址；界面要**逐项**
+ * 显示，否则用户会以为只走了一个代理（旧版只显示 `server`，另两个完全不可见）。
+ *
+ * 老快照 / Windows 的 `ProxyState` 没有这三个字段 —— 退回主落点、不加标签。
+ * 快捷面板、主窗口系统代理页、方案总览页三处共用，口径必须一致。
+ */
+export function proxyEndpoints(st: ProxyState): { label: string; addr: string }[] {
+  const live = (
+    [
+      ["HTTP", st.http_proxy],
+      ["HTTPS", st.https_proxy],
+      ["SOCKS", st.socks_proxy],
+    ] as [string, string | null | undefined][]
+  )
+    .filter((e): e is [string, string] => typeof e[1] === "string" && e[1].trim() !== "")
+    .map(([label, addr]) => ({ label, addr: addr.trim() }));
+  if (live.length) return live;
+  const main = (st.server || "").trim();
+  return main ? [{ label: "", addr: main }] : [];
+}
+
+/** 往一个容器里写逐协议落点（每协议一行，协议名当标签）。
+ *
+ * 用 DOM 拼而不是 `innerHTML` —— 地址是系统回读的外部字符串，不该走 HTML 注入路径。
+ */
+export function paintProxyEndpoints(box: Element, st: ProxyState): void {
+  const eps = proxyEndpoints(st);
+  box.replaceChildren();
+  if (!eps.length) {
+    const none = document.createElement("span");
+    none.className = "muted";
+    none.textContent = "未设置地址";
+    box.appendChild(none);
+    return;
+  }
+  for (const r of eps) {
+    const line = document.createElement("div");
+    if (r.label) {
+      const tag = document.createElement("span");
+      tag.className = "proto-tag";
+      tag.textContent = r.label;
+      line.appendChild(tag);
+    }
+    line.appendChild(document.createTextNode(r.addr));
+    box.appendChild(line);
+  }
+}
+
 export interface ProxyView {
   state: ProxyState;
   can_undo: boolean;

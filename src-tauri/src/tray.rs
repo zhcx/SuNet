@@ -15,7 +15,9 @@ use serde::Serialize;
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, Monitor, PhysicalPosition, PhysicalSize, Rect, WebviewWindow, Wry};
+use tauri::{
+    AppHandle, Manager, Monitor, PhysicalPosition, PhysicalSize, Rect, WebviewWindow, Wry,
+};
 #[cfg(target_os = "windows")]
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
 #[cfg(target_os = "windows")]
@@ -91,7 +93,8 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     let dns = MenuItem::with_id(app, "dns", "切换 DNS…", true, None::<&str>)?;
     let hosts = MenuItem::with_id(app, "hosts", "编辑 hosts…", true, None::<&str>)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
-    let autostart = CheckMenuItem::with_id(app, "autostart", "开机自启动", true, false, None::<&str>)?;
+    let autostart =
+        CheckMenuItem::with_id(app, "autostart", "开机自启动", true, false, None::<&str>)?;
     let open = MenuItem::with_id(app, "open", "打开主窗口", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出 SuNet", true, None::<&str>)?;
 
@@ -464,7 +467,9 @@ fn corner_anchor(app: &AppHandle) -> Option<Anchor> {
     } else {
         wa.position.y + wa.size.height as i32 - margin
     };
-    Some(Anchor::from_point(PhysicalPosition::new(x as f64, y as f64)))
+    Some(Anchor::from_point(PhysicalPosition::new(
+        x as f64, y as f64,
+    )))
 }
 
 /// 锚点落在哪块显示器上（物理像素口径）。
@@ -589,7 +594,9 @@ fn place_quick(app: &AppHandle, win: &WebviewWindow, a: Anchor) {
     } else {
         raw.0
     };
-    let y = raw.1.clamp(top + margin, (bottom - h - margin).max(top + margin));
+    let y = raw
+        .1
+        .clamp(top + margin, (bottom - h - margin).max(top + margin));
     let _ = win.set_position(PhysicalPosition::new(x, y));
     log::debug!(
         target: "tray",
@@ -652,20 +659,57 @@ pub fn status_with(
     match proxy {
         Some(p) => {
             out.proxy_on = p.is_on();
-            out.proxy = if p.pac_present {
-                "代理 PAC".into()
-            } else if p.enable {
-                match system_proxy::parse_server(&p.server) {
-                    Some((_, port)) => format!("代理 已开启(***:{port})"),
-                    None => "代理 已开启".into(),
-                }
-            } else {
-                "代理 关闭".into()
-            };
+            out.proxy = proxy_label(&p);
         }
         None => out.proxy = "代理 未知".into(),
     }
     out
+}
+
+/// 托盘/菜单里的代理摘要（纯函数，便于单测）。
+///
+/// macOS 三个协议互相独立，可能同时开着且各指一个地址 —— 只报 `server`
+/// （第一个开着的）会让另外两个在状态栏上完全不可见。托盘是全局可见的表面，
+/// 主机名一律掩成 `***`，只报协议与端口。
+fn proxy_label(p: &system_proxy::ProxyState) -> String {
+    if p.pac_present {
+        return "代理 PAC".into();
+    }
+    if !p.enable {
+        return "代理 关闭".into();
+    }
+    let eps = p.endpoints();
+    // 逐协议字段全空（旧快照 / Windows）→ 回落主落点 `server`，与前端
+    // `proxyEndpoints()` 同一个口径；不回落会退化成干巴巴的「已开启」，把端口丢了
+    let eps: Vec<(&str, &str)> = if eps.is_empty() {
+        if p.server.trim().is_empty() {
+            vec![]
+        } else {
+            vec![("", p.server.trim())]
+        }
+    } else {
+        eps
+    };
+    match eps.len() {
+        0 => "代理 已开启".into(),
+        1 => match system_proxy::parse_server(eps[0].1) {
+            Some((_, port)) if eps[0].0.is_empty() => format!("代理 已开启(***:{port})"),
+            Some((_, port)) => format!("代理 已开启({}:***:{port})", eps[0].0),
+            None => "代理 已开启".into(),
+        },
+        _ => {
+            // 落点格式不合规时也照样报出去，否则用户会以为只剩一个协议在跑
+            let shown = eps
+                .iter()
+                .map(|(label, addr)| match system_proxy::parse_server(addr) {
+                    Some((_, port)) => format!("{label}:***:{port}"),
+                    None => format!("{label}:***"),
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("代理 已开启({shown})")
+        }
+    }
 }
 
 /// 真实 DNS 状态 → tooltip 摘要（分族显示，§9：状态栏的 DNS 段必须分族）
@@ -716,22 +760,19 @@ fn effective_headline(s: &TrayStatus) -> String {
 /// Tooltip 文案（§5.4.2）：单行、`·` 分隔、固定字段顺序、≤127 字符，
 /// 超长时截断 DNS 部分而不截断代理 —— 代理是唯一会"全局断网"的层
 pub fn tooltip_text(s: &TrayStatus) -> String {
-    let mut parts = Vec::new();
-    parts.push(effective_headline(s));
-    parts.push(s.proxy.clone());
-    parts.push(s.dns_v4.clone());
-    parts.push(s.dns_v6.clone());
+    let mut parts = vec![
+        effective_headline(s),
+        s.proxy.clone(),
+        s.dns_v4.clone(),
+        s.dns_v6.clone(),
+    ];
     if s.hosts_count > 0 {
         parts.push(format!("hosts {} 条", s.hosts_count));
     }
     let mut text = format!("SuNet · {}", parts.join(" · "));
     if text.chars().count() > 120 {
         // 截断 DNS 之后的部分，保留代理状态
-        text = format!(
-            "SuNet · {} · {}",
-            parts[0].clone(),
-            s.proxy.clone()
-        );
+        text = format!("SuNet · {} · {}", parts[0].clone(), s.proxy.clone());
     }
     if s.warn_unread {
         text = format!("⚠ {text}");
@@ -756,7 +797,9 @@ fn refresh_now(app: &AppHandle) {
         let _ = tray.set_tooltip(Some(tooltip_text(&s)));
     }
     if let Some(handles) = app.try_state::<TrayHandles>() {
-        let _ = handles.status.set_text(format!("当前：{}", effective_headline(&s)));
+        let _ = handles
+            .status
+            .set_text(format!("当前：{}", effective_headline(&s)));
         let _ = handles.proxy.set_checked(s.proxy_on);
         let _ = handles.autostart.set_checked(s.autostart_enabled);
     }
@@ -781,6 +824,57 @@ pub fn refresh_icon_theme(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// macOS 三协议落点的托盘摘要：必须逐项列出，不能只报第一个开着的（2026-10-11）。
+    /// 主机名一律掩成 `***` —— 托盘 tooltip 是全局可见的表面。
+    #[test]
+    fn proxy_label_lists_every_enabled_protocol() {
+        let state = system_proxy::ProxyState {
+            enable: true,
+            server: "10.0.0.10:20173".into(),
+            bypass: String::new(),
+            autoconfig_url: None,
+            pac_present: false,
+            http_proxy: Some("10.0.0.10:20173".into()),
+            https_proxy: Some("127.0.0.1:18443".into()),
+            socks_proxy: Some("10.0.0.10:20172".into()),
+        };
+        assert_eq!(
+            proxy_label(&state),
+            "代理 已开启(HTTP:***:20173 HTTPS:***:18443 SOCKS:***:20172)"
+        );
+
+        // 只开一个 → 形态与旧版一致，不加协议前缀
+        let one = system_proxy::ProxyState {
+            http_proxy: None,
+            https_proxy: None,
+            socks_proxy: None,
+            ..state.clone()
+        };
+        // 逐协议字段全空 → 回落到主落点 `server`
+        assert_eq!(proxy_label(&one), "代理 已开启(***:20173)");
+
+        // 只开 SOCKS 时同样得逐项报出来，不能拿 `server`（HTTP 的落点）顶替；
+        // 标签也必须留着，否则和「只开 HTTP」在状态栏上长得一模一样
+        let socks_only = system_proxy::ProxyState {
+            http_proxy: None,
+            https_proxy: None,
+            ..state.clone()
+        };
+        assert_eq!(proxy_label(&socks_only), "代理 已开启(SOCKS:***:20172)");
+
+        // PAC 接管 / 手动关着 → 不碰协议列表，直接报那一档
+        let pac = system_proxy::ProxyState {
+            pac_present: true,
+            ..state.clone()
+        };
+        assert_eq!(proxy_label(&pac), "代理 PAC");
+        let off = system_proxy::ProxyState {
+            enable: false,
+            ..state
+        };
+        assert_eq!(proxy_label(&off), "代理 关闭");
+    }
 
     /// 本机 macOS 实测的屏（Retina，scale = 2，菜单栏 33 点、Dock 在底部 55 点）：
     /// 全部换算成物理像素 —— 外框 3024×1964，工作区 y 从 66 到 1854。

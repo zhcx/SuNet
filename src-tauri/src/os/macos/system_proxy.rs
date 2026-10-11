@@ -51,6 +51,24 @@ impl ProxyState {
     pub fn is_on(&self) -> bool {
         self.enable && !self.pac_present
     }
+
+    /// 开着的协议 → `(标签, 落点)`，顺序与系统设置一致（HTTP / HTTPS / SOCKS）。
+    ///
+    /// `http_proxy` 等只在对应 `*Enable` 为 1 时才有值（见 `read()` 里的 `one()`），
+    /// 所以这里不需要再判 `enable`；留空的协议自然不出现。
+    pub fn endpoints(&self) -> Vec<(&'static str, &str)> {
+        [
+            ("HTTP", self.http_proxy.as_deref()),
+            ("HTTPS", self.https_proxy.as_deref()),
+            ("SOCKS", self.socks_proxy.as_deref()),
+        ]
+        .iter()
+        .filter_map(|(label, addr)| {
+            addr.filter(|a| !a.trim().is_empty())
+                .map(|a| (*label, a.trim()))
+        })
+        .collect()
+    }
 }
 
 /// macOS 的三个代理协议：系统里是三个**互相独立的开关**
@@ -275,17 +293,6 @@ fn active_services() -> Result<Vec<String>> {
         return Err(AppError::coded(E3003).with_detail("没有可用的网络服务"));
     }
     Ok(list)
-}
-
-/// 主服务（`-listnetworkserviceorder` 里第一个未停用的服务）
-fn primary_service() -> Result<String> {
-    let list = dns_client::list_interfaces()?;
-    list.iter()
-        .find(|i| i.has_default_gateway && i.status != "Disabled")
-        .or_else(|| list.iter().find(|i| i.status != "Disabled"))
-        .or_else(|| list.first())
-        .map(|i| i.alias.clone())
-        .ok_or_else(|| AppError::coded(E3003).with_detail("找不到主网络服务"))
 }
 
 // ---------------------------------------------------------------------------
@@ -692,13 +699,14 @@ fn snapshot_services(services: &[String]) -> Result<()> {
     // 目录备好，出错也把路径报出来。
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
-            AppError::coded(E3003)
-                .with_detail(format!("创建代理还原点目录失败（{}）：{e}", parent.display()))
+            AppError::coded(E3003).with_detail(format!(
+                "创建代理还原点目录失败（{}）：{e}",
+                parent.display()
+            ))
         })?;
     }
     std::fs::write(&path, text.as_bytes()).map_err(|e| {
-        AppError::coded(E3003)
-            .with_detail(format!("写入代理还原点失败（{}）：{e}", path.display()))
+        AppError::coded(E3003).with_detail(format!("写入代理还原点失败（{}）：{e}", path.display()))
     })?;
     Ok(())
 }
@@ -892,8 +900,14 @@ mod tests {
         };
         let plan = manual_plan(&all).unwrap();
         assert_eq!(plan.enabled_count(), 3);
-        assert_eq!(plan.get(Proto::Secure), Some(&("127.0.0.1".to_string(), 7891)));
-        assert_eq!(plan.get(Proto::Socks), Some(&("127.0.0.1".to_string(), 1080)));
+        assert_eq!(
+            plan.get(Proto::Secure),
+            Some(&("127.0.0.1".to_string(), 7891))
+        );
+        assert_eq!(
+            plan.get(Proto::Socks),
+            Some(&("127.0.0.1".to_string(), 1080))
+        );
 
         // 关闭：三个协议全关（落点不看）——旧版本 / 手工设置的残留也要清掉
         let off = manual_plan(&crate::os::ManualProxy::off("localhost")).unwrap();
@@ -921,7 +935,10 @@ mod tests {
         .unwrap();
         assert_eq!(https_only.enabled_count(), 1);
         assert_eq!(https_only.get(Proto::Web), None);
-        assert_eq!(https_only.get(Proto::Secure), Some(&("127.0.0.1".to_string(), 7891)));
+        assert_eq!(
+            https_only.get(Proto::Secure),
+            Some(&("127.0.0.1".to_string(), 7891))
+        );
 
         // 一个都不填：开代理却什么也不写 —— 必须报错，不能静默"开"上一次空操作
         assert!(manual_plan(&crate::os::ManualProxy {

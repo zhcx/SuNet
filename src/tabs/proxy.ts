@@ -1,6 +1,6 @@
 // 代理标签页（设计方案 §3）
 
-import { api, errText, type ProxyView } from "../api";
+import { api, errText, paintProxyEndpoints, proxyEndpoints, type ProxyView } from "../api";
 import type { TabCtx } from "../main";
 import * as ui from "../ui";
 import * as os from "../platform";
@@ -39,6 +39,7 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
       <div class="row-between" style="margin-bottom:12px">
         <div>
           <div class="kv"><span class="k">当前状态</span><span id="px-state"></span></div>
+          <div class="kv"><span class="k">落点</span><span id="px-eps"></span></div>
           <div class="kv"><span class="k">PAC</span><span id="px-pac"></span></div>
         </div>
         <div class="actions">
@@ -119,19 +120,15 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
   `;
 
   const stateEl = root.querySelector("#px-state")!;
+  const epsEl = root.querySelector("#px-eps")!;
   const pacEl = root.querySelector("#px-pac")!;
-  // macOS 的三个协议是独立开关，逐项列出来才对得上"到底开了什么"
-  const protoText = (s: ProxyView["state"]) => {
-    const parts: string[] = [];
-    if (s.http_proxy) parts.push(`HTTP ${s.http_proxy}`);
-    if (s.https_proxy) parts.push(`HTTPS ${s.https_proxy}`);
-    if (s.socks_proxy) parts.push(`SOCKS ${s.socks_proxy}`);
-    return parts.join(" · ");
-  };
   const renderState = (s: ProxyView) => {
-    const detail = protoText(s.state) || s.state.server || "未设置地址";
-    stateEl.textContent = s.state.enable ? `已开启（${detail}）` : "已关闭";
+    stateEl.textContent = s.state.enable
+      ? `已开启（${proxyEndpoints(s.state).length} 个协议）`
+      : "已关闭";
     (stateEl as HTMLElement).className = s.state.enable ? "ok-text" : "muted";
+    // 落点逐协议列出：macOS 三个开关互相独立，只报一个地址会让人以为只走了一个代理
+    paintProxyEndpoints(epsEl, s.state);
     pacEl.textContent = s.state.pac_present
       ? "存在（PAC 优先级高于手动代理，会使「关闭代理」失效）"
       : "无";

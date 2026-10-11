@@ -6,7 +6,9 @@
 //!   3. 清零必须删 AutoConfigURL，否则 PAC 仍接管，"清零"是假的（§5.5.6 第 3 步）
 
 use crate::error::{Result, E3003, E3004};
-use crate::os::winapi::{InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED};
+use crate::os::winapi::{
+    InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
+};
 use serde::{Deserialize, Serialize};
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 use winreg::RegKey;
@@ -29,11 +31,26 @@ impl ProxyState {
     pub fn is_on(&self) -> bool {
         self.enable && !self.pac_present
     }
+
+    /// WinINET 只有一个落点，与 macOS 的"三协议"对齐成同一形状（托盘 / 面板共用代码）。
+    /// 标签留空 = 界面不加前缀。
+    pub fn endpoints(&self) -> Vec<(&'static str, &str)> {
+        let server = self.server.trim();
+        if server.is_empty() {
+            vec![]
+        } else {
+            vec![("", server)]
+        }
+    }
 }
 
 fn open(read_only: bool) -> Result<RegKey> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let flag = if read_only { KEY_READ } else { KEY_READ | KEY_WRITE };
+    let flag = if read_only {
+        KEY_READ
+    } else {
+        KEY_READ | KEY_WRITE
+    };
     hkcu.open_subkey_with_flags(KEY_PATH, flag)
         .map_err(|e| crate::error::AppError::new(E3003, format!("打开代理注册表键失败：{e}")))
 }
@@ -75,13 +92,16 @@ pub fn write_manual(p: &crate::os::ManualProxy) -> Result<()> {
     if !p.enable {
         // 关闭时不看落点：清掉已有的 proxy 字符串（与 macOS 的「三项全关」对齐）
         let key = open(false)?;
-        key.set_value("ProxyEnable", &0u32)
-            .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyEnable 失败：{e}")))?;
-        key.set_value("ProxyServer", &String::new())
-            .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyServer 失败：{e}")))?;
+        key.set_value("ProxyEnable", &0u32).map_err(|e| {
+            crate::error::AppError::new(E3003, format!("写入 ProxyEnable 失败：{e}"))
+        })?;
+        key.set_value("ProxyServer", &String::new()).map_err(|e| {
+            crate::error::AppError::new(E3003, format!("写入 ProxyServer 失败：{e}"))
+        })?;
         if !p.bypass.trim().is_empty() {
-            key.set_value("ProxyOverride", &p.bypass)
-                .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyOverride 失败：{e}")))?;
+            key.set_value("ProxyOverride", &p.bypass).map_err(|e| {
+                crate::error::AppError::new(E3003, format!("写入 ProxyOverride 失败：{e}"))
+            })?;
         }
         return Ok(());
     }
@@ -92,8 +112,9 @@ pub fn write_manual(p: &crate::os::ManualProxy) -> Result<()> {
     key.set_value("ProxyServer", &p.http)
         .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyServer 失败：{e}")))?;
     if !p.bypass.trim().is_empty() {
-        key.set_value("ProxyOverride", &p.bypass)
-            .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyOverride 失败：{e}")))?;
+        key.set_value("ProxyOverride", &p.bypass).map_err(|e| {
+            crate::error::AppError::new(E3003, format!("写入 ProxyOverride 失败：{e}"))
+        })?;
     }
     Ok(())
 }
@@ -109,8 +130,9 @@ pub fn restore(state: &ProxyState) -> Result<()> {
         .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyOverride 失败：{e}")))?;
     match &state.autoconfig_url {
         Some(url) if !url.trim().is_empty() => {
-            key.set_value("AutoConfigURL", url)
-                .map_err(|e| crate::error::AppError::new(E3003, format!("写入 AutoConfigURL 失败：{e}")))?;
+            key.set_value("AutoConfigURL", url).map_err(|e| {
+                crate::error::AppError::new(E3003, format!("写入 AutoConfigURL 失败：{e}"))
+            })?;
         }
         _ => {
             // 原状态无 PAC → 确保删除，否则残留 PAC 会覆盖手动代理

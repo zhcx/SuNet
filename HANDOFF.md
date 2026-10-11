@@ -538,6 +538,7 @@ WinHTTP 代理、PAC 代理模式、TUN/虚拟网卡、hosts 通配符规则、�
 4. 按架构构建的 dmg 产物（`--target aarch64-apple-darwin` / `x86_64-apple-darwin`）、ad-hoc 签名后的 Gatekeeper 提示。
 5. 前端 `data-os="macos"` 的样式/文案分支是否完整（自绘按钮隐藏、顶栏留白、授权文案）。用户两次实测反馈过"左上角与交通灯冲突"：第一次（2026-10-10）按「首帧打标 + 安全区 88px」修；第二次按量出来的真实几何（14×14 / 间距 23pt / `close.x=9`）重新核对，中间一版去掉了方块 logo，用户又要求放回来 —— 最终 = **保留 logo + 安全区 100px + x 改为系统默认 9**（§4.20），观感仍以用户过目为准。
 6. **提权助手路径下的「写前还原点」**（§4.21）：修复前 root 身份写 `proxy_prev.json` 一律 ENOENT（已用普通用户身份在旧二进制上复现，逐字命中用户的 `[E0000]`）；修复后**必须在真正走助手的路径上验证一次**（GUI 里切换带代理层的方案），并确认 root 的 appdata 里真的出现了这份还原点：`sudo ls -l "/var/root/Library/Application Support/SuNet/proxy_prev.json"`。
+   ✅ 2026-10-11 已在**助手路径**上验证：直接以控制台用户身份连 `/var/run/sunet-helper.sock` 发 `proxy_write` → `proxy_restore`（见 §6.5），root 身份落盘无 ENOENT，写入与还原都成功；GUI 点击那条路径仍未实跑。
 
 **本机验证边界**：2026-10-10 起开发机就是 **macOS 27.0.1 / Apple Silicon** ⇒ macOS 侧**现在能本地验证**：`cargo test` 73 项、`npm run tauri -- build` 出 `.app` / `.dmg`、回读可以直接看 `scutil --proxy`（不必依赖截图，见 §4.20 的离屏量法）。反过来 **Windows 侧只能靠 CI**（本机既跑不了 Windows 那份 `cargo test`，也没法在 Windows 上冒烟）。历史注（Intel iMac、无 `cc`）：`cargo check --target aarch64-apple-darwin` 曾死在 `objc2-exception-helper` 的 build script（`failed to find tool "cc"`），那时只能由 CI 回答「macOS 能不能编译」（CI 当年答：能编译、59 项单测、dmg 能出，见 §5.1）。
 
@@ -556,6 +557,28 @@ WinHTTP 代理、PAC 代理模式、TUN/虚拟网卡、hosts 通配符规则、�
 8. 无助手路径：`--helper-uninstall` 后再写 hosts，应弹一次系统授权框；**取消**时应报 E1001 且配置回到操作前。
 9. 外观：无残留 Windows 标题栏、无重复的最小化/关闭按钮、交通灯不被顶栏内容压住、快捷面板贴边正常；macOS 顶栏**保留方块 logo**（§4.20），品牌方块距三灯右缘 ≥31pt（`.topbar` 左内边距 100px）。托盘侧另看两点：菜单栏图标是**模板图**（浅色 / 深色菜单栏下都该看得清，不再是糊在上面的一坨）；快捷面板弹出后应**水平居中于菜单栏图标**、贴着菜单栏下沿（而不是跑到屏幕右下角或跟着鼠标飘），主窗口 / 热键唤出也应贴图标（§6.4「托盘 / 快捷面板」行）。
 10. 自启：开关各一次，检查 `~/Library/LaunchAgents/com.sunet.desktop.autostart.plist` 与 `launchctl list | grep sunet`。
+
+---
+
+## 6.5 macOS 三协议代理：真机验证记录（2026-10-11）
+
+**方法**：不必点 GUI —— 以控制台用户身份直连常驻助手 socket 就能走**真实 root 提权路径**（`helper/client.rs` 的线上格式：一行 JSON `{"task":"...","payload":{...}}\n`，回一行 `TaskOutput`；`daemon.rs` 用 `LOCAL_PEERCRED` 放行 root / console 用户）。脚本与逐字输出留在 `/tmp/sunet-verify/`。系统原配置是真实公司代理（HTTP `10.0.0.10:20173` + SOCKS `10.0.0.10:20172`、HTTPS 关但预填同地址、Thunderbolt Bridge 另有一条关着的预填 PAC URL），每轮写入后立即还原并与写入前的逐服务快照 `diff`。
+
+**通过项**
+1. 三协议同时写入三个不同落点（HTTP 18080 / HTTPS 18443 / SOCKS 18108）→ `scutil --proxy` 里 `HTTPEnable/HTTPSEnable/SOCKSEnable` 全为 1 且端口逐项对上；`networksetup -get{web,secureweb,socksfirewall}proxy` 逐服务一致（Wi-Fi 与 Thunderbolt Bridge 两个服务都写了）。
+2. 只填 HTTP、HTTPS/SOCKS 传 `null` → 两者 `HTTPSEnable:0` / `SOCKSEnable:0`（留空即关闭，不会误开）。
+3. 还原：HTTP / SOCKS / 例外列表 / PAC / 服务逐项回到写入前的值（用**新留**的还原点时 diff 完全一致）。
+4. 手动写入不动 PAC（与 Windows 同语义）：Thunderbolt Bridge 上那条关着的预填 PAC URL 写入前后原样保留。
+5. `§4.21` 的 ENOENT 修复在 root 身份下成立：写还原点、读还原点都成功。
+
+**实测踩出的三个问题（按严重度）**
+1. 🔴 **陈旧还原点会胜出**：`system_proxy.rs::snapshot_services` 的策略是「`proxy_prev.json` 已存在就不再留」（本意：接管期间重复写，不把还原点覆盖成接管后的状态）。实测第一轮「写入 → 还原」用的是**上一次会话**遗留的全关还原点，结果把用户原本开着的公司代理整个关掉（开关全关、server 停在测试地址上）。该策略依赖 app 层保证「只有接管期间才留文件」；一旦 app 崩溃/被杀，或有人绕过 app 直接调 helper，还原就会错到很久以前的状态。建议：还原点带时间戳/会话标识，超期或与当前状态差异过大时拒绝套用并降级为「按传入 state 还原」。
+2. 🟡 **关闭状态的协议不回写地址**：`write_protocol` 对 `want.enable=false` 的协议只 `set_*proxystate off`，不回写 server。于是「关着但预填了地址」的 HTTPS（本机实测场景：`Enabled: No` + `Server: 10.0.0.10:20173`）在被写过一次后再还原，地址残留成写入时的测试地址。生效行为无变化（开关是 off），但用户的预填值丢了。建议：还原点里带 server 时，关闭协议前先把 server 写回去再关（`set_*proxy` 会顺带打开，需紧跟一次 off）。
+3. 🟢 **装机助手与 app 不是同一份构建**：`shasum -a256` 显示 `/Library/PrivilegedHelperTools/com.sunet.helper`（Oct 10 23:43，6103952 B）≠ `/Applications/SuNet.app/Contents/MacOS/SuNet`（Oct 11 13:55，6103968 B，v0.0.2）；即助手装于三协议提交（`19df502`，Oct 11 13:41）之前。**但它实测能正确处理 `https`/`socks` 载荷**（第 1 条验证即由它执行），推测装的是当时未提交的开发构建。按 §6.4 第 7 条重装一次即可让两者一致。
+
+**副作用说明**：验证期间系统代理被临时改写（含一次未按预期还原、由手工 `networksetup` 命令补回），结束后已与写入前快照逐项 `diff` 一致；`scutil --proxy` 多出 `ProxyAutoConfigEnable:0` / `ProxyAutoDiscoveryEnable:0` 两个显式 0（语义与基线相同）。
+
+**仍未验证**：GUI 点击路径、`osascript` 回退路径、WPAD 自动发现（`-setproxyautodiscovery` 目前不在读/清/还原覆盖范围内）。
 
 ---
 

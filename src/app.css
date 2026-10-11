@@ -1575,6 +1575,14 @@ details.help summary {
   line-height: 1.45;
 }
 
+/* 逐协议落点标签：协议名当左侧标签，三个开关各指一个地址时逐行对齐（macOS）。
+   快捷面板瓦片与主窗口系统代理页共用 */
+.proto-tag {
+  display: inline-block;
+  min-width: 3.6em;
+  color: var(--fg-muted);
+}
+
 /* 通栏动作条：让「清除代理」这类操作在瓦片内一眼可见、一点就中 */
 .tile-actions {
   display: flex;
