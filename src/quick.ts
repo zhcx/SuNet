@@ -11,7 +11,7 @@
 // 但需要"看到细节"的操作（编辑条目、选服务商、看快照）一律跳主窗口对应标签页。
 
 import { listen } from "@tauri-apps/api/event";
-import { api, errText, type AppStateView, type ProfileBrief } from "./api";
+import { api, errText, proxyEndpoints, type AppStateView, type ProfileBrief } from "./api";
 import { initTheme, onThemeChange, cycleTheme, currentMode } from "./theme";
 import { icon, type IconName } from "./icons";
 import * as ui from "./ui";
@@ -231,25 +231,43 @@ function notes(): string {
   return out.join("");
 }
 
+/**
+ * 代理瓦片要显示的落点清单：逐协议各一行。
+ *
+ * macOS 的 HTTP / HTTPS / SOCKS 是**三个互相独立的开关**，可以同时开着且各指一个
+ * 地址（`scutil --proxy` 里三个 `*Enable` 都是 1）。以前这里只显示 `server`（HTTP →
+ * HTTPS → SOCKS 里第一个开着的），另两个开着的协议在面板上完全看不见 —— 用户以为
+ * 只走了一个代理，其实系统里还挂着两个。
+ *
+ * 开着时一律以**系统回读**为准（真实生效的才是该显示的）；只有回读拿不到逐协议
+ * 信息时（老快照 / Windows 的 `ProxyState` 没有这三个字段）才退回主落点。
+ */
+function proxyRows(v: View): { label: string; addr: string }[] {
+  if (!v.proxyOn) return [];
+
+  // 开着时以系统回读为准（真实生效的才是该显示的）；`proxyEndpoints` 负责逐协议过滤，
+  // 回读拿不到逐协议信息时（老快照 / Windows）它自己会退回主落点。
+  const live = proxyEndpoints(state!.proxy);
+  if (live.length) return live;
+
+  // 没有逐协议信息：退回主落点（老快照 / Windows）
+  const main = state!.proxy.server.trim();
+  if (main) return [{ label: "", addr: main }];
+
+  // 主落点也空：用方案里配好的其它协议顶上（HTTP 留空时常见）
+  if (!v.active) return [];
+  const ep = (host: string, port: number) =>
+    host.trim() && port > 0 ? `${host.trim()}:${port}` : "";
+  return [
+    { label: "HTTP", addr: ep(v.active.proxy_host, v.active.proxy_port) },
+    { label: "HTTPS", addr: ep(v.active.proxy_https_host, v.active.proxy_https_port) },
+    { label: "SOCKS", addr: ep(v.active.proxy_socks_host, v.active.proxy_socks_port) },
+  ].filter((r) => r.addr !== "");
+}
+
 /** 代理瓦片：面板里的头号操作，用大号开关 + 一个通栏 */
 function tileProxy(v: View): string {
-  // HTTP 留空时用方案里配好的其它协议顶上（macOS 三个开关互相独立）
-  const fromProfile = v.active
-    ? [
-        v.active.proxy_host.trim() && v.active.proxy_port
-          ? `${v.active.proxy_host}:${v.active.proxy_port}`
-          : "",
-        v.active.proxy_https_host.trim() && v.active.proxy_https_port
-          ? `HTTPS ${v.active.proxy_https_host}:${v.active.proxy_https_port}`
-          : "",
-        v.active.proxy_socks_host.trim() && v.active.proxy_socks_port
-          ? `SOCKS ${v.active.proxy_socks_host}:${v.active.proxy_socks_port}`
-          : "",
-      ]
-        .filter(Boolean)
-        .join(" · ")
-    : "";
-  const addr = state!.proxy.server || fromProfile;
+  const rows = proxyRows(v);
   const stateText = v.proxyOn
     ? "所有遵循系统代理的应用都会走它"
     : state!.proxy.pac_present
@@ -268,8 +286,15 @@ function tileProxy(v: View): string {
       </label>
     </div>
     ${
-      v.proxyOn && addr
-        ? `<div class="tile-addr">${esc(addr)}</div>`
+      rows.length
+        ? rows
+            .map(
+              (r) =>
+                `<div class="tile-addr">${
+                  r.label ? `<span class="proto-tag">${esc(r.label)}</span>` : ""
+                }${esc(r.addr)}</div>`,
+            )
+            .join("")
         : `<div class="tile-state">${stateText}</div>`
     }
   </div>`;

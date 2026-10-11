@@ -3,6 +3,7 @@
 import {
   api,
   errText,
+  proxyEndpoints,
   type DnsPreset,
   type HostsView,
   type Profile,
@@ -79,7 +80,14 @@ export async function renderProfiles(root: HTMLElement, ctx: TabCtx): Promise<vo
             proxyView.state.pac_present
               ? "PAC 接管中（手动代理不生效）"
               : proxyOn
-                ? ui.esc(proxyView.state.server || "已开启，未填地址")
+                ? // 逐协议列出：macOS 三个开关互相独立，可以同时开着且各指一个地址，
+                  // 只报 `server`（第一个开着的）会漏掉另外两个
+                  proxyEndpoints(proxyView.state)
+                    .map(
+                      (r) =>
+                        `<div>${r.label ? `<span class="proto-tag">${ui.esc(r.label)}</span>` : ""}${ui.esc(r.addr)}</div>`,
+                    )
+                    .join("") || "已开启，未填地址"
                 : "已关闭"
           }</div>
           <div class="layer-foot">
