@@ -33,6 +33,12 @@ pub struct ProfileBrief {
     pub proxy_host: String,
     pub proxy_port: u16,
     pub proxy_bypass: String,
+    /// 逐协议落点（macOS 的 HTTPS / SOCKS）：快捷面板一键开代理时得把它们一起发下去，
+    /// 否则一键开关会"只开 HTTP"、把方案里配的另两个协议默默地关掉
+    pub proxy_https_host: String,
+    pub proxy_https_port: u16,
+    pub proxy_socks_host: String,
+    pub proxy_socks_port: u16,
     /// 方案里记的网卡：快捷面板不摆网卡选择器，「还原自动」直接作用于它
     pub dns_enabled: bool,
     pub dns_alias: String,
@@ -118,6 +124,10 @@ pub async fn get_app_state(app: AppHandle) -> Result<AppStateView> {
                     proxy_host: p.proxy.host.clone(),
                     proxy_port: p.proxy.port,
                     proxy_bypass: p.proxy.bypass.clone(),
+                    proxy_https_host: p.proxy.https_host.clone(),
+                    proxy_https_port: p.proxy.https_port,
+                    proxy_socks_host: p.proxy.socks_host.clone(),
+                    proxy_socks_port: p.proxy.socks_port,
                     dns_enabled: p.dns.enabled,
                     dns_alias: p.dns.interface_alias.clone(),
                 })
@@ -1170,6 +1180,9 @@ pub struct SilentElevationStatus {
     pub enabled: bool,
     /// 通道是否已装好（Windows = 计划任务指向当前 exe；macOS = LaunchDaemon plist 存在）
     pub installed: bool,
+    /// macOS 专属：装好了且守护进程在跑（socket 在）。装了但未跑 = 被 BTM 拦截；
+    /// Windows 上恒等于 installed。前端拿这个字段显示状态徽标，不解析文案。
+    pub running: bool,
     /// 界面上这条通道叫什么（「静默提权通道」/「免密提权助手」）
     pub noun: String,
     /// 状态说明（直接给界面显示，平台差异由后端收口，前端不判断平台）
@@ -1179,10 +1192,12 @@ pub struct SilentElevationStatus {
 fn silent_status() -> SilentElevationStatus {
     let installed = crate::elevation_task::is_installed();
     let enabled = crate::elevation_task::enabled();
+    let health = crate::elevation_task::health();
     SilentElevationStatus {
         supported: crate::elevation_task::supported(),
         enabled,
         installed,
+        running: health == "ok",
         noun: crate::elevation_task::noun().to_string(),
         detail: crate::elevation_task::detail(installed, enabled),
     }

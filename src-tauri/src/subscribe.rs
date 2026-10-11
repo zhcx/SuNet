@@ -170,7 +170,7 @@ pub fn parse_content(text: &str) -> Result<(Vec<HostsEntry>, Vec<String>)> {
         let ip: IpAddr = match ip_str.parse() {
             Ok(v) => v,
             Err(_) => {
-                rejected.push(format!("IP 非法：{}", truncate(&ip_str)));
+                rejected.push(format!("IP 非法：{}", truncate(ip_str)));
                 continue;
             }
         };

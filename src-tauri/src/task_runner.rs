@@ -134,6 +134,13 @@ pub fn run_and_exit(args: TaskArgs) -> i32 {
 
 /// 固定函数表分派（不做动态求值）
 pub fn execute(task: &str, data: &Value) -> TaskOutput {
+    // 提权身份不一定跟我们住同一个家目录：macOS 的常驻 helper 由 launchd 以 root 拉起，
+    // HOME 是 `/var/root`（launchd 也可能干脆不给 HOME，此时 `paths::home_dir()` 退回
+    // `/tmp`），而日志、代用还原点都按 `paths::appdata_dir()` / `logs_dir()` / `ipc_dir()`
+    // 定位 —— 这些目录在 root 家目录下并不存在，第一次写就是 ENOENT，用户看到的是
+    // 「[E0000] 内部错误（No such file or directory (os error 2)）」，指不出是哪里。
+    // 这里按当前身份把目录补齐（幂等，代价可忽）。
+    let _ = crate::paths::ensure_dirs();
     match task {
         // 批处理：一次提权跑多个子任务（见 batch 的说明）
         "batch" => batch(data),
@@ -152,7 +159,7 @@ pub fn execute(task: &str, data: &Value) -> TaskOutput {
         "dns_set" => dns_set(data),
         "dns_reset" => dns_reset(data),
         "dns_flush" => {
-            let r = crate::critsec::with_critical_section(|| dns_client::flush());
+            let r = crate::critsec::with_critical_section(dns_client::flush);
             match r {
                 Ok(_) => TaskOutput::ok().with_step(ok_step("dns", "DNS 缓存已刷新")),
                 Err(e) => TaskOutput::fail(e),
@@ -460,16 +467,27 @@ fn dns_reset(data: &Value) -> TaskOutput {
     }
 }
 
-/// proxy_write：写入手动代理（`enable=false` 即关闭手动代理）
+/// proxy_write：写入手动代理（逐协议；`enable=false` 即关闭全部协议）
 ///
-/// 载荷：`{ enable: bool, server: "host:port", bypass: String }`
+/// 载荷：`{ enable: bool, server: "host:port", https: "host:port"|null,
+/// socks: "host:port"|null, bypass: String }`。
+///
+/// 直接用 [`crate::os::ManualProxy`] 反序列化（键名与它一一对应）。
+/// `https` / `socks` 缺失或为 null 都当"关闭该协议"——旧版 GUI 只发前三个键，
+/// 于是旧界面的行为（只写 HTTP）在这儿自然保持（见 `os::ManualProxy` 的说明）。
 fn proxy_write(data: &Value) -> TaskOutput {
-    let enable = data["enable"].as_bool().unwrap_or(false);
-    let server = data["server"].as_str().unwrap_or("").to_string();
-    let bypass = data["bypass"].as_str().unwrap_or("").to_string();
-    let r = crate::critsec::with_critical_section(|| {
-        system_proxy::write_manual(enable, &server, &bypass)
-    });
+    let p: crate::os::ManualProxy = match serde_json::from_value(data.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            let mut out = TaskOutput::fail(
+                crate::error::AppError::new(crate::error::E1004, format!("代理载荷解析失败：{e}")),
+            );
+            out.steps.push(bad_step("proxy", format!("代理载荷解析失败：{e}")));
+            return out;
+        }
+    };
+    let enable = p.enable;
+    let r = crate::critsec::with_critical_section(|| system_proxy::write_manual(&p));
     match r {
         Ok(_) => TaskOutput::ok().with_step(ok_step(
             "proxy",

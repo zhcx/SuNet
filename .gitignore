@@ -4,3 +4,7 @@ src-tauri/target/
 src-tauri/gen/
 *.log
 .vite/
+
+# 本机噪音：Finder 元数据与本地工具（pi）的任务目录，都不该进版本库
+.DS_Store
+.pi/

@@ -12,6 +12,7 @@
 
 use crate::error::Result;
 use crate::os::system_proxy::{self, ProxyState};
+use crate::os::ManualProxy;
 use serde_json::json;
 
 /// 任务名（与 `task_runner::execute` 的固定函数表对应）
@@ -25,16 +26,18 @@ fn via_elevation(task: &str, data: serde_json::Value) -> Result<()> {
     Ok(())
 }
 
-/// 写入手动代理（enable=false 即关闭手动代理）
-pub fn write_manual(enable: bool, server: &str, bypass: &str) -> Result<bool> {
+/// 写入手动代理（逐协议：`enable=false` 即关闭全部协议）。
+///
+/// 载荷直接用 [`ManualProxy`] 的序列化结果（键名 `enable` / `server` / `https` /
+/// `socks` / `bypass`）：`server` 是 HTTP 落点的历史键名，**不能改** ——
+/// 常驻 helper 是安装那一刻的可执行文件拷贝，旧版本只认识这几个键中的一个子集
+/// （见 `crate::os::ManualProxy` 与 `crate::helper`）。
+pub fn write_manual(p: &ManualProxy) -> Result<bool> {
     if system_proxy::proxy_write_needs_root() {
-        via_elevation(
-            TASK_WRITE,
-            json!({ "enable": enable, "server": server, "bypass": bypass }),
-        )?;
+        via_elevation(TASK_WRITE, serde_json::to_value(p)?)?;
         return Ok(system_proxy::notify_changed());
     }
-    system_proxy::write_manual(enable, server, bypass)?;
+    system_proxy::write_manual(p)?;
     Ok(system_proxy::notify_changed())
 }
 

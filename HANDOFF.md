@@ -14,11 +14,14 @@ npm install
 npm run tauri -- dev            # 开发（先起 vite:5180，再起 Tauri）
 npm run tauri -- build          # 生产包（真正内嵌前端资源的构建，见 §4.8）
 npm run check                   # 前端类型检查
-cd src-tauri && cargo test      # 本机平台跑自己那份单测（Windows 55 项，纯逻辑，不碰系统）
+cd src-tauri && cargo test      # 本机平台跑自己那份单测（纯逻辑，不碰系统）
+                                # 2026-10-10 计：源码 80 个 #[test]，macOS 73 / Windows 63
 
-# macOS（需要 Xcode Command Line Tools）
+# macOS（本机 = Apple Silicon + Xcode Command Line Tools ⇒ 本地就能出包）
 npm run tauri -- build -- --target aarch64-apple-darwin --bundles dmg   # Apple Silicon
 npm run tauri -- build -- --target x86_64-apple-darwin --bundles dmg    # Intel
+# 注：dmg 的 bundle_dmg.sh 偶发失败（2026-10-10 首次 build 挂在 dmg 步、单独重跑 `--bundles dmg` 即成功）；
+#     .app 在 dmg 之前就产好了 —— 失败时 target/release/bundle/macos/SuNet.app 仍然可用
 
 # 发布：打 tag 即出包（Windows NSIS+MSI、macOS 两种架构各一份 dmg，同一个 Release）
 git tag v0.0.1 && git push origin v0.0.1
@@ -58,6 +61,11 @@ git tag v0.0.1 && git push origin v0.0.1
 > · **macOS 一开代理就断网 = 三个协议被当成一个**：macOS 的 HTTP / HTTPS / SOCKS 是三个独立开关，`os/macos/system_proxy.rs` 原先三项都写同一个 `host:port` —— 只支持 HTTP 的代理端口收到 SOCKS 请求，其它程序就走不动了。改为**只写 HTTP**（`-setwebproxy`；CFNetwork 没有 Secure Web Proxy 时 HTTPS 也走 HTTP 代理），启用时顺手关掉旧版本留下的 HTTPS / SOCKS 残留、关闭时三项全关；命令表收敛成 `Proto`（get/set/state 三个命令 + 标签）+ `MANUAL_PROTO` / `MANUAL_CLEAR` / `MANUAL_OFF` 三个常量，补了 3 条 macOS 专属单测（只写 HTTP、三个协议命令互不相同、还原点逐协议）。**还原点也改成逐协议**（`proxy_prev.json` 加 `fmt=2`，旧格式整份丢弃）：合并成一个值时"切回原状态"会把本来没开的协议一起打开，是同一个故障的另一副面孔；另外 `snapshot_services` 不再覆盖已存在的还原点（与 app 层 `ensure_proxy_snapshot` 同一约定）。
 > · **输过密码后主动提示怎么免掉它**：`ApplyReport` 新增 `prompted`（提权层在走 `runas` / `osascript` 时打标记，事务开始先清零，只统计本次），`cmd/profile.rs` 的 `hint_no_password()` 在切换 / 还原确实弹过框、而免密通道还没装（或装了没跑起来）时提示一次并给「去设置」入口（`elevation_task::no_password_hint()`：macOS 给出安装/放行指引，Windows 返回 `None`——静默通道的安全边界要求显式开启，不主动引导）。每个会话只提示一次。
 
+> · **macOS：HTTP / HTTPS / SOCKS 三个代理协议可以分别配置**（2026-10-10，用户要求「在 macOS 版本上添加修改 http 代理、https 代理和 socks 代理的功能」）：系统代理页与方案编辑器在 macOS 上给出三组「地址 + 端口」——HTTP 必填，HTTPS / SOCKS **留空即关闭该协议**（只填一半会被拦下）。这是把「只写 HTTP」那条修复（见下条）从硬编码改成用户可控：不再有任何协议被静默写成一个落点，默认仍然只填 HTTP。写入路径按 `Proto` 逐项开关（`ManualPlan` 三个落点，`Some` → 写 + 开、`None` → 关），回读用 `scutil --proxy` 的逐协议字段（`ProxyState` 新增 `http_proxy` / `https_proxy` / `socks_proxy`，`serde(default)` 保证旧还原点还能读），校验改成先逐项 validate 再逐项 probe。提权载荷是 `{enable, server, https, socks, bypass}` —— **`server` 恒指 HTTP 落点**，旧助手（升级 app 不重装）只认这三个键 ⇒ 退化成旧的「只写 HTTP + 清另两项」+ 回读校验报「代理已写入但回读校验不通过」；到「设置 → 提权」重装一次即可。托盘 / 快捷面板 / 方案开关三个入口都会带上另外两个协议（`ProfileBrief` 与 `ProfileProxy` 各加四个字段），不然一键开代理会把用户配好的 HTTPS / SOCKS 关掉。Windows 不看这两项（WinINET 只有一个 `ProxyServer` 值，`prepare_proxy` 里有平台闸门，不会去校验 / 探测无关端口）。
+> · **本机出包 + 助手同步（2026-10-10 深夜）**：`npm run tauri -- build` 在本机（macOS 27.0.1 / Apple Silicon）跑通 —— release 编译 1m17s、`cargo test` **73 项全过**，产物 `target/release/bundle/macos/SuNet.app`（exe 哈希 `07bf7313…`）覆盖安装到 `/Applications/SuNet.app`（版本仍是 `0.0.2`，用户选择不 bump），并出了 `SuNet_0.0.2_aarch64.dmg`（2.7 MB，ad-hoc 签名）。**同时把免密助手换成了新二进制**：旧助手与安装当时的 app 同哈希（`22b5d3ea…`，即「只写 HTTP」那版），而助手的**载荷语义随版本走、二进制不随 app 更新自动换** —— 不换就会踩到「HTTPS / SOCKS 被旧助手静默忽略」。更新命令见 §6.4 第 7 条。
+> · **macOS 菜单栏图标改模板图 + 快捷面板不再"凭空"弹出（2026-10-10 深夜，用户报告）**：① 图标此前按主题在两版 png 之间切（`defaults read -g AppleInterfaceStyle`）—— 深浅混搭的菜单栏上必然猜错（糊在上面看不清）。改为**模板图**：新增 `src-tauri/icons/tray-template.png`（纯黑 + alpha，中间那条 66% alpha；按仓库根的 `icons/tray.svg` 几何生成），`TrayIconBuilder::icon_as_template(cfg!(target_os = "macos"))` 交给系统上色（浅色菜单栏画深色、深色菜单栏画白色），macOS 版 `taskbar_is_light()` 与每 5 秒的主题轮询整段删掉（`main.rs` 的维护线程里主题块与 `last_light` / `ticks` 一起 `#[cfg(target_os = "windows")]`，`refresh_icon_theme` 只剩 Windows 实现）。② 面板定位原先用**光标位置**当中心（图标越靠屏幕右缘越明显 —— clamp 一推面板就不在图标下方了），从主窗口 / 热键唤出时更直接锚在**工作区右下角**（Windows 任务栏的假设；macOS 菜单栏在右上角 ⇒ 面板弹到屏幕最底下）。现在用 `TrayIconEvent::Click` 事件里的 **`rect`（托盘图标外框）**当锚点，菜单 / 热键唤出则现查 `TrayIcon::rect()`；退化链 = 事件 rect → `TrayIcon::rect()` → 点击点 → 光标点 → 屏幕角落（macOS 取右上、其他取右下）；水平方向优先居中于图标、被屏幕夹住时改成与图标同侧对齐，垂直方向贴图标上下沿留 8pt，并记一条 `log::debug!(target:"tray", "快捷面板定位：图标 […] 工作区 […] 尺寸 …")` 供复现。注意 `rect` 在 Windows 上可能查不到（`Shell_NotifyIconGetRect` 失败给全 0 框）⇒ `Anchor::from_rect` 对宽或高 ≤ 0 一律返回 None。
+> · **切换方案报 `[E0000] … (os error 2)` = 免密助手与我们不共享家目录（2026-10-10 深夜，用户报告）**：常驻助手由 launchd 以 **root** 拉起（`HOME=/var/root`，也可能没有 `HOME` ⇒ 退到 `/tmp`），而代理「写前还原点」按 `paths::appdata_dir()`（`$HOME/Library/Application Support/SuNet/proxy_prev.json`）定位 —— root 名下从来没这个目录，于是**每次带代理层的切换都在写还原点那一步 ENOENT**；接着 `std::fs::write(...)?` 又把裸 `io::Error` 抛成**不带路径**的 E0000，界面上只剩一句「内部错误」（`/var/log/sunet-helper.log` 只记「执行任务 batch（uid Some(501)）」，也没线索）。修法：① `task_runner::execute` 开头 `let _ = crate::paths::ensure_dirs();`（幂等；`ensure_dirs` 此前只在 `run_gui()` 里调过，提权侧从来没有）；② `snapshot_services` 写前 `create_dir_all(parent)`、写 / 读失败都用 `E3003` + **路径**入 detail。本机复现/验证（**不需要 root**）：`HOME=/tmp/sunet-probe /Applications/SuNet.app/Contents/MacOS/SuNet --task batch --in … --out …`，载荷放 `$HOME/Library/Caches/SuNet/ipc/task-<uuid>.in.json`，内容 `{"version":1,"task":"batch","created_at":"…","data":{"ops":[{"task":"proxy_write","data":{"enable":true,"server":"","socks":"10.0.0.10:20172","bypass":"localhost;127.*;<local>"}}]}}` —— 目录不存在时逐字复现用户那句 E0000（步骤 kind = `proxy`、`applied:false`），`mkdir` 出 `$HOME/Library/Application Support/SuNet` 后同一载荷 `ok:true` 并落下 `proxy_prev.json`，因果链闭合。⚠️ 这一步以普通用户身份也会**真的改系统代理**（管理员账号跑 `networksetup` 不需要 root），验证完必须 `networksetup -setwebproxystate/-setsecurewebproxystate/-setsocksfirewallproxystate <服务> off` 并用 `scutil --proxy` 确认三项为 0（详见 §4.21）。
+
 | 事实 | 值 |
 |---|---|
 | 后端 | Rust 47 文件 / 13 827 行（`os/windows` 8 + `os/macos` 7 + `helper` 4）；Tauri 2.12.1 + tauri-build 2.7.1 |
@@ -65,7 +73,7 @@ git tag v0.0.1 && git push origin v0.0.1
 | Tauri 命令 | **62 个**，全部在 `src-tauri/src/main.rs` 的 `invoke_handler` 注册 |
 | 错误码 | 26 个（`src-tauri/src/error.rs`，含中文文案表与退出码映射） |
 | 配置 schema | `schema_version = 1`（迁移表在 `migrate.rs`） |
-| 单测 | 源码共 **66** 个 `#[test]`（覆盖 hosts 编解码/幂等、预设地址、订阅校验、迁移、脱敏、hex、IPC 映射、热键直连切换目标选择、快捷键键名收敛与非法组合拒绝、DNS/代理解析与 `pick_in_use`）；其中平台专属 macOS 11 / Windows 7，各自只编译自己那份 → **Windows 实测 55**，macOS 预期 59 |
+| 单测 | 源码共 **80** 个 `#[test]`（覆盖 hosts 编解码/幂等、预设地址、订阅校验、迁移、脱敏、hex、IPC 映射、热键直连切换目标选择、快捷键键名收敛与非法组合拒绝、DNS/代理解析与 `pick_in_use`、代理载荷形状与逐协议落点）；其中平台专属 macOS 17 / Windows 7，各自只编译自己那份 → **macOS 实测 73**（2026-10-10），Windows 现应 63（未重跑） |
 | 前端产物 | index.html + quick.html 双入口，约 98 KB JS / 25 KB CSS（压缩后 gzip 约 31 KB） |
 | 生产包体积 | Windows：`SuNet.exe` 6.2 MB（不含 WebView2，用系统自带）；NSIS 安装包 `SuNet_<版本>_x64-setup.exe` 约 2.2 MB（`target/release/bundle/nsis/`），MSI 在 `bundle/msi/`。macOS：`SuNet_<版本>_aarch64.dmg` / `SuNet_<版本>_x86_64.dmg`（ad-hoc 签名，未公证；此前 universal 包约 5.8 MB） |
 | 发布流水线 | `.github/workflows/release.yml`（结构参考同作者的 zeditor）：tag `v*` → `prepare-release`（先建 Release，说明取自 CHANGELOG）→ `build` matrix 并行（Windows nsis+msi；macOS aarch64 / x86_64 各一份 dmg，`fail-fast: false`）→ `readme`（把平台表与版本号写回 README 并提交）；各构建 job 只依赖 `prepare-release`，平台之间互不连坐 |
@@ -85,7 +93,7 @@ git tag v0.0.1 && git push origin v0.0.1
 | 配置目录（macOS） | `~/Library/Application Support/SuNet/`（同一批文件；日志落在 `~/Library/Logs/SuNet/`，IPC 载荷在 `~/Library/Caches/SuNet/ipc/`） |
 | hosts（macOS） | `/etc/hosts`（root 写：同目录 `.tmp` → `sync_all` → `rename` → `chown 0:0` + `chmod 0644`） |
 | 提权助手（macOS） | `--helper-install`（需 root）装到 `/Library/PrivilegedHelperTools/com.sunet.helper` + `/Library/LaunchDaemons/com.sunet.helper.plist`；socket `/var/run/sunet-helper.sock`（0666，按 peer uid 校验调用方）；日志 `/var/log/sunet-helper.log` |
-| 本机做不了的事 | **macOS 侧本地无法编译**：没有 `cc`，`cargo check --target aarch64-apple-darwin` 会死在 `objc2-exception-helper` 的 build script（`failed to find tool "cc"`）；macOS 能不能编译只能由 CI 回答 |
+| 出包（本机） | 2026-10-10 起开发机是 **macOS 27.0.1 / Apple Silicon**：`npm run tauri -- build` 本地可跑（release 1m17s、`cargo test` 73 项），产物 `.app`（`target/release/bundle/macos/`）+ `SuNet_<版本>_aarch64.dmg`（2.7 MB，ad-hoc 签名）。`bundle_dmg.sh` **偶发失败**，重跑 `--bundles dmg` 即成功，`.app` 不受影响。历史上的 Intel 机器没有 `cc`（`failed to find tool "cc"`）⇒ 那时 macOS 侧只能靠 CI（见 §5.1 注） |
 
 ---
 
@@ -332,6 +340,23 @@ Hyper-V 的 vEthernet 报 IfType=6（会被 if_type∈{6,71} 的物理近似误�
 2. **跨进程锁不能用数据目录里的文件**：助手以 root 运行、`HOME=/var/root`，锁文件放 `~/Library/…` 等于两个进程锁的不是同一个文件 → 改用 `/tmp/sunet-critsec.lock`（`flock` + 10s 超时，语义与命名互斥体对齐）。
 3. **提权子进程的 argv 不要经 shell**：`networksetup` 的服务名含空格（`iPhone USB`），macOS 侧的外部命令全部走 `Command::new(路径).args([...])` 直传；只有 `osascript` 那条必须拼字符串，用 POSIX 单引号转义（`sh_quote`）后再嵌进 AppleScript。
 
+### 4.20 macOS 交通灯留位：要量，别照着"设计稿尺寸"算（2026-10-10）
+
+- **交通灯不是三个 12px 方块 + 8px 间隙**。本机 AppKit 实测（macOS 27.0.1 / build 26A434）：按钮 **14×14**、间距 **S = mini.x − close.x = 23pt**、`close.x = 9` ⇒ 三灯占 **9..69pt**；配 `trafficLightPosition.x = 14` 时占 14..74pt。tao 的 `inset_traffic_lights`（`tao-0.37.1/src/platform_impl/macos/view.rs`）**直接沿用这个 S**，不是自己按 8px 排的。CSS 的 `[data-os="macos"] .topbar{padding-left}`（现 100px）要按这个右缘 + 呼吸位来留。
+- **`trafficLightPosition.x` 建议就填系统默认值**（本机 9）：tao 只在 `draw_rect` 与退出全屏时打补丁，AppKit 先把按钮弹回默认位置 —— 配置值 = 默认值就没有那一帧跳动。
+- **留位解决"压住"，解决不了"看着像冲突"**：24×24 的深色实心方块 logo 紧挨着三盏玻璃圆钮，两者还都是"三个一组"，间距再准也像撞在一起。中间试过一版**直接不渲染该方块**（`[data-os="macos"] .logo{display:none}`），实际用下来用户还是要求把 logo 放回去（它是产品标识）—— 所以最终的做法是保留 logo、把安全区从 88px 放宽到 **100px**（三灯 9..69pt + 31pt 呼吸位）。规律：**这类"看着像冲突"的问题，改间距比删元素更符合用户预期**，而间距要按实测值（不是设计稿尺寸）留。
+- **量几何的手段（无屏幕录制 / 无辅助功能权限时）**：`screencapture` 要「屏幕录制」（否则 `could not create image from rect`）、`osascript` + System Events 要「辅助功能」（否则 `-1719 osascript 不允许辅助访问`）。可行的是 `clang -fobjc-arc -framework AppKit` 编个几十行的 ObjC 程序（见 §0 同日条目），建**离屏窗口**直接打印 `standardWindowButton:` 的 frame —— 不需要任何系统权限。
+
+---
+
+### 4.21 提权进程的家目录不是我们的家目录（2026-10-10，用户报 `[E0000] … os error 2`）
+
+- **症状**：切换方案（含代理层的方案）报 `[E0000] 内部错误（No such file or directory (os error 2)）`；应用日志只有一行 `elevation: helper 任务 batch：ok=false`，`/var/log/sunet-helper.log` 一个字都不多（它只记「执行任务 batch（uid Some(501)）」）。**系统代理其实没被改动**（失败发生在写 `networksetup` 之前），所以重试即可。
+- **根因**：常驻助手由 launchd 以 root 拉起 ⇒ `HOME=/var/root`（launchd 也可能不给 `HOME`，`paths::home_dir()` 那时退回 `/tmp`），而 `paths::appdata_dir()` / `logs_dir()` / `ipc_dir()` 全是相对 `$HOME` 拼的 —— root 名下 `Library/Application Support/SuNet` 从来不存在，于是 `os/macos/system_proxy.rs` 的 `snapshot_services()` 末尾那句 `std::fs::write(snapshot_path(), …)?` 直接 ENOENT。旧代码把裸 `io::Error` 一路抛成 `AppError::internal`（`error.rs` 的 `From<io::Error>`）⇒ 界面上只有一句「内部错误」，**没路径、没文件名**，日志侧也查不到。
+- **为什么一直没暴露**：`paths::ensure_dirs()` 只在 `run_gui()` 里调过一次（`main.rs`），提权侧入口（`task_runner::run_and_exit` / `helper/daemon.rs` 的 `execute`）从来没调过；而 macOS 侧**所有**代理写 / 还原 / 清除都要提权（`proxy_write_needs_root() == true`）⇒「先写还原点」是每次切换的必经之路，只是必须由**根身份**去写才会踩到。物证：用户侧 `~/Library/Application Support/SuNet/` 里**从来没有 `proxy_prev.json`**。
+- **修法**：① 提权任务入口补一句 `let _ = crate::paths::ensure_dirs();`（`task_runner::execute` 开头；幂等，Windows 侧无副作用）；② `snapshot_services` 自己 `create_dir_all(parent)`，写 / 读失败都用 `E3003` 并把**路径**写进 detail。**不要**把还原点改到用户家目录：读（`proxy_restore`）与写（`proxy_write`）都在根身份下，换成用户目录反而要额外处理「哪个用户 + 属主」的问题。
+- **复现与验证（不需要 root，命令见 §0 同日条目）**：`HOME=<不存在 / 没有 Library/Application Support/SuNet 的目录> /Applications/SuNet.app/Contents/MacOS/SuNet --task batch --in … --out …`，载荷必须放在 `$HOME/Library/Caches/SuNet/ipc/task-<uuid>.in.json`（文件名形状与 `SuNet/ipc` 末两段都要过 `verify_payload_file`）。⚠️ 以普通用户身份跑 `networksetup` **真的会改系统代理**（管理员账号不需要 root —— 这也是「免密助手其实不是必需」的原因），验证完务必关掉：`networksetup -setwebproxystate/-setsecurewebproxystate/-setsocksfirewallproxystate <服务> off`，再用 `scutil --proxy` 确认三项为 `0`。
+
 ---
 
 ## 5. 怎么证明改动是对的
@@ -340,7 +365,7 @@ Hyper-V 的 vEthernet 报 IfType=6（会被 if_type∈{6,71} 的物理近似误�
 
 | 项 | 判据 |
 |---|---|
-| 单测 | `cargo test` → **55 passed**（Windows；源码共 66 个 `#[test]`，macOS 专属 11 个不参与编译） |
+| 单测 | `cargo test` → **55 passed**（2026-10-07 Windows 实测；此后源码增至 80 个 `#[test]`，macOS 专属 17 个不参与编译 ⇒ Windows 现应 63）。**macOS 2026-10-10 实测 73 passed**，见 §6.4 |
 | 前端 | `npm run check` 零错误；`npm run build` 双入口产物 |
 | 后端 | `cargo build` 零警告 |
 | IPC 延迟 | CDP 实测 `get_app_state` ≈ 2–6ms；`dns_interfaces`（FFI）≈ 8ms；主窗口五个标签页切换全部 ≈ 110ms（DNS 页曾 3080ms） |
@@ -492,35 +517,44 @@ WinHTTP 代理、PAC 代理模式、TUN/虚拟网卡、hosts 通配符规则、�
 
 | 能力 | Windows（已实测） | macOS（已实现，**未真机验证**） |
 |---|---|---|
-| 系统代理 | 注册表 `Internet Settings` + `InternetSetOptionW` 通知 | **只写 HTTP**（`-setwebproxy`——2026-10-10：三项同端口会让只支持 HTTP 的代理端口收到 SOCKS 而断网）× 全部活动服务，并清掉 HTTPS / SOCKS 残留；读回 `scutil --proxy`；还原点 `~/Library/Application Support/SuNet/proxy_prev.json` 逐协议记录（`fmt=2`，旧格式整份丢弃） |
+| 系统代理 | 注册表 `Internet Settings` + `InternetSetOptionW` 通知 | **HTTP / HTTPS / SOCKS 三个协议各自独立**（2026-10-10；同一端口搪给三个协议会让只支持 HTTP 的代理端口收到 SOCKS 而断网，所以默认仍只填 HTTP，见顶上那条）× 全部活动服务；读回 `scutil --proxy`（`http_proxy` / `https_proxy` / `socks_proxy` 逐协议）；还原点 `~/Library/Application Support/SuNet/proxy_prev.json` 逐协议记录（`fmt=2`，旧格式整份丢弃） |
 | DNS | `GetAdaptersAddresses` 枚举（~8ms）+ `netsh` 分族写 | `networksetup -listnetworkserviceorder` + `-listallhardwareports` + `ifconfig`（2s 缓存）；`-setdnsservers` 分族写、写后回读校验；刷缓存 `dscacheutil -flushcache` + `killall -HUP mDNSResponder`（走提权任务 `dns_flush`） |
 | hosts | `…\drivers\etc\hosts` + `ReplaceFileW` | `/etc/hosts` + 同目录 `.tmp` → `rename` → `chown 0:0` / `chmod 0644` |
 | 提权 | `ShellExecuteExW` runas + `--task` 子进程 IPC | ① 常驻助手：root LaunchDaemon（`launchctl bootstrap system`）+ `/var/run/sunet-helper.sock`，按 peer uid（root 或 console 用户）校验，`--helper-install` 装一次免密码；② 回退 `osascript … with administrator privileges`，弹一次系统授权框（这条路径**没有超时**——等用户输密码不算卡死；取消按 `-128` 或 "User canceled" 判 `E1001`）。一次方案切换最多弹**一次**（代理与 hosts / DNS 同批，见顶上 2026-10-10 那条） |
 | 自启动 | 计划任务（`/RL LIMITED` `/SC ONLOGON`） | `~/Library/LaunchAgents/com.sunet.desktop.autostart.plist` + `launchctl bootstrap gui/<uid>` |
 | 全局热键 | `global-shortcut`，展示 `Ctrl+Alt+S` | 同一个插件；⌘ 在录制里规范名为 `Super`（后端 `mods_of` → `MOD_WIN`，插件认识 `Super`），展示层由 `platform.ts` 的 `MOD_GLYPH` 渲染成 ⌃⌥⇧⌘ |
-| 窗口外观 | 无边框自绘顶栏（§4.18） | 原生交通灯：`tauri.macos.conf.json` 的 `titleBarStyle: "Overlay"` + `hiddenTitle` + `trafficLightPosition {x:14,y:18}`；CSS 隐藏自绘 `−` / `×` 并给 `.topbar` 留 88px 左内边距。`data-os` 由首帧脚本 `public/os-mark.js`（两个 HTML 的 `<head>` 经典脚本引入）在**首帧前**打上（`src/platform.ts` 只做兜底重写） |
+| 窗口外观 | 无边框自绘顶栏（§4.18） | 原生交通灯：`tauri.macos.conf.json` 的 `titleBarStyle: "Overlay"` + `hiddenTitle` + `trafficLightPosition {x:9,y:18}`（x = 本机 AppKit 默认值，见 §4.20）；CSS 隐藏自绘 `−` / `×`（方块 logo **保留**，那是产品标识），`.topbar` 左内边距 **100px**（三灯 9..69pt + 31pt 呼吸位）。`data-os` 由首帧脚本 `public/os-mark.js`（两个 HTML 的 `<head>` 经典脚本引入）在**首帧前**打上（`src/platform.ts` 只做兜底重写） |
+| 托盘 / 快捷面板 | 图标按任务栏明暗在两版 png 间切（`taskbar_is_light()` 读注册表，每 5 秒轮询）；面板锚点 = 光标点 → clamp 到工作区 | 图标 = `icons/tray-template.png` + `icon_as_template`（系统按菜单栏材质上色，**不猜主题**，也没有轮询）；面板锚点 = `TrayIconEvent::Click.rect` / `TrayIcon::rect()`（退化链：图标外框 → 图标点 → 光标点 → 角落；macOS 角落取**右上**、其他取右下）；水平居中于图标、被夹住时改成与图标同侧对齐，垂直贴图标上下沿留 8pt |
 | 签名 | 未签名（SmartScreen） | `signingIdentity: "-"`（ad-hoc；没有开发者证书，因此不签名不公证 → 首次打开要在系统设置里放行） |
 | 界面文案 | UAC / 计划任务 / WinINET | 系统授权框 / 登录项 / 网络服务代理（`src/platform.ts` 按 `navigator.userAgent` 切） |
 
 **已知未验证点（按风险排序）**
+
+> 2026-10-10 起开发机就是 macOS 27.0.1（Apple Silicon），下面这些点改为在本机逐条实测；本小节标题与下表里遗留的「未真机验证」字样是当时（Windows 开发机）的历史判断。
+
 1. `osascript` 提权路径的取消/失败判定，以及"取消后不留半套配置"（靠 `apply.rs` 的回滚）。
 2. 常驻助手的安装/鉴权/卸载：BTM 是否拦 `bootstrap system`、socket peer uid 校验、卸载残留。
 3. `pick_in_use()` 的服务选择：只有 Wi-Fi、或 Wi-Fi + 有线同时在用时，写到的服务是否是用户实际在用的那个。
 4. 按架构构建的 dmg 产物（`--target aarch64-apple-darwin` / `x86_64-apple-darwin`）、ad-hoc 签名后的 Gatekeeper 提示。
-5. 前端 `data-os="macos"` 的样式/文案分支是否完整（自绘按钮隐藏、顶栏留白、授权文案）。用户实测反馈过"logo 与交通灯重合"，2026-10-10 按「首帧打标 + 安全区 88px」修，**仍需真机复核**（本机没有 macOS）。
+5. 前端 `data-os="macos"` 的样式/文案分支是否完整（自绘按钮隐藏、顶栏留白、授权文案）。用户两次实测反馈过"左上角与交通灯冲突"：第一次（2026-10-10）按「首帧打标 + 安全区 88px」修；第二次按量出来的真实几何（14×14 / 间距 23pt / `close.x=9`）重新核对，中间一版去掉了方块 logo，用户又要求放回来 —— 最终 = **保留 logo + 安全区 100px + x 改为系统默认 9**（§4.20），观感仍以用户过目为准。
+6. **提权助手路径下的「写前还原点」**（§4.21）：修复前 root 身份写 `proxy_prev.json` 一律 ENOENT（已用普通用户身份在旧二进制上复现，逐字命中用户的 `[E0000]`）；修复后**必须在真正走助手的路径上验证一次**（GUI 里切换带代理层的方案），并确认 root 的 appdata 里真的出现了这份还原点：`sudo ls -l "/var/root/Library/Application Support/SuNet/proxy_prev.json"`。
 
-**本机验证边界**：本机没有 macOS，交叉检查也做不了 —— 没有 `cc`，`cargo check --target aarch64-apple-darwin` 会死在 `objc2-exception-helper` 的 build script（`failed to find tool "cc"`）。所以"macOS 能不能编译"只能由 CI 回答（**CI 已给出答案：能编译、59 项单测通过、dmg 能出——当时为 universal 构建，见 §5.1**）；本地能保证的只有 `rustfmt --edition 2021 --check` 无语法错误 + Windows 侧 `cargo test` 不回归。
+**本机验证边界**：2026-10-10 起开发机就是 **macOS 27.0.1 / Apple Silicon** ⇒ macOS 侧**现在能本地验证**：`cargo test` 73 项、`npm run tauri -- build` 出 `.app` / `.dmg`、回读可以直接看 `scutil --proxy`（不必依赖截图，见 §4.20 的离屏量法）。反过来 **Windows 侧只能靠 CI**（本机既跑不了 Windows 那份 `cargo test`，也没法在 Windows 上冒烟）。历史注（Intel iMac、无 `cc`）：`cargo check --target aarch64-apple-darwin` 曾死在 `objc2-exception-helper` 的 build script（`failed to find tool "cc"`），那时只能由 CI 回答「macOS 能不能编译」（CI 当年答：能编译、59 项单测、dmg 能出，见 §5.1）。
 
 **Mac 实测清单（拿到 mac 后按顺序跑）**
 1. `npm ci` → `npm run tauri -- build -- --target aarch64-apple-darwin --bundles dmg`（Intel 机器换 `x86_64-apple-darwin`）→ 装 dmg（首次要在「系统设置 → 隐私与安全性」放行）。
-2. `cd src-tauri && cargo test` → 预期 **59 项**（66 − 7 项 Windows 专属）。
+2. `cd src-tauri && cargo test` → 预期 **73 项**（80 − 7 项 Windows 专属；2026-10-10 本机实测 73 passed）。
 3. 启动三态冒烟：裸启 / `--minimized` / `--panel`；日志无 error；托盘菜单与 ⌘ 组合热键可用。
 4. hosts：写入 → `cat /etc/hosts` 看托管区块 → 还原 → 区块消失；`ls -l /etc/hosts` 应为 `root wheel` `0644`。
-5. 代理：开关各一次，对比 `scutil --proxy` 与「系统设置 → 网络 → 代理」；关闭后是否回到原值。
+5. 代理：HTTP / HTTPS / SOCKS 各填一个落点后开启，用 `scutil --proxy` 核对 `HTTPEnable` / `HTTPSEnable` / `SOCKSEnable` 与端口逐项对上（**留空的协议必须是 0**）；关闭后回到原值（逐协议还原点 `proxy_prev.json`）。顺手验证 §4.21：走**助手**（GUI 切换）时提权身份也要能落盘 —— `sudo ls -l "/var/root/Library/Application Support/SuNet/proxy_prev.json"` 应存在（用户身份跑复现命令则是 `~/Library/Application Support/SuNet/proxy_prev.json`）。
 6. DNS：`networksetup -getdnsservers Wi-Fi` 前后对比；切"自动(DHCP)"后应落回 `aren't any DNS Servers`；刷缓存无报错。
 7. 提权助手：`sudo /Applications/SuNet.app/Contents/MacOS/SuNet --helper-install` → `--helper-status`；之后写 hosts **不该**再弹授权框。
+   **升级 app 后助手仍是旧二进制**（`helper/install.rs` 拷贝的是安装当时的 exe，而载荷语义随版本走），更新办法一条命令、一次密码：
+   `osascript -e 'do shell script "/Applications/SuNet.app/Contents/MacOS/SuNet --helper-install" with administrator privileges'`
+   （UI 在「已安装且运行中」时只给「卸载」，走界面要授权两次）。核对两者是否同一份：
+   `shasum -a256 /Library/PrivilegedHelperTools/com.sunet.helper /Applications/SuNet.app/Contents/MacOS/SuNet`。
 8. 无助手路径：`--helper-uninstall` 后再写 hosts，应弹一次系统授权框；**取消**时应报 E1001 且配置回到操作前。
-9. 外观：无残留 Windows 标题栏、无重复的最小化/关闭按钮、交通灯不被顶栏内容压住、快捷面板贴边正常。
+9. 外观：无残留 Windows 标题栏、无重复的最小化/关闭按钮、交通灯不被顶栏内容压住、快捷面板贴边正常；macOS 顶栏**保留方块 logo**（§4.20），品牌方块距三灯右缘 ≥31pt（`.topbar` 左内边距 100px）。托盘侧另看两点：菜单栏图标是**模板图**（浅色 / 深色菜单栏下都该看得清，不再是糊在上面的一坨）；快捷面板弹出后应**水平居中于菜单栏图标**、贴着菜单栏下沿（而不是跑到屏幕右下角或跟着鼠标飘），主窗口 / 热键唤出也应贴图标（§6.4「托盘 / 快捷面板」行）。
 10. 自启：开关各一次，检查 `~/Library/LaunchAgents/com.sunet.desktop.autostart.plist` 与 `launchctl list | grep sunet`。
 
 ---

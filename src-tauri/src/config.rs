@@ -37,17 +37,11 @@ impl Default for ShortcutBinding {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Shortcuts {
     pub clear_proxy: ShortcutBinding,
 }
 
-impl Default for Shortcuts {
-    fn default() -> Self {
-        Self {
-            clear_proxy: ShortcutBinding::default(),
-        }
-    }
-}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
@@ -140,6 +134,44 @@ pub struct ProfileProxy {
     pub host: String,
     pub port: u16,
     pub bypass: String,
+    /// HTTPS 代理地址（macOS 把三个协议当独立开关；Windows 用不上 → 界面不显示）
+    pub https_host: String,
+    pub https_port: u16,
+    /// SOCKS 代理地址
+    pub socks_host: String,
+    pub socks_port: u16,
+}
+
+impl ProfileProxy {
+    /// 有没有任何一个协议配好了（HTTP 或 HTTPS / SOCKS）——
+    /// 决定“一键开代理”（托盘 / 快捷面板 / 方案开关）能不能用：
+    /// macOS 三个协议都是可选的，只配了 HTTPS / SOCKS 也算配好了。
+    pub fn any_endpoint(&self) -> bool {
+        (!self.host.trim().is_empty() && self.port > 0)
+            || self.https_endpoint().is_some()
+            || self.socks_endpoint().is_some()
+    }
+
+    /// HTTPS 落点：地址与端口都填了才算配（留空 = 关闭该协议）
+    pub fn https_endpoint(&self) -> Option<crate::apply::ProxyEndpoint> {
+        endpoint(&self.https_host, self.https_port)
+    }
+
+    /// SOCKS 落点（留空 = 关闭该协议）
+    pub fn socks_endpoint(&self) -> Option<crate::apply::ProxyEndpoint> {
+        endpoint(&self.socks_host, self.socks_port)
+    }
+}
+
+/// 两个字段都填了才算一个落点（只填一半 = 没填，与界面的"留空即关闭该协议"一致）
+fn endpoint(host: &str, port: u16) -> Option<crate::apply::ProxyEndpoint> {
+    if host.trim().is_empty() || port == 0 {
+        return None;
+    }
+    Some(crate::apply::ProxyEndpoint {
+        host: host.trim().to_string(),
+        port,
+    })
 }
 
 impl Default for ProfileProxy {
@@ -149,6 +181,11 @@ impl Default for ProfileProxy {
             host: String::new(),
             port: 0,
             bypass: DEFAULT_BYPASS.into(),
+            // 逐协议代理默认留空 = 不开（与 ≤ 0.0.2 只写 HTTP 的行为一致）
+            https_host: String::new(),
+            https_port: 0,
+            socks_host: String::new(),
+            socks_port: 0,
         }
     }
 }
@@ -186,6 +223,7 @@ impl Default for ProfileDns {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Profile {
     pub id: String,
     pub name: String,
@@ -196,19 +234,6 @@ pub struct Profile {
     pub dns: ProfileDns,
 }
 
-impl Default for Profile {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            name: String::new(),
-            is_builtin: false,
-            note: String::new(),
-            hosts: ProfileHosts::default(),
-            proxy: ProfileProxy::default(),
-            dns: ProfileDns::default(),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // 订阅
@@ -280,15 +305,11 @@ pub struct SourceEntries {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
+#[derive(Default)]
 pub struct DnsPresetStore {
     pub custom: Vec<DnsPreset>,
 }
 
-impl Default for DnsPresetStore {
-    fn default() -> Self {
-        Self { custom: Vec::new() }
-    }
-}
 
 fn custom_dns_default() -> DnsPreset {
     DnsPreset {

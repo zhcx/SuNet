@@ -95,6 +95,26 @@ mod imp {
         enabled() && is_installed()
     }
 
+    /// 通道健康度：ok（装好且可用）/ missing（未安装）。
+    /// Windows 计划任务没有「装了没跑起来」这个状态。
+    pub fn health() -> &'static str {
+        if usable() {
+            "ok"
+        } else {
+            "missing"
+        }
+    }
+
+    /// 通道健康度：ok（装好且可用）/ missing（未安装）。
+    /// Windows 计划任务没有「装了没跑起来」这个状态。
+    pub fn health() -> &'static str {
+        if usable() {
+            "ok"
+        } else {
+            "missing"
+        }
+    }
+
     /// 切换后是否提示"装一次就不用再输密码"。
     ///
     /// Windows 返回 `None`：静默通道等价于"一次授权、长期有效"（见模块头「安全边界」），
@@ -421,6 +441,20 @@ mod macos_impl {
         }
     }
 
+    /// 通道健康度：ok（装好且 socket 在跑）/ stalled（装了但守护进程没起来，
+    /// 常见原因是 BTM 拦截）/ missing（未安装）。给提示层区分文案用。
+    pub fn health() -> &'static str {
+        if crate::helper::installed() {
+            if crate::helper::available() {
+                "ok"
+            } else {
+                "stalled"
+            }
+        } else {
+            "missing"
+        }
+    }
+
     /// 安装 / 卸载自带 osascript 提权（一次性输密码），不走 `run_elevated`
     pub fn install() -> Result<String> {
         crate::elevation::run_self_command_elevated(&["--helper-install"])
@@ -463,6 +497,9 @@ mod unsupported {
     pub fn invalidate_cache() {}
     pub fn usable() -> bool {
         false
+    }
+    pub fn health() -> &'static str {
+        "missing"
     }
     pub fn no_password_hint() -> Option<String> {
         None

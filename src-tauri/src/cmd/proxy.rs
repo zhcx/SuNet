@@ -1,6 +1,6 @@
 //! 代理相关命令（[无提权]：HKCU 用户 hive 可写）
 
-use crate::apply::{self, ApplyTargets, ProxyTarget};
+use crate::apply::{self, ApplyTargets, ProxyEndpoint, ProxyTarget};
 use crate::error::{AppError, Result};
 use crate::os::system_proxy::{self, ProxyState};
 use crate::state::{SharedState, CLEAR_UNDO_WINDOW};
@@ -16,6 +16,12 @@ pub struct ProxyConfig {
     pub port: u16,
     #[serde(default)]
     pub bypass: String,
+    /// HTTPS 代理落点（`null` / 缺省 = 关闭该协议）；只有 macOS 会发它
+    #[serde(default)]
+    pub https: Option<ProxyEndpoint>,
+    /// SOCKS 代理落点（`null` / 缺省 = 关闭该协议）；只有 macOS 会发它
+    #[serde(default)]
+    pub socks: Option<ProxyEndpoint>,
     /// 前端可覆盖全局设置（§3.4 第 2 步的"仍然开启"出口）
     #[serde(default)]
     pub force: bool,
@@ -122,6 +128,10 @@ pub async fn proxy_set(
                 port: cfg.port,
                 bypass,
                 probe: effective_probe,
+                // 逐协议落点：前端没发（Windows）或整套留空就是"关闭该协议"；
+                // 只填一半的要留到校验里报错，所以这里只滤掉"完全为空"的
+                https: cfg.https.clone().filter(|e| !empty_endpoint(e)),
+                socks: cfg.socks.clone().filter(|e| !empty_endpoint(e)),
             }),
             strict_verify: false,
             ..Default::default()
@@ -143,6 +153,13 @@ pub async fn proxy_set(
         );
     }
     Ok(report)
+}
+
+/// 界面上"整套留空"发过来的是 `{host:"", port:0}`：按"没配这个协议"处理
+/// ——【关闭该协议】与【不改动】在这里是同一件事（写下去就是显式关闭）。
+/// 只填一半的**不**在这里丢：那要让 `apply::prepare_proxy` 报错，而不是被静默当成关闭。
+fn empty_endpoint(e: &ProxyEndpoint) -> bool {
+    e.host.trim().is_empty() && e.port == 0
 }
 
 /// [无提权] 彻底清零 + 可撤销（§5.5.6 / §5.5.7）

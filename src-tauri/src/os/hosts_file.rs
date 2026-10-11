@@ -438,7 +438,7 @@ pub fn validate_hostname(hostname: &str) -> std::result::Result<(), String> {
 pub fn validate_entry(entry: &HostsEntry) -> Result<()> {
     validate_ip(&entry.ip).map_err(|e| AppError::new("E2005", format!("IP 非法：{e}")))?;
     validate_hostname(&entry.hostname).map_err(|e| AppError::new("E2005", format!("域名非法：{e}")))?;
-    if entry.comment.contains(|c| c == '\n' || c == '\r') {
+    if entry.comment.contains(['\n', '\r']) {
         return Err(AppError::new("E2005", "注释不能包含换行"));
     }
     Ok(())

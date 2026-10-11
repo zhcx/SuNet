@@ -420,6 +420,9 @@ mod tests {
                 bypass: String::new(),
                 autoconfig_url: None,
                 pac_present: false,
+                // macOS 的逐协议字段（Windows 的 ProxyState 里没有这几个字段）：
+                // 这个测试只关心元信息文案，用默认值即可
+                ..Default::default()
             }),
             proxy_existed: true,
             dns: vec![],

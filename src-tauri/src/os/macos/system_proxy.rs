@@ -11,8 +11,8 @@
 //!   - WinINET `ProxyOverride` 是分号分隔且支持通配符；macOS 的例外列表是域名列表，
 //!     不接受 `127.*` 这种写法，也没有 `<local>` ⇒ `to_mac_exceptions` / `from_mac_exceptions`
 //!   - WinINET 的 `ProxyServer` 一个值服务所有协议；macOS 的 HTTP / HTTPS / SOCKS 是
-//!     **三个独立开关** ⇒ 这里只写 HTTP 一项（见 [`MANUAL_PROTO`] 的说明），
-//!     HTTPS / SOCKS 只在"清残留"时被动关掉
+//!     **三个独立开关** ⇒ 这里逐协议写入（见 [`write_manual`]）：给了落点的协议写地址
+//!     并打开，没给落点的协议**显式关闭**（顺手清掉旧版本把三项都指到同一端口的残留）
 //!   - PAC 由 `-setautoproxyurl` / `-setautoproxystate` 管理（手动写入不动 PAC，同 Windows）
 
 use crate::error::{AppError, Result, E3003, E3004};
@@ -26,11 +26,24 @@ pub const DEFAULT_BYPASS: &str = "localhost;127.*;<local>";
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct ProxyState {
     pub enable: bool,
+    /// **主落点**：HTTP → HTTPS → SOCKS 里第一个开着的
+    /// （托盘 / 快捷面板这类只显示一个地址的界面用它）
     pub server: String,
     pub bypass: String,
     pub autoconfig_url: Option<String>,
     /// PAC 存在时优先级高于手动代理
     pub pac_present: bool,
+    /// 逐协议落点（`host:port`）；`None` = 该协议没开，或快照里没有这个信息。
+    ///
+    /// 只有 macOS 有"逐协议代理"这个概念（三个独立开关），Windows 的 `ProxyState`
+    /// 里没有这几个字段；反序列化时缺失也不会失败（`serde(default)`），
+    /// 所以两边共用同一份 `proxy_snapshot.json` 的旧文件仍然读得进来。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub https_proxy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socks_proxy: Option<String>,
 }
 
 impl ProxyState {
@@ -50,6 +63,31 @@ enum Proto {
 }
 
 impl Proto {
+    /// 三个协议（顺序 = 界面顺序 = 系统设置里的顺序）
+    const ALL: [Proto; 3] = [Proto::Web, Proto::Secure, Proto::Socks];
+
+    /// 本协议在"逐协议写入内容"里的落点（`None` = 这次写入要把它关掉）
+    fn target(self, p: &crate::os::ManualProxy) -> Option<String> {
+        let raw = match self {
+            Proto::Web => Some(p.http.as_str()),
+            Proto::Secure => p.https.as_deref(),
+            Proto::Socks => p.socks.as_deref(),
+        };
+        let s = raw.map(str::trim).filter(|s| !s.is_empty())?;
+        Some(s.to_string())
+    }
+
+    /// 本协议在回读状态里的落点（`None` = 回读显示它是关的）
+    fn state_target(self, st: &ProxyState) -> Option<String> {
+        let raw = match self {
+            Proto::Web => st.http_proxy.as_deref(),
+            Proto::Secure => st.https_proxy.as_deref(),
+            Proto::Socks => st.socks_proxy.as_deref(),
+        };
+        let s = raw.map(str::trim).filter(|s| !s.is_empty())?;
+        Some(s.to_string())
+    }
+
     /// 读服务器：`-getwebproxy` / `-getsecurewebproxy` / `-getsocksfirewallproxy`
     fn get_cmd(self) -> &'static str {
         match self {
@@ -87,24 +125,60 @@ impl Proto {
     }
 }
 
-/// 「手动代理」写入时**只写 HTTP 这一项**（2026-10-10 用户实测修正）。
+/// 一次手动代理写入的**逐协议计划**：每个协议要么写地址（并打开），要么显式关闭。
 ///
-/// 原先三项都指到同一个 `host:port`：只支持 HTTP 的代理端口会收到 SOCKS / HTTPS 请求，
-/// 结果是一开代理就断网。HTTP 一项已经覆盖绝大多数场景 —— CFNetwork 在没有
-/// Secure Web Proxy 时，HTTPS 请求也会走 HTTP 代理（CONNECT）。
-///
-/// 想支持"SOCKS 走另一个端口"之类的玩法，就得先把方案里的代理地址拆成逐协议配置；
-/// 在那之前，多写协议只会制造上面那个故障。
-const MANUAL_PROTO: Proto = Proto::Web;
+/// 为什么要先落成计划：地址解析必须**在动手写之前**全部完成 —— 否则第一个网络服务
+/// 已经改了，第二个才发现地址不合法，留下一个改了一半的系统。
+struct ManualPlan {
+    /// 固定按 [`Proto::ALL`] 的顺序
+    per_proto: [(Proto, Option<(String, u16)>); 3],
+}
 
-/// 写入手动代理时**必须顺手关掉**的两项。
-///
-/// 旧版本（≤ 0.0.2）把 HTTPS / SOCKS 也指到了同一个端口：升级后不清掉的话，残留设置
-/// 会继续把 HTTPS / SOCKS 流量送去那个端口（用户看到的现象就是"升级了还是上不了网"）。
-const MANUAL_CLEAR: &[Proto] = &[Proto::Secure, Proto::Socks];
+impl ManualPlan {
+    /// 某个协议这次要写到哪个落点（`None` = 关闭该协议）。仅单测断言用。
+    #[cfg(test)]
+    fn get(&self, proto: Proto) -> Option<&(String, u16)> {
+        self.per_proto
+            .iter()
+            .find(|(p, _)| *p == proto)
+            .and_then(|(_, t)| t.as_ref())
+    }
 
-/// 关闭手动代理时三项全关 —— 同样是为了清掉旧版本 / 用户手工留下的三项
-const MANUAL_OFF: &[Proto] = &[Proto::Web, Proto::Secure, Proto::Socks];
+    /// 这次要打开的协议数（关闭时是 0）
+    fn enabled_count(&self) -> usize {
+        self.per_proto.iter().filter(|(_, t)| t.is_some()).count()
+    }
+}
+
+/// 解析逐协议写入计划。
+///
+/// `enable=false` 时落点全部忽略（三个协议都关）；`enable=true` 时**三个协议都是可选的**
+/// —— 给了落点的写地址并打开、留空的显式关掉 —— 但不允许一个都不填：那等于"用开代理的
+/// 方式把代理全关掉"，只会让用户以为操作出了错。
+fn manual_plan(p: &crate::os::ManualProxy) -> Result<ManualPlan> {
+    let mut per_proto: [(Proto, Option<(String, u16)>); 3] = [
+        (Proto::Web, None),
+        (Proto::Secure, None),
+        (Proto::Socks, None),
+    ];
+    if p.enable {
+        for (i, proto) in Proto::ALL.iter().enumerate() {
+            let Some(raw) = proto.target(p) else { continue };
+            let (host, port) = parse_server(&raw).ok_or_else(|| {
+                AppError::coded(E3003).with_detail(format!(
+                    "{} 代理地址格式不正确：{raw}（应形如 127.0.0.1:7890）",
+                    proto.label()
+                ))
+            })?;
+            per_proto[i] = (*proto, Some((host, port)));
+        }
+        if per_proto.iter().all(|(_, t)| t.is_none()) {
+            return Err(AppError::coded(E3003)
+                .with_detail("请至少填写一个代理协议的地址与端口（HTTP / HTTPS / SOCKS）"));
+        }
+    }
+    Ok(ManualPlan { per_proto })
+}
 
 /// 单个协议的代理项
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -234,15 +308,28 @@ pub fn read() -> Result<ProxyState> {
     let socks_enable = on("SOCKSEnable");
     let enable = http_enable || https_enable || socks_enable;
 
-    let server = if http_enable {
-        join_host_port(get("HTTPProxy"), get("HTTPPort"))
-    } else if https_enable {
-        join_host_port(get("HTTPSProxy"), get("HTTPSPort"))
-    } else if socks_enable {
-        join_host_port(get("SOCKSProxy"), get("SOCKSPort"))
-    } else {
-        String::new()
+    // 只把"开着且拿得到地址"的协议记入逐协议字段；开着但地址读不出来（理论上不会发生）
+    // 也不编一个假地址出来
+    let one = |on: bool, host: Option<String>, port: Option<String>| -> Option<String> {
+        if !on {
+            return None;
+        }
+        let s = join_host_port(host, port);
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
     };
+    let http_proxy = one(http_enable, get("HTTPProxy"), get("HTTPPort"));
+    let https_proxy = one(https_enable, get("HTTPSProxy"), get("HTTPSPort"));
+    let socks_proxy = one(socks_enable, get("SOCKSProxy"), get("SOCKSPort"));
+    // 主落点：三个里第一个开着的（给"只要一个地址"的界面用）
+    let server = http_proxy
+        .clone()
+        .or_else(|| https_proxy.clone())
+        .or_else(|| socks_proxy.clone())
+        .unwrap_or_default();
 
     // 例外列表：形如 `0 : *.local` 的序号键
     let exceptions: Vec<String> = pairs
@@ -264,6 +351,9 @@ pub fn read() -> Result<ProxyState> {
         bypass,
         autoconfig_url: if pac_present { Some(auto_url) } else { None },
         pac_present,
+        http_proxy,
+        https_proxy,
+        socks_proxy,
     })
 }
 
@@ -360,13 +450,22 @@ fn parse_proxy_block(text: &str) -> (bool, String) {
 // 写
 // ---------------------------------------------------------------------------
 
-/// 只写入手动代理（不动 PAC）：**只写 HTTP 一项**（见 [`MANUAL_PROTO`]），
-/// 并顺手清掉旧版本留下的 HTTPS / SOCKS 残留。对所有未停用服务生效。
-pub fn write_manual(enable: bool, server: &str, bypass: &str) -> Result<()> {
+/// 只写入手动代理（不动 PAC）：**逐协议**写 —— 给了落点的协议写地址并打开，
+/// 没给落点的协议显式关闭（顺手清掉 ≤ 0.0.2 把 HTTPS / SOCKS 也指到同一端口的残留）。
+/// 对所有未停用服务生效。
+pub fn write_manual(p: &crate::os::ManualProxy) -> Result<()> {
+    let plan = manual_plan(p)?;
     let services = active_services()?;
+    log::info!(
+        target: "proxy",
+        "写入手动代理：{} 个协议 × {} 个网络服务（HTTP={}）",
+        plan.enabled_count(),
+        services.len(),
+        if p.enable { "on" } else { "off" }
+    );
     snapshot_services(&services)?; // 先留还原点
     for svc in &services {
-        write_service_manual(svc, enable, server, bypass)?;
+        write_service_manual(svc, &plan, &p.bypass)?;
     }
     Ok(())
 }
@@ -389,21 +488,52 @@ pub fn restore(state: &ProxyState) -> Result<()> {
             None => Ok(()),
         };
     }
-    // 没有还原点：按与 write_manual 相同的规则落到所有服务（只写 HTTP），PAC 单独回填
+    // 没有还原点：按与 write_manual 相同的规则落到所有服务，PAC 单独回填。
+    // 逐协议字段只在带逐协议信息的快照（macOS 0.0.3+）里才有：老快照只有主落点，
+    // 那就只恢复主落点 —— 老版本正是"三项同端口"才断网的，照抄那个形态等于把故障
+    // 一起还原回来（见 [`state_to_manual`]）。
+    let plan = manual_plan(&state_to_manual(state))?;
     let services = active_services()?;
     for svc in &services {
-        write_service_manual(svc, state.enable, &state.server, &state.bypass)?;
+        write_service_manual(svc, &plan, &state.bypass)?;
         write_pac(svc, state.autoconfig_url.as_deref(), state.pac_present)?;
     }
     Ok(())
+}
+
+/// 回读状态 → 逐协议写入内容（只在"没有逐服务还原点"的兜底还原里用）
+fn state_to_manual(st: &ProxyState) -> crate::os::ManualProxy {
+    let norm = |s: Option<&str>| -> Option<String> {
+        s.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    };
+    // 老快照（≤ 0.0.2）只记了主落点，那时它就是 HTTP；新快照逐协议记录 ——
+    // HTTP 留空就是"没开 HTTP"，**不能**拿 `server` 顶上（那时它可能是 HTTPS / SOCKS 的落点，
+    // 拿过来就成了"把 SOCKS 的地址写到 HTTP 上"）。
+    let legacy = st.http_proxy.is_none() && st.https_proxy.is_none() && st.socks_proxy.is_none();
+    let http = if legacy {
+        norm(st.http_proxy.as_deref()).or_else(|| norm(Some(&st.server)))
+    } else {
+        norm(st.http_proxy.as_deref())
+    };
+    crate::os::ManualProxy {
+        enable: st.enable,
+        http: http.unwrap_or_default(),
+        // 逐协议信息缺失时**不**把主落点复制到 HTTPS / SOCKS：
+        // 那正是 ≤ 0.0.2 三项同端口、一开就断网的形态
+        https: norm(st.https_proxy.as_deref()),
+        socks: norm(st.socks_proxy.as_deref()),
+        bypass: st.bypass.clone(),
+    }
 }
 
 /// 彻底清零：三个代理全关 + PAC 关（保留例外列表 —— 它是绕过名单，清掉反而更糟）
 pub fn hard_clear() -> Result<()> {
     let services = active_services()?;
     for svc in &services {
-        for p in MANUAL_OFF {
-            set_proxy_state(svc, *p, false)?;
+        for p in Proto::ALL {
+            set_proxy_state(svc, p, false)?;
         }
         let _ = net::networksetup_soft(&[
             "-setautoproxystate".to_string(),
@@ -415,19 +545,18 @@ pub fn hard_clear() -> Result<()> {
     Ok(())
 }
 
-/// 手动代理：启用时**只写 HTTP**，关闭时三项全关。
+/// 按计划写一个服务：逐协议「写地址 + 打开」或「显式关闭」。
 ///
-/// 两种情况下都会顺手关掉"不该开"的项：启用时清掉旧版本留下的 HTTPS / SOCKS 残留
-/// （否则它们会把流量继续送去那个端口），关闭时把三项一起清掉（用户手工设过、或用过旧版本）。
-fn write_service_manual(service: &str, enable: bool, server: &str, bypass: &str) -> Result<()> {
-    if enable {
-        let (host, port) = parse_server(server).ok_or_else(|| {
-            AppError::coded(E3003).with_detail(format!("代理地址格式不正确：{server}"))
-        })?;
-        set_proxy(service, MANUAL_PROTO, &host, port)?;
-    }
-    for p in if enable { MANUAL_CLEAR } else { MANUAL_OFF } {
-        set_proxy_state(service, *p, false)?;
+/// 顺序按 [`Proto::ALL`]（HTTP → HTTPS → SOCKS）：**先写要开的、后关不要的**。
+/// 关的动作用来做清残留（≤ 0.0.2 留下的 HTTPS / SOCKS），让正在工作的那个协议
+/// 多留在原位一瞬，比先关后写（中间有一段完全没有代理）更稳。
+fn write_service_manual(service: &str, plan: &ManualPlan, bypass: &str) -> Result<()> {
+    for (proto, target) in plan.per_proto.iter() {
+        match target {
+            // `-set*proxy` 这条命令同时会把该项打开
+            Some((host, port)) => set_proxy(service, *proto, host, *port)?,
+            None => set_proxy_state(service, *proto, false)?,
+        }
     }
     write_exceptions(service, bypass)
 }
@@ -556,7 +685,21 @@ fn snapshot_services(services: &[String]) -> Result<()> {
         services: list,
     };
     let text = serde_json::to_string_pretty(&snap)?;
-    std::fs::write(snapshot_path(), text.as_bytes())?;
+    let path = snapshot_path();
+    // 目录可能不存在：提权身份（macOS 的 root helper）与我们不共享家目录，
+    // `appdata_dir()` 指到 root 家目录下就什么也没有（以前这里直接 `?` 把裸 io::Error
+    // 抛出去，用户只看到不带路径的 E0000，完全无从排查）。写文件的事自己负责把
+    // 目录备好，出错也把路径报出来。
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            AppError::coded(E3003)
+                .with_detail(format!("创建代理还原点目录失败（{}）：{e}", parent.display()))
+        })?;
+    }
+    std::fs::write(&path, text.as_bytes()).map_err(|e| {
+        AppError::coded(E3003)
+            .with_detail(format!("写入代理还原点失败（{}）：{e}", path.display()))
+    })?;
     Ok(())
 }
 
@@ -565,7 +708,9 @@ fn take_snapshot() -> Result<Option<Vec<ServiceProxy>>> {
     if !path.exists() {
         return Ok(None);
     }
-    let text = std::fs::read_to_string(&path)?;
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        AppError::coded(E3003).with_detail(format!("读取代理还原点失败（{}）：{e}", path.display()))
+    })?;
     let snap: ServiceSnapshot = match serde_json::from_str(&text) {
         Ok(s) => s,
         Err(e) => {
@@ -597,7 +742,7 @@ fn take_snapshot() -> Result<Option<Vec<ServiceProxy>>> {
 // 校验 / 通知
 // ---------------------------------------------------------------------------
 
-/// 回读校验
+/// 回读校验（只看主服务，与 [`read`] 同一约定）
 pub fn verify(expect_enable: bool) -> Result<bool> {
     let st = read()?;
     if expect_enable {
@@ -605,6 +750,36 @@ pub fn verify(expect_enable: bool) -> Result<bool> {
     } else {
         Ok(!st.enable && !st.pac_present)
     }
+}
+
+/// 逐协议回读校验：每个协议的「开 / 关 + 落点」都要与写入计划一致。
+///
+/// 写入时落到**所有**未停用服务，回读只回一个代表（主服务）：macOS 上各服务共享同一个
+/// `scutil --proxy` 视图，逐服务比对既没意义也读不到（`networksetup` 只能逐个服务读）。
+pub fn verify_manual(p: &crate::os::ManualProxy) -> Result<bool> {
+    let st = read()?;
+    // PAC 存在时手动代理不生效（`ProxyState::is_on` 的同一约定）
+    if st.pac_present {
+        return Ok(false);
+    }
+    Ok(protocols_match(&manual_plan(p)?, &st))
+}
+
+/// 逐协议比对（纯函数，便于测试）：计划里的每个协议的开/关与落点都要与回读一致
+fn protocols_match(want: &ManualPlan, st: &ProxyState) -> bool {
+    for (proto, target) in want.per_proto.iter() {
+        match (target, proto.state_target(st)) {
+            (None, None) => {}
+            (Some((host, port)), Some(got)) => {
+                // 系统会给地址做归一化（IPv6 加方括号等），比 (host, port) 而不是比字符串
+                if parse_server(&got) != Some((host.clone(), *port)) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// macOS 无需显式通知（configd 会广播配置变更）；保持同签名以便上层一致调用
@@ -695,18 +870,172 @@ mod tests {
         assert!(!st.is_on());
     }
 
-    /// 回归（2026-10-10 用户实测）：手动代理**只许写 HTTP 一项**。
-    /// 旧版本把三项都指到同一个 host:port —— 只支持 HTTP 的代理端口会收到 SOCKS 请求，
-    /// 一开代理就断网。
+    /// 回归（2026-10-10 用户实测 → 逐协议改造）：手动代理**逐协议**写。
+    /// 只给了 HTTP 时，HTTPS / SOCKS 必须被显式关掉 —— 旧版本把三项都指到同一个
+    /// host:port，只支持 HTTP 的代理端口会收到 SOCKS 请求，一开代理就断网。
     #[test]
-    fn manual_proxy_only_writes_http() {
-        assert_eq!(MANUAL_PROTO, Proto::Web);
-        assert_eq!(MANUAL_PROTO.set_cmd(), "-setwebproxy");
-        // 启用时要顺手关掉的，正是旧版本多写的那两项
-        assert_eq!(MANUAL_CLEAR, [Proto::Secure, Proto::Socks].as_slice());
-        // 关闭时三项全关（旧版本 / 手工设置的残留也要清掉）
-        assert_eq!(MANUAL_OFF.len(), 3);
-        assert!(MANUAL_OFF.contains(&Proto::Web));
+    fn manual_plan_is_per_protocol() {
+        let only_http = crate::os::ManualProxy::http_only("127.0.0.1:7890", "localhost");
+        let plan = manual_plan(&only_http).unwrap();
+        assert_eq!(plan.enabled_count(), 1);
+        assert_eq!(plan.get(Proto::Web), Some(&("127.0.0.1".to_string(), 7890)));
+        assert_eq!(plan.get(Proto::Secure), None);
+        assert_eq!(plan.get(Proto::Socks), None);
+
+        // 三个协议各指一个端口：各自拿到自己的落点（不再合并成一个）
+        let all = crate::os::ManualProxy {
+            enable: true,
+            http: "127.0.0.1:7890".into(),
+            https: Some("127.0.0.1:7891".into()),
+            socks: Some("127.0.0.1:1080".into()),
+            bypass: "localhost".into(),
+        };
+        let plan = manual_plan(&all).unwrap();
+        assert_eq!(plan.enabled_count(), 3);
+        assert_eq!(plan.get(Proto::Secure), Some(&("127.0.0.1".to_string(), 7891)));
+        assert_eq!(plan.get(Proto::Socks), Some(&("127.0.0.1".to_string(), 1080)));
+
+        // 关闭：三个协议全关（落点不看）——旧版本 / 手工设置的残留也要清掉
+        let off = manual_plan(&crate::os::ManualProxy::off("localhost")).unwrap();
+        assert_eq!(off.enabled_count(), 0);
+        assert!(off.per_proto.iter().all(|(_, t)| t.is_none()));
+
+        // 地址不合法 → 动手写之前就报错（否则第一个服务已经改了、后面才失败）
+        assert!(manual_plan(&crate::os::ManualProxy::http_only("no-port", "")).is_err());
+        assert!(manual_plan(&crate::os::ManualProxy {
+            enable: true,
+            http: "127.0.0.1:7890".into(),
+            https: Some("127.0.0.1:not-a-port".into()),
+            socks: None,
+            bypass: String::new(),
+        })
+        .is_err());
+        // HTTP 留空 = 关闭 HTTP，只写 HTTPS（三个协议都是可选的）
+        let https_only = manual_plan(&crate::os::ManualProxy {
+            enable: true,
+            http: String::new(),
+            https: Some("127.0.0.1:7891".into()),
+            socks: None,
+            bypass: String::new(),
+        })
+        .unwrap();
+        assert_eq!(https_only.enabled_count(), 1);
+        assert_eq!(https_only.get(Proto::Web), None);
+        assert_eq!(https_only.get(Proto::Secure), Some(&("127.0.0.1".to_string(), 7891)));
+
+        // 一个都不填：开代理却什么也不写 —— 必须报错，不能静默"开"上一次空操作
+        assert!(manual_plan(&crate::os::ManualProxy {
+            enable: true,
+            http: String::new(),
+            https: None,
+            socks: None,
+            bypass: String::new(),
+        })
+        .is_err());
+    }
+
+    /// 逐协议回读比对：某个协议的开关或落点与计划不符就不能算通过；
+    /// 而且**没配的协议必须是关的**（降级成"只关 HTTP"会让残留继续生效）
+    #[test]
+    fn protocols_match_compares_each_protocol() {
+        let want = manual_plan(&crate::os::ManualProxy {
+            enable: true,
+            http: "127.0.0.1:7890".into(),
+            https: Some("127.0.0.1:7891".into()),
+            socks: None,
+            bypass: String::new(),
+        })
+        .unwrap();
+
+        let ok = ProxyState {
+            enable: true,
+            http_proxy: Some("127.0.0.1:7890".into()),
+            https_proxy: Some("127.0.0.1:7891".into()),
+            ..Default::default()
+        };
+        assert!(protocols_match(&want, &ok));
+
+        // HTTPS 落点不对 → 不通过
+        let wrong_port = ProxyState {
+            https_proxy: Some("127.0.0.1:9999".into()),
+            ..ok.clone()
+        };
+        assert!(!protocols_match(&want, &wrong_port));
+
+        // 没配的 SOCKS 却开着（旧版本残留）→ 不通过
+        let leftover_socks = ProxyState {
+            socks_proxy: Some("127.0.0.1:1080".into()),
+            ..ok.clone()
+        };
+        assert!(!protocols_match(&want, &leftover_socks));
+
+        // 该开的没开 → 不通过
+        let missing_https = ProxyState {
+            https_proxy: None,
+            ..ok
+        };
+        assert!(!protocols_match(&want, &missing_https));
+    }
+
+    /// 老快照（没有逐协议字段）只还原主落点：**不**把主落点复制给 HTTPS / SOCKS
+    /// —— 那正是 ≤ 0.0.2 三项同端口、一开就断网的形态
+    #[test]
+    fn state_to_manual_ignores_missing_protocols() {
+        let old = ProxyState {
+            enable: true,
+            server: "127.0.0.1:7890".into(),
+            bypass: "localhost".into(),
+            ..Default::default()
+        };
+        let m = state_to_manual(&old);
+        assert_eq!(m.http, "127.0.0.1:7890");
+        assert!(m.https.is_none() && m.socks.is_none());
+
+        // 新快照：逐协议原样带回
+        let new = ProxyState {
+            enable: true,
+            server: "127.0.0.1:7890".into(),
+            http_proxy: Some("127.0.0.1:7890".into()),
+            https_proxy: Some("127.0.0.1:7891".into()),
+            socks_proxy: Some("127.0.0.1:1080".into()),
+            ..Default::default()
+        };
+        let m = state_to_manual(&new);
+        assert_eq!(m.http, "127.0.0.1:7890");
+        assert_eq!(m.https.as_deref(), Some("127.0.0.1:7891"));
+        assert_eq!(m.socks.as_deref(), Some("127.0.0.1:1080"));
+
+        // HTTP 留空、SOCKS 开着的新快照：**不能**把 SOCKS 落点当成 HTTP 写回去
+        // （`server` 在那种状态下就是第一个非空落点 = SOCKS 地址）
+        let socks_only = ProxyState {
+            enable: true,
+            server: "127.0.0.1:1080".into(),
+            socks_proxy: Some("127.0.0.1:1080".into()),
+            ..Default::default()
+        };
+        let m = state_to_manual(&socks_only);
+        assert_eq!(m.http, "");
+        assert!(m.https.is_none());
+        assert_eq!(m.socks.as_deref(), Some("127.0.0.1:1080"));
+    }
+
+    /// 逐协议字段是**后加的**：旧的 `proxy_snapshot.json`（没有这三个键）必须还能读进来，
+    /// 否则升级后一次"还原代理"就会因为反序列化失败而失败
+    #[test]
+    fn proxy_state_accepts_old_snapshot_json() {
+        let text = r#"{
+            "enable": true,
+            "server": "127.0.0.1:7890",
+            "bypass": "localhost;127.0.0.1;.local",
+            "autoconfig_url": null,
+            "pac_present": false
+        }"#;
+        let st: ProxyState = serde_json::from_str(text).unwrap();
+        assert_eq!(st.server, "127.0.0.1:7890");
+        assert!(st.http_proxy.is_none() && st.https_proxy.is_none() && st.socks_proxy.is_none());
+        // None 不写回 JSON（老快照不会因为"多了几个 null"而变胖）
+        let back = serde_json::to_string(&st).unwrap();
+        assert!(!back.contains("http_proxy"));
     }
 
     /// 三个协议的命令必须各不相同：否则"只关 HTTPS"会误伤别的协议

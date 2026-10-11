@@ -92,7 +92,9 @@ pub async fn profile_delete(
 static NO_PASSWORD_HINTED: AtomicBool = AtomicBool::new(false);
 
 /// 免密提示：这次操作**确实弹了系统授权框 / UAC**（报告里的 `prompted` 由提权层标记），
-/// 而免密通道还没装（或装了没跑起来）→ 提示一次，并给一个「去设置」的入口。
+/// 而免密通道还没生效 → 提示一次，并按通道健康度给直达动作：
+///   - 未安装 → 「安装免密助手」直接安装（一次授权，之后不再输密码）；
+///   - 装了但守护进程没跑（BTM 拦截常见）→ 引导去系统设置放行，并附重装按钮。
 ///
 /// 为什么不是每次切换都提示：那是骚扰。每个会话只在第一次真的让用户输了密码之后提示。
 /// 是否提示、提示什么由后端按平台决定（见 `elevation_task::no_password_hint`），
@@ -107,13 +109,34 @@ fn hint_no_password(app: &AppHandle, report: &ApplyReport) {
     let Some(body) = crate::elevation_task::no_password_hint() else {
         return;
     };
+    // 动作由通道健康度决定（macOS：missing=装一次；stalled=重装 + 系统设置放行；
+    // Windows 本就不产生提示，走不到这里）
+    let actions = match crate::elevation_task::health() {
+        "missing" => vec![
+            crate::notify::action_arg(
+                &format!("安装{}", crate::elevation_task::noun()),
+                "silent:install",
+                serde_json::json!("missing"),
+            ),
+            crate::notify::action("去设置", "open:settings"),
+        ],
+        "stalled" => vec![
+            crate::notify::action_arg(
+                &format!("重新安装{}", crate::elevation_task::noun()),
+                "silent:install",
+                serde_json::json!("stalled"),
+            ),
+            crate::notify::action("去设置", "open:settings"),
+        ],
+        _ => vec![crate::notify::action("去设置", "open:settings")],
+    };
     crate::notify::send(
         app,
-        crate::notify::Level::Info, // Info：不置托盘警告，只在窗口里提示
+        crate::notify::Level::Warn, // Warn：置托盘「⚠ 」未读前缀，窗口隐藏也能被看到
         "以后切换可以不用输密码",
         &body,
-        vec![crate::notify::action("去设置", "open:settings")],
-        false,
+        actions,
+        true, // sticky：这是低频高价值的引导，别让它 12 秒后自己消失
     );
 }
 

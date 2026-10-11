@@ -33,6 +33,7 @@ export async function renderProfiles(root: HTMLElement, ctx: TabCtx): Promise<vo
     s.profiles.find((p) => p.id === s.active_profile_id) ??
     s.profiles.find((p) => p.is_builtin);
 
+  // pi-lens-ignore: no-inner-html-js -- 动态内容均经 esc/ui.esc 转义后拼接（项目统一模板写法）
   root.innerHTML = `
     <div class="card">
       <div class="row-between">
@@ -158,6 +159,7 @@ export async function renderProfiles(root: HTMLElement, ctx: TabCtx): Promise<vo
               }${p.dns.enable_v6 ? "+v6" : ""}`
         }（${p.dns.interface_alias || "未选网卡"}）`
       : "DNS 不管理";
+  // pi-lens-ignore: no-inner-html-js -- 动态内容均经 esc/ui.esc 转义后拼接（项目统一模板写法）
     card.innerHTML = `
       <div class="row-between">
         <div>
@@ -258,20 +260,31 @@ export async function renderProfiles(root: HTMLElement, ctx: TabCtx): Promise<vo
   root.querySelector("#pf-proxy-switch")?.addEventListener("change", async (e) => {
     const box = e.target as HTMLInputElement;
     const wantOn = box.checked;
-    if (wantOn && (!active || !active.proxy_host.trim() || !active.proxy_port)) {
+    // 三个协议任一配好就能开（macOS 可以只配 HTTPS / SOCKS；Windows 只有 HTTP 这一项）
+    const anyEp = active
+      ? (active.proxy_host.trim() !== "" && active.proxy_port > 0) ||
+        (active.proxy_https_host.trim() !== "" && active.proxy_https_port > 0) ||
+        (active.proxy_socks_host.trim() !== "" && active.proxy_socks_port > 0)
+      : false;
+    if (wantOn && !anyEp) {
       box.checked = false;
-      ui.toast("warn", "当前方案里没有代理地址", "请到「代理」页填写地址与端口后保存方案");
+      ui.toast("warn", "当前方案里没有代理地址", "请到「代理」页至少填一个协议的地址与端口后保存方案");
       ctx.navigate("proxy");
       return;
     }
     const ok = await ui.elevationNotice(os.PROXY_SWITCH_NOTICE, os.PROXY_NEEDS_ADMIN);
     if (!ok) return;
+    // 逐协议落点：只有 macOS 会让用户填 HTTPS / SOCKS，Windows 侧这两个字段恒为空
+    const ep = (host: string, port: number) =>
+      host.trim() && port > 0 ? { host: host.trim(), port } : undefined;
     try {
       const r = await api.proxySet(
         {
           enable: wantOn,
           host: active?.proxy_host ?? "",
           port: active?.proxy_port ?? 0,
+          https: ep(active?.proxy_https_host ?? "", active?.proxy_https_port ?? 0),
+          socks: ep(active?.proxy_socks_host ?? "", active?.proxy_socks_port ?? 0),
           bypass: active?.proxy_bypass ?? "",
           force: false,
         },
@@ -279,6 +292,7 @@ export async function renderProfiles(root: HTMLElement, ctx: TabCtx): Promise<vo
       );
       if (!r.ok) {
         box.checked = !wantOn;
+  // pi-lens-ignore: no-inner-html-js -- 动态内容均经 esc/ui.esc 转义后拼接（项目统一模板写法）
         heroMsg.innerHTML = `<div class="error-text">${ui.esc(r.message)}</div>${
           ui.stepsHtml(r.steps) as string
         }`;
@@ -301,6 +315,7 @@ export async function renderProfiles(root: HTMLElement, ctx: TabCtx): Promise<vo
   (root.querySelector("#sn-empty") as HTMLElement).hidden = snapshots.length > 0;
   for (const s of snapshots) {
     const tr = document.createElement("tr");
+  // pi-lens-ignore: no-inner-html-js -- 动态内容均经 esc/ui.esc 转义后拼接（项目统一模板写法）
     tr.innerHTML = `
       <td class="mono" style="font-size:12px">${ui.esc(ui.fmtTime(s.created_at))}</td>
       <td>${ui.esc(s.reason)}${s.restored ? ` <span class="pill">已还原过</span>` : ""}</td>
@@ -315,6 +330,7 @@ export async function renderProfiles(root: HTMLElement, ctx: TabCtx): Promise<vo
       try {
         const d = await api.snapshotsDiff(s.id);
         const box = root.querySelector("#sn-diff") as HTMLElement;
+  // pi-lens-ignore: no-inner-html-js -- 动态内容均经 esc/ui.esc 转义后拼接（项目统一模板写法）
         box.innerHTML = d.identical
           ? `<div class="card"><h2>差异（${ui.esc(ui.fmtTime(d.created_at))}）</h2><div class="ok-text">当前系统状态与该快照一致，无需还原。</div></div>`
           : `<div class="card"><h2>差异（${ui.esc(ui.fmtTime(d.created_at))}）</h2>
@@ -397,7 +413,17 @@ async function profileEditor(
       is_builtin: false,
       note: "",
       hosts: { enabled: true, entry_ids: [], source_ids: [] },
-      proxy: { enabled: false, host: "127.0.0.1", port: 7890, bypass: "localhost;127.*;<local>" },
+      proxy: {
+        enabled: false,
+        host: "127.0.0.1",
+        port: 7890,
+        bypass: "localhost;127.*;<local>",
+        // 逐协议代理（macOS）：默认留空 = 不开启这两个协议，与 ≤ 0.0.2 只写 HTTP 一致
+        https_host: "",
+        https_port: 0,
+        socks_host: "",
+        socks_port: 0,
+      },
       dns: {
         enabled: false,
         mode: "dhcp",
@@ -412,6 +438,7 @@ async function profileEditor(
     };
 
   const { box, close } = ui.openModal(p ? `编辑方案：${p.name}` : "新建方案");
+  // pi-lens-ignore: no-inner-html-js -- 动态内容均经 esc/ui.esc 转义后拼接（项目统一模板写法）
   box.innerHTML += `
     <div class="field-grid">
       <span>名称</span><input type="text" id="pe-name" value="${ui.esc(draft.name)}" />
@@ -440,10 +467,21 @@ async function profileEditor(
       } /> 切换时开启系统代理</label>
     </div>
     <div class="field-grid">
-      <span>地址</span><input type="text" id="pe-proxy-host" value="${ui.esc(draft.proxy.host)}" />
-      <span>端口</span><input type="number" id="pe-proxy-port" value="${draft.proxy.port}" min="1" max="65535" style="width:120px" />
+      <span>HTTP 代理</span><input type="text" id="pe-proxy-host" value="${ui.esc(draft.proxy.host)}" />
+      <span>HTTP 端口</span><input type="number" id="pe-proxy-port" value="${draft.proxy.port}" min="1" max="65535" style="width:120px" />
       <span>绕过列表</span><input type="text" id="pe-proxy-bypass" value="${ui.esc(draft.proxy.bypass)}" />
     </div>
+    ${
+      os.IS_MACOS
+        ? `<div class="field-grid" style="margin-top:8px">
+      <span>HTTPS 代理</span><input type="text" id="pe-proxy-https-host" value="${ui.esc(draft.proxy.https_host)}" placeholder="留空 = 不启用" />
+      <span>HTTPS 端口</span><input type="number" id="pe-proxy-https-port" value="${draft.proxy.https_port || ""}" min="1" max="65535" style="width:120px" placeholder="端口" />
+      <span>SOCKS 代理</span><input type="text" id="pe-proxy-socks-host" value="${ui.esc(draft.proxy.socks_host)}" placeholder="留空 = 不启用" />
+      <span>SOCKS 端口</span><input type="number" id="pe-proxy-socks-port" value="${draft.proxy.socks_port || ""}" min="1" max="65535" style="width:120px" placeholder="端口" />
+    </div>
+    <p class="hint" style="margin-top:6px">${os.PROXY_PROFILE_HINT}</p>`
+        : ""
+    }
 
     <div class="section-title">系统 DNS</div>
     <div class="actions">
@@ -502,19 +540,37 @@ async function profileEditor(
   `;
 
   const q = <T extends HTMLElement>(sel: string) => box.querySelector(sel) as T;
+  // 可选字段读取器：非 macOS 平台不渲染 HTTPS/SOCKS 输入框，取不到元素时回落到 draft 原值。
+  const optVal = (sel: string) => (box.querySelector(sel) as HTMLInputElement | null)?.value.trim() ?? null;
+  const optNum = (sel: string) => {
+    const el = box.querySelector(sel) as HTMLInputElement | null;
+    return el && el.value.trim() ? Number(el.value) : null;
+  };
   const selectedHosts = new Set(draft.hosts.entry_ids);
   const selectedSources = new Set(draft.hosts.source_ids);
 
   const body = q<HTMLElement>("#pe-hosts-body");
   for (const e of hosts.entries) {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td style="width:32px"><input type="checkbox" ${
-      selectedHosts.has(e.id) ? "checked" : ""
-    } /></td><td class="mono" style="width:170px">${ui.esc(e.ip)}</td><td class="mono">${ui.esc(
-      e.hostname,
-    )}</td><td class="faint">${ui.esc(e.comment)}</td>`;
-    (tr.querySelector("input") as HTMLInputElement).addEventListener("change", (ev) => {
-      if ((ev.target as HTMLInputElement).checked) selectedHosts.add(e.id);
+    const tdCheck = document.createElement("td");
+    tdCheck.style.width = "32px";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = selectedHosts.has(e.id);
+    tdCheck.appendChild(cb);
+    const tdIp = document.createElement("td");
+    tdIp.className = "mono";
+    tdIp.style.width = "170px";
+    tdIp.textContent = e.ip;
+    const tdHost = document.createElement("td");
+    tdHost.className = "mono";
+    tdHost.textContent = e.hostname;
+    const tdComment = document.createElement("td");
+    tdComment.className = "faint";
+    tdComment.textContent = e.comment;
+    tr.append(tdCheck, tdIp, tdHost, tdComment);
+    cb.addEventListener("change", () => {
+      if (cb.checked) selectedHosts.add(e.id);
       else selectedHosts.delete(e.id);
     });
     body.appendChild(tr);
@@ -536,11 +592,17 @@ async function profileEditor(
   for (const s of sources) {
     const label = document.createElement("label");
     label.className = "row";
-    label.innerHTML = `<input type="checkbox" ${
-      selectedSources.has(s.id) ? "checked" : ""
-    } /> <span>${ui.esc(s.name)}</span> <span class="faint">（间隔 ${s.interval_hours}h）</span>`;
-    (label.querySelector("input") as HTMLInputElement).addEventListener("change", (ev) => {
-      if ((ev.target as HTMLInputElement).checked) selectedSources.add(s.id);
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = selectedSources.has(s.id);
+    const nameSpan = document.createElement("span");
+    nameSpan.textContent = s.name;
+    const metaSpan = document.createElement("span");
+    metaSpan.className = "faint";
+    metaSpan.textContent = `（间隔 ${s.interval_hours}h）`;
+    label.append(cb, " ", nameSpan, " ", metaSpan);
+    cb.addEventListener("change", () => {
+      if (cb.checked) selectedSources.add(s.id);
       else selectedSources.delete(s.id);
     });
     srcBox.appendChild(label);
@@ -579,6 +641,11 @@ async function profileEditor(
         host: q<HTMLInputElement>("#pe-proxy-host").value.trim(),
         port: Number(q<HTMLInputElement>("#pe-proxy-port").value || 0),
         bypass: q<HTMLInputElement>("#pe-proxy-bypass").value.trim(),
+        // 逐协议字段只在 macOS 的编辑器里存在；Windows 保留原值（不显示 = 不改动）
+        https_host: optVal("#pe-proxy-https-host") ?? draft.proxy.https_host,
+        https_port: optNum("#pe-proxy-https-port") ?? draft.proxy.https_port,
+        socks_host: optVal("#pe-proxy-socks-host") ?? draft.proxy.socks_host,
+        socks_port: optNum("#pe-proxy-socks-port") ?? draft.proxy.socks_port,
       },
       dns: {
         enabled: q<HTMLInputElement>("#pe-dns-en").checked,

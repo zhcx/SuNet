@@ -32,3 +32,121 @@ pub use macos::{dns_client, fs_security, hosts_io, privilege, system_proxy};
 
 pub mod dns_presets;
 pub mod hosts_file;
+
+use serde::{Deserialize, Serialize};
+
+/// 手动代理的**逐协议**写入内容（跨平台同形，具体语义由各平台的 `system_proxy` 解释）。
+///
+/// macOS 把 HTTP / HTTPS / SOCKS 当作三个**互相独立**的开关，每个协议各有自己的
+/// 落点，所以这里逐协议给值：`None`（或空串）表示**显式关闭该协议**——不是"保持原样"，
+/// 用户把 HTTPS 那一行的地址清空就是要关掉它。
+///
+/// Windows 的 WinINET 只有一个 `ProxyServer` 值（支持 `http=` / `https=` / `socks=`
+/// 分段语法，但本工具维持单一落点写 `http`），因此 Windows 只读 [`ManualProxy::http`]，
+/// 另外两项忽略——「HTTP 代理与 HTTPS 代理分开配」这件事只有 macOS 需要。
+///
+/// `enable = false` 时三个落点全部忽略：语义是"关掉所有协议"，
+/// **必须把三项残留一起清掉**（0.0.2 及更早的 macOS 版本会把 HTTPS / SOCKS
+/// 也指到同一个端口，只关 HTTP 会留下半开的代理）。
+///
+/// 序列化时字段名与提权载荷一致（`server` 而不是 `http`）：载荷 `{enable, server, https,
+/// socks, bypass}` 从 0.0.2 起就是这个形状，`server` 这个键名不能再动——
+/// 常驻 helper 是**安装那一刻**的可执行文件拷贝，没有版本握手，
+/// 改名会让旧 helper 收到空地址（见 `crate::helper`）。
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ManualProxy {
+    /// 总开关；false = 关闭全部协议（三协议的落点都不看）
+    pub enable: bool,
+    /// HTTP 落点 `host:port`（macOS 的必填主落点；提权载荷里叫 `server`）
+    #[serde(rename = "server")]
+    pub http: String,
+    /// HTTPS 落点 `host:port`；`None` = 关闭该协议
+    #[serde(default)]
+    pub https: Option<String>,
+    /// SOCKS 落点 `host:port`；`None` = 关闭该协议
+    #[serde(default)]
+    pub socks: Option<String>,
+    /// 绕过列表（`;` 分隔，各平台自己翻译成系统格式）
+    pub bypass: String,
+}
+
+impl ManualProxy {
+    /// 关闭全部协议（清残留用）
+    pub fn off(bypass: &str) -> Self {
+        Self {
+            enable: false,
+            http: String::new(),
+            https: None,
+            socks: None,
+            bypass: bypass.to_string(),
+        }
+    }
+
+    /// 只有 HTTP 一个落点（Windows 的唯一形态；macOS 的「只写 HTTP」也走它）
+    ///
+    /// 仅测试构造用：生产路径由 `apply.rs` 的 `prepare_proxy` 逐项拼装载荷，
+    /// 没有"只可能是 HTTP"的调用点，标 `cfg(test)` 免得在 release 里变成死代码。
+    #[cfg(test)]
+    pub fn http_only(server: &str, bypass: &str) -> Self {
+        Self {
+            enable: true,
+            http: server.to_string(),
+            https: None,
+            socks: None,
+            bypass: bypass.to_string(),
+        }
+    }
+
+    /// 启用的协议个数（回读/展示用；Windows 恒为 0 或 1）
+    ///
+    /// 同 [`Self::http_only`]：只在单测里用来断言载荷形状。
+    #[cfg(test)]
+    pub fn enabled_protocols(&self) -> usize {
+        if !self.enable {
+            return 0;
+        }
+        let mut n = usize::from(!self.http.trim().is_empty());
+        n += usize::from(self.https.as_deref().is_some_and(|s| !s.trim().is_empty()));
+        n += usize::from(self.socks.as_deref().is_some_and(|s| !s.trim().is_empty()));
+        n
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_proxy_serde_uses_server_key() {
+        // 提权载荷的键名是跨版本契约（常驻 helper 可能是旧版本），改名即破坏兼容
+        let v = serde_json::to_value(ManualProxy::http_only("127.0.0.1:7890", "localhost")).unwrap();
+        assert_eq!(v["server"], "127.0.0.1:7890");
+        assert!(v["https"].is_null());
+        assert!(v["socks"].is_null());
+        assert_eq!(v["enable"], true);
+
+        // 旧版 GUI 只发 {enable, server, bypass}，也必须能解析
+        let old: ManualProxy = serde_json::from_value(serde_json::json!({
+            "enable": true,
+            "server": "127.0.0.1:7890",
+            "bypass": "localhost"
+        }))
+        .unwrap();
+        assert_eq!(old.http, "127.0.0.1:7890");
+        assert!(old.https.is_none() && old.socks.is_none());
+        assert_eq!(old.enabled_protocols(), 1);
+    }
+
+    #[test]
+    fn enabled_protocols_counts_all_three() {
+        let p = ManualProxy {
+            enable: true,
+            http: "127.0.0.1:7890".into(),
+            https: Some("127.0.0.1:7891".into()),
+            socks: Some("127.0.0.1:7892".into()),
+            bypass: String::new(),
+        };
+        assert_eq!(p.enabled_protocols(), 3);
+        assert_eq!(ManualProxy::off("x").enabled_protocols(), 0);
+    }
+}

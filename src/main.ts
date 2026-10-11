@@ -334,15 +334,22 @@ async function boot(): Promise<void> {
   h("btn-settings").addEventListener("click", () => openSettingsModal());
   h("btn-global-restore").addEventListener("click", () => void globalRestore());
 
-  await listen<{ level: string; title: string; body: string; actions: { label: string; action: string }[] }>(
+  await listen<{ level: string; title: string; body: string; sticky?: boolean; actions: { label: string; action: string; args?: unknown }[] }>(
     "sunet://notify",
     (ev) => {
       const p = ev.payload;
       const actions = (p.actions ?? []).map((a) => ({
         label: a.label,
-        run: () => runNotifyAction(a.action),
+        run: () => runNotifyAction(a.action, a.args),
       }));
-      ui.toast((p.level as "info" | "warn" | "error") ?? "info", p.title, p.body, actions);
+      // sticky（如免密助手引导）不该几秒就消失：拉长停留，用户处理或手动关掉
+      ui.toast(
+        (p.level as "info" | "warn" | "error") ?? "info",
+        p.title,
+        p.body,
+        actions,
+        p.sticky ? 30000 : 0,
+      );
     },
   );
   await listen<import("./api").ApplyReport>("sunet://report", () => {
@@ -421,12 +428,17 @@ async function globalRestore(): Promise<void> {
   }
 }
 
-function runNotifyAction(action: string): void {
+function runNotifyAction(action: string, args?: unknown): void {
   const [cmd, arg] = action.split(":");
   switch (cmd) {
     case "open":
       if (arg === "settings") openSettingsModal();
       else void navigate(arg);
+      break;
+    case "silent":
+      // 免密提示横幅里的直达安装（后端附带的 args = 触发时的通道健康度，
+      // missing → 首装文案；stalled → 重装，装完未跑再引导去系统设置放行）
+      if (arg === "install") void installSilentFromNotify(args === "stalled");
       break;
     case "proxy":
       if (arg === "undo_clear") {
@@ -446,6 +458,29 @@ function runNotifyAction(action: string): void {
       break;
     default:
       void navigate("profiles");
+  }
+}
+
+/** 免密提示横幅的直达安装：不复用设置弹层，装完就地反馈结果 */
+async function installSilentFromNotify(reinstall: boolean): Promise<void> {
+  const toast = ui.toast("info", reinstall ? "正在重新安装免密提权助手…" : "正在安装免密提权助手…", "macOS 可能弹出一次系统授权框，请输入密码确认");
+  try {
+    const v = reinstall
+      ? await api.silentElevationUninstall().then(() => api.silentElevationInstall())
+      : await api.silentElevationInstall();
+    if (v.installed && !v.running) {
+      ui.toast(
+        "warn",
+        "助手已安装但未运行",
+        "可能被系统拦在后台：请在「系统设置 → 通用 → 登录项与扩展」中允许，稍后重试切换。",
+      );
+    } else {
+      ui.toast("info", "免密提权助手已就绪", "之后切换方案不再需要输密码");
+    }
+  } catch (e) {
+    ui.toast("error", "安装失败", errText(e));
+  } finally {
+    void toast;
   }
 }
 

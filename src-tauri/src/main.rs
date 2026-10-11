@@ -283,23 +283,31 @@ fn run_gui() {
             {
                 let h = handle.clone();
                 std::thread::spawn(move || {
+                    // 主题跟随只有 Windows 需要：macOS 的菜单栏图标是模板图，系统按
+                    // 明暗自己上色。旧代码在 macOS 上每 5 秒 fork 一次 `defaults`
+                    // 读 AppleInterfaceStyle，纯属空转（探针还只认 `defaults` 一套外观，
+                    // 深浅混搭的菜单栏必然猜错），整段省掉。
+                    #[cfg(target_os = "windows")]
                     let mut last_light = tray::taskbar_is_light();
+                    #[cfg(target_os = "windows")]
                     let mut ticks: u64 = 0;
                     loop {
                         std::thread::sleep(std::time::Duration::from_secs(1));
                         if let Some(s) = h.try_state::<state::SharedState>() {
                             apply::expire_clear_undo(&s);
                         }
-                        // 主题检查放慢到 5 秒：macOS 的 taskbar_is_light() 每次都会 fork
-                        // 一个 `defaults` 子进程，每秒一次纯属空转；Windows 的注册表读
-                        // 同样没必要每秒一次。用户切深浅色后最多晚 5 秒跟随。
-                        ticks += 1;
-                        if ticks % 5 == 0 {
-                            let now_light = tray::taskbar_is_light();
-                            if now_light != last_light {
-                                last_light = now_light;
-                                tray::refresh_icon_theme(&h);
-                                tray::refresh(&h);
+                        // 主题检查放慢到 5 秒：注册表读没必要每秒一次，
+                        // 用户切深浅色后最多晚 5 秒跟随。
+                        #[cfg(target_os = "windows")]
+                        {
+                            ticks += 1;
+                            if ticks % 5 == 0 {
+                                let now_light = tray::taskbar_is_light();
+                                if now_light != last_light {
+                                    last_light = now_light;
+                                    tray::refresh_icon_theme(&h);
+                                    tray::refresh(&h);
+                                }
                             }
                         }
                         if h.get_webview_window("main").is_none() {

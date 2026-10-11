@@ -63,14 +63,36 @@ pub fn read() -> Result<ProxyState> {
 }
 
 /// 只写入手动代理三件套（不动 AutoConfigURL）
-pub fn write_manual(enable: bool, server: &str, bypass: &str) -> Result<()> {
+///
+/// WinINET 只有一个 `ProxyServer` 值，所以逐协议结构在这里塌缩成一项：
+/// 写的是 [`ManualProxy::http`]，`https` / `socks` 被忽略——
+/// 「HTTP 代理与 HTTPS 代理分开配」是 macOS 网络服务的概念，
+/// WinINET 做不到（`http=…;https=…` 语法只是给同一个值分段，
+/// 本工具从 0.0.1 起就写单一落点，改掉会动到系统代理的既有行为）。
+/// 界面在 Windows 上只显示一行地址，所以这里收到的 https / socks 一定是空的，
+/// 忽略它们对用户不可见。
+pub fn write_manual(p: &crate::os::ManualProxy) -> Result<()> {
+    if !p.enable {
+        // 关闭时不看落点：清掉已有的 proxy 字符串（与 macOS 的「三项全关」对齐）
+        let key = open(false)?;
+        key.set_value("ProxyEnable", &0u32)
+            .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyEnable 失败：{e}")))?;
+        key.set_value("ProxyServer", &String::new())
+            .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyServer 失败：{e}")))?;
+        if !p.bypass.trim().is_empty() {
+            key.set_value("ProxyOverride", &p.bypass)
+                .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyOverride 失败：{e}")))?;
+        }
+        return Ok(());
+    }
+
     let key = open(false)?;
-    key.set_value("ProxyEnable", &if enable { 1u32 } else { 0u32 })
+    key.set_value("ProxyEnable", &1u32)
         .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyEnable 失败：{e}")))?;
-    key.set_value("ProxyServer", &server.to_string())
+    key.set_value("ProxyServer", &p.http)
         .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyServer 失败：{e}")))?;
-    if !bypass.trim().is_empty() {
-        key.set_value("ProxyOverride", &bypass.to_string())
+    if !p.bypass.trim().is_empty() {
+        key.set_value("ProxyOverride", &p.bypass)
             .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyOverride 失败：{e}")))?;
     }
     Ok(())
@@ -123,6 +145,19 @@ pub fn verify(expect_enable: bool) -> Result<bool> {
     } else {
         Ok(!st.enable && !st.pac_present)
     }
+}
+
+/// 逐协议回读校验。
+///
+/// Windows 只有一个 `ProxyServer` 值（所有协议共用），不存在"逐协议"这回事：
+/// 打开时看 [`ManualProxy::http`] 写进去的非空且已生效，关闭时看开关确实落了 0。
+/// 存在的意义只是与 macOS 保持同名同签名（上层的代理层收尾是平台无关的）。
+pub fn verify_manual(want: &crate::os::ManualProxy) -> Result<bool> {
+    let st = read()?;
+    if !want.enable {
+        return Ok(!st.enable && !st.pac_present);
+    }
+    Ok(st.enable && !st.pac_present && !st.server.trim().is_empty())
 }
 
 /// 通知系统配置已变更（§3.2）；失败只记 warning，不中断事务

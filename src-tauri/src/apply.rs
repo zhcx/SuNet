@@ -17,10 +17,11 @@ use crate::ipc::ApplyStep;
 use crate::os::dns_client::DnsFamilyState;
 use crate::os::hosts_file::HostsEntry;
 use crate::os::system_proxy::{self, ProxyState};
+use crate::os::ManualProxy;
 use crate::paths;
 use crate::probe;
 use crate::state::AppState;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::Duration;
 
@@ -41,6 +42,26 @@ pub struct ApplyReport {
     pub prompted: bool,
 }
 
+/// 一个代理落点（逐协议代理用）。
+///
+/// 主落点（HTTP）用的是 [`ProxyTarget::host`] / [`ProxyTarget::port`] 两个平铺字段
+/// —— 它们从 0.0.1 就是这个形状，界面、托盘、快捷面板都依赖它；
+/// HTTPS / SOCKS 是 0.0.3 加的逐协议落点，`None` = **关闭该协议**（不是"保持不变"）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyEndpoint {
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub port: u16,
+}
+
+impl ProxyEndpoint {
+    /// 写入载荷里的 `host:port` 形式
+    fn to_server(&self) -> String {
+        format!("{}:{}", self.host.trim(), self.port)
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct ProxyTarget {
     pub enable: bool,
@@ -49,6 +70,11 @@ pub struct ProxyTarget {
     pub bypass: String,
     /// 开启前是否做 TCP 连通性自检（§3.4 硬性需求）
     pub probe: bool,
+    /// HTTPS 代理落点（`None` = 关闭该协议）。只有 macOS 有"逐协议"这个概念，
+    /// Windows 的 WinINET 只有一个 `ProxyServer`，那里恒为 None
+    pub https: Option<ProxyEndpoint>,
+    /// SOCKS 代理落点（`None` = 关闭该协议）
+    pub socks: Option<ProxyEndpoint>,
 }
 
 /// DNS 目标：None = 该族不改动；Some(空) = 该族还原为自动获取
@@ -112,6 +138,9 @@ pub fn build_targets(cfg: &Config, p: &Profile) -> ApplyTargets {
             p.proxy.bypass.clone()
         },
         probe: cfg.settings.proxy_probe_before_enable,
+        // 方案里的逐协议落点：没填 = 关闭该协议（界面上的留空就是这个意思）
+        https: p.proxy.https_endpoint(),
+        socks: p.proxy.socks_endpoint(),
     });
     let dns = if p.dns.enabled {
         // 取消勾选 = 该族还原为自动获取（§4.3 规则 2：不留隐性残留）
@@ -153,7 +182,7 @@ fn prune_satisfied(targets: &ApplyTargets) -> ApplyTargets {
     let mut out = targets.clone();
 
     // hosts：目标是「清空托管区块」且当前本来就没有区块 → 无事可做
-    if out.hosts.as_ref().map_or(false, |e| e.is_empty()) {
+    if out.hosts.as_ref().is_some_and(|e| e.is_empty()) {
         if let Ok(st) = crate::os::hosts_file::stats() {
             if !st.block_present && st.enabled_entries == 0 {
                 out.hosts = None;
@@ -308,7 +337,7 @@ pub fn apply(state: &AppState, targets: &ApplyTargets, reason: &str) -> Result<A
 
     // 代理写入落在哪里：macOS 需要 root → 并入下面的提权批处理（一次切换只弹一次授权框）；
     // Windows 不需要 → 本进程直接写，行为与从前完全一致（不弹 UAC）。
-    let proxy_needs_root = proxy_plan.as_ref().map_or(false, |p| p.write.needs_root());
+    let proxy_needs_root = proxy_plan.as_ref().is_some_and(|p| p.write.needs_root());
     if failure.is_none() && !proxy_needs_root {
         if let Some(p) = proxy_plan.as_ref() {
             match p.write.write_here() {
@@ -496,12 +525,8 @@ fn valid_proxy_host(host: &str) -> bool {
 
 /// 代理写入内容（父进程侧已完成校验、前置探测与快照落盘）
 enum ProxyWrite {
-    /// 写入手动代理（`enable=false` 即关闭手动代理）
-    Manual {
-        enable: bool,
-        server: String,
-        bypass: String,
-    },
+    /// 写入手动代理（逐协议；`enable=false` 即关闭全部协议）
+    Manual(ManualProxy),
     /// 按接管前的快照原样还原（含 PAC）
     Restore(ProxyState),
 }
@@ -514,6 +539,12 @@ enum ProxyReport {
         bypass: String,
         /// 开启前是否做了 TCP 连通性自检（§3.4）
         probe: bool,
+        /// 主落点所属协议（`None` = HTTP，文案保持历史口径）。
+        /// HTTP 留空时主落点可能是 HTTPS / SOCKS —— 那时必须报出协议名，否则
+        /// 「已启用系统代理 ***:7891」会让人以为 HTTP 在生效
+        label: Option<&'static str>,
+        /// 其它一起打开的协议（已转成 "HTTPS ***:7891" 这样的展示文案；空串 = 没有别的）
+        extra_protocols: String,
     },
     /// 没有快照可还原：直接关掉手动开关
     Disabled { pac_present: bool },
@@ -538,25 +569,29 @@ impl ProxyWrite {
     /// 「系统配置变更通知是否成功」（E3004 降级用）。
     fn write_here(&self) -> Result<bool> {
         match self {
-            ProxyWrite::Manual {
-                enable,
-                server,
-                bypass,
-            } => crate::proxy_ops::write_manual(*enable, server, bypass),
+            ProxyWrite::Manual(p) => crate::proxy_ops::write_manual(p),
             ProxyWrite::Restore(state) => crate::proxy_ops::restore(state),
+        }
+    }
+
+    /// 回读校验（逐协议：写下去的每个协议都要对得上，没写的协议必须是关的）
+    fn verify(&self) -> Result<bool> {
+        match self {
+            ProxyWrite::Manual(p) => system_proxy::verify_manual(p),
+            // 还原的期望就是快照里那个总开关（逐协议的部分由还原点逐服务回填，
+            // 这里只能看主服务的总开关 —— 与 `verify` 的固有粒度一致）
+            ProxyWrite::Restore(state) => system_proxy::verify(state.enable),
         }
     }
 
     /// 提权批处理里的子任务载荷（任务名必须落在 `task_runner` 的白名单里）
     fn op(&self) -> serde_json::Value {
         match self {
-            ProxyWrite::Manual {
-                enable,
-                server,
-                bypass,
-            } => json!({
+            // 载荷形状就是 ManualProxy 的序列化结果（enable / server / https / socks / bypass）：
+            // `server` 是 HTTP 落点的历史键名，必须保持 —— 常驻 helper 可能是旧版本
+            ProxyWrite::Manual(p) => json!({
                 "task": crate::proxy_ops::TASK_WRITE,
-                "data": { "enable": enable, "server": server, "bypass": bypass },
+                "data": p,
             }),
             ProxyWrite::Restore(state) => json!({
                 "task": crate::proxy_ops::TASK_RESTORE,
@@ -566,40 +601,144 @@ impl ProxyWrite {
     }
 }
 
+/// 逐协议落点归一化：三个协议**都是可选的**，留空 = 关闭该协议。
+///
+/// · 地址与端口都没填 → `None`（这个协议不参与这次写入，会被显式关掉）
+/// · 只填一半 → 报错（"这个协议到底开不开"必须只有一个答案）
+fn resolve_endpoint(label: Option<&str>, host: &str, port: u16) -> Result<Option<ProxyEndpoint>> {
+    let host = host.trim();
+    if host.is_empty() && port == 0 {
+        return Ok(None);
+    }
+    if host.is_empty() || port == 0 {
+        let what = match label {
+            Some(l) => format!("{l} 代理"),
+            None => "代理".to_string(),
+        };
+        return Err(
+            AppError::coded(E4002)
+                .with_detail(format!("{what}的地址与端口要成对填写（整套留空表示关闭该协议）")),
+        );
+    }
+    Ok(Some(ProxyEndpoint {
+        host: host.to_string(),
+        port,
+    }))
+}
+
+/// 代理落点校验：地址 / 端口不合法要在**探测和写入之前**就报错。
+/// （"没填"已经在 [`resolve_endpoint`] 里分流掉了，这里只管"填了但是错的"）
+fn validate_endpoint(label: Option<&str>, e: &ProxyEndpoint) -> Result<()> {
+    let host = e.host.trim();
+    let what = match label {
+        Some(l) => format!("{l} 代理"),
+        None => "代理".to_string(),
+    };
+    if e.port == 0 || host.is_empty() {
+        return Err(AppError::coded(E4002).with_detail(format!("{what}地址与端口不完整")));
+    }
+    if !valid_proxy_host(host) {
+        return Err(AppError::coded(E4002).with_detail(format!("{what}地址非法：{host}")));
+    }
+    Ok(())
+}
+
+/// 前置连通性自检：没有这一条，这个功能会造成全网中断（§3.4）
+fn probe_endpoint(label: Option<&str>, e: &ProxyEndpoint) -> Result<()> {
+    let host = e.host.trim();
+    if probe::probe_proxy(host, e.port) {
+        return Ok(());
+    }
+    // 主落点（HTTP）的文案与从前逐字一致：设计方案 §3.4 与界面提示都引用了它
+    let what = match label {
+        Some(l) => format!("（{l} 代理）"),
+        None => String::new(),
+    };
+    Err(AppError::coded(E3001).with_detail(format!(
+        "无法连接到 {host}:{}{what}，开启后所有应用将无法联网。请先启动代理软件，或检查端口。",
+        e.port
+    )))
+}
+
 /// 代理层的父进程侧准备：校验 → 前置连通性自检 → 接管前快照。
 ///
 /// 这一步**不碰系统代理配置**（写的部分见 [`ProxyWrite`]），所以授权框要等到
 /// 确定真要写的时候才弹。
 fn prepare_proxy(t: &ProxyTarget) -> Result<ProxyPlan> {
     if t.enable {
-        let host = t.host.trim().to_string();
-        if host.is_empty() || t.port == 0 {
-            return Err(AppError::coded(E4002)
-                .with_detail("请填写代理地址与端口（1–65535）"));
+        // 逐协议落点：**三个协议都是可选的**（留空 = 关闭该协议），但至少要填一个。
+        // HTTPS / SOCKS 的独立落点是 macOS 特有的（系统里是三个独立开关）；WinINET 只有一个
+        // 系统代理值，所以 Windows 上直接忽略这两个字段，避免对无关端口做校验与探测 ——
+        // 那边 HTTP 仍是必填（否则"开代理"什么也不写）。
+        let is_macos = cfg!(target_os = "macos");
+        let http = resolve_endpoint(None, &t.host, t.port)?;
+        let (https, socks) = if is_macos {
+            let pick = |label: &'static str, ep: Option<&ProxyEndpoint>| match ep {
+                Some(e) => resolve_endpoint(Some(label), &e.host, e.port),
+                None => Ok(None),
+            };
+            (pick("HTTPS", t.https.as_ref())?, pick("SOCKS", t.socks.as_ref())?)
+        } else {
+            (None, None)
+        };
+        // 展示与探测的顺序固定 HTTP → HTTPS → SOCKS
+        let mut endpoints: Vec<(Option<&'static str>, ProxyEndpoint)> = Vec::new();
+        for (label, e) in [
+            (None, http.clone()),
+            (Some("HTTPS"), https.clone()),
+            (Some("SOCKS"), socks.clone()),
+        ] {
+            if let Some(e) = e {
+                endpoints.push((label, e));
+            }
         }
-        if !valid_proxy_host(&host) {
-            return Err(AppError::coded(E4002).with_detail(format!("代理地址非法：{host}")));
+        if endpoints.is_empty() {
+            return Err(AppError::coded(E4002).with_detail(if is_macos {
+                "请至少填写一个代理协议的地址与端口（HTTP / HTTPS / SOCKS）"
+            } else {
+                "请填写代理地址与端口（1–65535）"
+            }));
         }
-        // 前置连通性自检：没有这一条，这个功能会造成全网中断
-        if t.probe && !probe::probe_proxy(&host, t.port) {
-            return Err(AppError::coded(E3001).with_detail(format!(
-                "无法连接到 {host}:{}，开启后所有应用将无法联网。请先启动代理软件，或检查端口。",
-                t.port
-            )));
+        // 先全部校验（便宜、在本地），再逐项探测（要连网、慢）
+        for (label, e) in &endpoints {
+            validate_endpoint(*label, e)?;
+        }
+        if t.probe {
+            for (label, e) in &endpoints {
+                probe_endpoint(*label, e)?;
+            }
         }
         let before = system_proxy::read()?;
         ensure_proxy_snapshot(&before)?;
+
+        let manual = ManualProxy {
+            enable: true,
+            // `server` 是 HTTP 落点的历史键名（提权载荷的跨版本契约）：HTTP 留空时写空串，
+            // 新助手按"该协议不参与"处理，旧助手会在解析地址时报错、什么也不写
+            http: http.as_ref().map(ProxyEndpoint::to_server).unwrap_or_default(),
+            https: https.as_ref().map(ProxyEndpoint::to_server),
+            socks: socks.as_ref().map(ProxyEndpoint::to_server),
+            bypass: t.bypass.clone(),
+        };
+        let primary = &endpoints[0];
+        let extra = endpoints[1..]
+            .iter()
+            .map(|(label, e)| format!("{} ***:{}", label.unwrap_or("HTTP"), e.port))
+            .collect::<Vec<_>>();
+        let extra_protocols = if extra.is_empty() {
+            String::new()
+        } else {
+            format!("；{}", extra.join("、"))
+        };
         Ok(ProxyPlan {
-            write: ProxyWrite::Manual {
-                enable: true,
-                server: format!("{host}:{}", t.port),
-                bypass: t.bypass.clone(),
-            },
+            write: ProxyWrite::Manual(manual),
             report: ProxyReport::Enabled {
-                host,
-                port: t.port,
+                host: primary.1.host.clone(),
+                port: primary.1.port,
+                label: primary.0,
                 bypass: t.bypass.clone(),
                 probe: t.probe,
+                extra_protocols,
             },
         })
     } else {
@@ -618,11 +757,7 @@ fn prepare_proxy(t: &ProxyTarget) -> Result<ProxyPlan> {
             None => {
                 let now = system_proxy::read()?;
                 Ok(ProxyPlan {
-                    write: ProxyWrite::Manual {
-                        enable: false,
-                        server: String::new(),
-                        bypass: now.bypass.clone(),
-                    },
+                    write: ProxyWrite::Manual(ManualProxy::off(&now.bypass)),
                     report: ProxyReport::Disabled {
                         pac_present: now.pac_present,
                     },
@@ -638,15 +773,24 @@ fn proxy_step(plan: &ProxyPlan, notified: bool) -> ApplyStep {
         ProxyReport::Enabled {
             host,
             port,
+            label,
             bypass,
             probe,
+            extra_protocols,
         } => {
-            let verified = system_proxy::verify(true).unwrap_or(false);
+            let verified = plan.write.verify().unwrap_or(false);
+            // 主落点是 HTTP 时保持历史文案（只有一个协议在起作用时它最自然），
+            // HTTP 留空时把协议名报出来，否则会以为开的是 HTTP
+            let head = match label {
+                None => "已启用系统代理".to_string(),
+                Some(l) => format!("已启用系统代理 {l}"),
+            };
             let message = if verified {
                 format!(
-                    "已启用系统代理 ***:{}（绕过：{}）{}",
+                    "{head} ***:{}（绕过：{}）{}{}",
                     port,
                     bypass,
+                    extra_protocols,
                     if notified {
                         ""
                     } else {
@@ -658,8 +802,9 @@ fn proxy_step(plan: &ProxyPlan, notified: bool) -> ApplyStep {
             };
             log::info!(
                 target: "proxy",
-                "代理变更：enable=true server={} bypass={} 前置探测={} 通知={} 回读={}",
+                "代理变更：enable=true server={} 额外协议={:?} bypass={} 前置探测={} 通知={} 回读={}",
                 crate::logging::redact_host_port(host, *port),
+                extra_protocols,
                 bypass,
                 probe,
                 notified,
@@ -805,8 +950,8 @@ fn resolve_dns_alias(t: &DnsTarget) -> Result<String> {
     if !t.alias.trim().is_empty() {
         return Ok(t.alias.clone());
     }
-    let wants_manual = t.v4.as_ref().map_or(false, |l| !l.is_empty())
-        || t.v6.as_ref().map_or(false, |l| !l.is_empty());
+    let wants_manual = t.v4.as_ref().is_some_and(|l| !l.is_empty())
+        || t.v6.as_ref().is_some_and(|l| !l.is_empty());
     if wants_manual {
         return Err(AppError::coded(crate::error::E4001).with_detail(
             "方案未指定网卡：请编辑方案选择网卡，或将 DNS 模式改为「还原为自动获取」",
@@ -1069,16 +1214,17 @@ mod tests {
 
     fn enabled_proxy_plan() -> ProxyPlan {
         ProxyPlan {
-            write: ProxyWrite::Manual {
-                enable: true,
-                server: "127.0.0.1:7890".into(),
-                bypass: "localhost;127.*;<local>".into(),
-            },
+            write: ProxyWrite::Manual(crate::os::ManualProxy::http_only(
+                "127.0.0.1:7890",
+                "localhost;127.*;<local>",
+            )),
             report: ProxyReport::Enabled {
                 host: "127.0.0.1".into(),
                 port: 7890,
+                label: None,
                 bypass: "localhost;127.*;<local>".into(),
                 probe: false,
+                extra_protocols: String::new(),
             },
         }
     }

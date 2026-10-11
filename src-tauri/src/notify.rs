@@ -97,3 +97,12 @@ pub fn action(label: &str, action: &str) -> NotifyAction {
         args: json!(null),
     }
 }
+
+/// 带参数的动作（如 `silent:install` 附带触发时的通道健康度，供前端区分文案）
+pub fn action_arg(label: &str, action: &str, args: serde_json::Value) -> NotifyAction {
+    NotifyAction {
+        label: label.to_string(),
+        action: action.to_string(),
+        args,
+    }
+}

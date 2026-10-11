@@ -9,11 +9,28 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
   const view: ProxyView = await api.proxyGet();
   const st = view.state;
   const last = readLastForm();
-  const host = last.host ?? (st.server ? st.server.split(":").slice(0, -1).join(":") : "");
-  const port = last.port ?? (st.server ? st.server.split(":").pop() ?? "" : "");
+  // 逐协议落点：三个协议都**可选**（留空 = 关闭该协议，macOS 三个开关互相独立），至少要填一个
+  const splitEp = (v?: string | null) => {
+    if (!v) return { host: "", port: "" };
+    const i = v.lastIndexOf(":");
+    return i <= 0 ? { host: v, port: "" } : { host: v.slice(0, i), port: v.slice(i + 1) };
+  };
+  // 老状态（≤ 0.0.2）只记了一个主落点，那时它就是 HTTP；新状态逐协议记录 ——
+  // HTTP 留空就是"没开 HTTP"，**不能**拿 `server` 顶上（那时它可能是 HTTPS / SOCKS 的落点）
+  const legacy = !st.http_proxy && !st.https_proxy && !st.socks_proxy;
+  const http0 = splitEp(st.http_proxy ?? (legacy ? st.server : ""));
+  const https0 = splitEp(st.https_proxy);
+  const socks0 = splitEp(st.socks_proxy);
+  const host = last.host ?? http0.host;
+  const port = last.port ?? http0.port;
+  const httpsHost = last.https_host ?? https0.host;
+  const httpsPort = last.https_port ?? https0.port;
+  const socksHost = last.socks_host ?? socks0.host;
+  const socksPort = last.socks_port ?? socks0.port;
   const bypass = last.bypass ?? st.bypass;
   const readonly = !!ctx.state.read_only;
 
+  // pi-lens-ignore: no-inner-html-js -- 动态内容均经 esc/ui.esc 转义后拼接（项目统一模板写法）
   root.innerHTML = `
     <div class="card">
       <h2>${os.PROXY_TITLE}</h2>
@@ -29,14 +46,32 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
         </div>
       </div>
 
-      <div class="field-grid">
+      ${os.IS_MACOS ? `<div class="field-grid">
+        <span>HTTP 代理</span>
+        <div style="display:flex;gap:8px">
+          <input type="text" id="px-host" value="${ui.esc(host)}" placeholder="留空 = 不启用" />
+          <input type="number" id="px-port" min="1" max="65535" value="${ui.esc(port)}" placeholder="7890" style="width:120px" />
+        </div>
+        <span>HTTPS 代理</span>
+        <div style="display:flex;gap:8px">
+          <input type="text" id="px-https-host" value="${ui.esc(httpsHost)}" placeholder="留空 = 不启用" />
+          <input type="number" id="px-https-port" min="1" max="65535" value="${ui.esc(httpsPort)}" placeholder="7891" style="width:120px" />
+        </div>
+        <span>SOCKS 代理</span>
+        <div style="display:flex;gap:8px">
+          <input type="text" id="px-socks-host" value="${ui.esc(socksHost)}" placeholder="留空 = 不启用" />
+          <input type="number" id="px-socks-port" min="1" max="65535" value="${ui.esc(socksPort)}" placeholder="1080" style="width:120px" />
+        </div>
+        <span>绕过列表</span>
+        <input type="text" id="px-bypass" value="${ui.esc(bypass)}" />
+      </div>` : `<div class="field-grid">
         <span>地址</span>
         <input type="text" id="px-host" value="${ui.esc(host)}" placeholder="127.0.0.1 或 proxy.local" />
         <span>端口</span>
         <input type="number" id="px-port" min="1" max="65535" value="${ui.esc(port)}" placeholder="7890" style="width:120px" />
         <span>绕过列表</span>
         <input type="text" id="px-bypass" value="${ui.esc(bypass)}" />
-      </div>
+      </div>`}
 
       <div style="margin:12px 0">
         <label class="row"><input type="checkbox" id="px-probe" ${view.probe_before_enable ? "checked" : ""} />
@@ -85,10 +120,17 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
 
   const stateEl = root.querySelector("#px-state")!;
   const pacEl = root.querySelector("#px-pac")!;
+  // macOS 的三个协议是独立开关，逐项列出来才对得上"到底开了什么"
+  const protoText = (s: ProxyView["state"]) => {
+    const parts: string[] = [];
+    if (s.http_proxy) parts.push(`HTTP ${s.http_proxy}`);
+    if (s.https_proxy) parts.push(`HTTPS ${s.https_proxy}`);
+    if (s.socks_proxy) parts.push(`SOCKS ${s.socks_proxy}`);
+    return parts.join(" · ");
+  };
   const renderState = (s: ProxyView) => {
-    stateEl.textContent = s.state.enable
-      ? `已开启（${s.state.server || "未设置地址"}）`
-      : "已关闭";
+    const detail = protoText(s.state) || s.state.server || "未设置地址";
+    stateEl.textContent = s.state.enable ? `已开启（${detail}）` : "已关闭";
     (stateEl as HTMLElement).className = s.state.enable ? "ok-text" : "muted";
     pacEl.textContent = s.state.pac_present
       ? "存在（PAC 优先级高于手动代理，会使「关闭代理」失效）"
@@ -101,32 +143,71 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
     const box = root.querySelector("#px-report") as HTMLElement;
     const body = root.querySelector("#px-report-body") as HTMLElement;
     box.hidden = false;
+  // pi-lens-ignore: no-inner-html-js -- 动态内容均经 esc/ui.esc 转义后拼接（项目统一模板写法）
     body.innerHTML = `<div class="muted" style="margin-bottom:8px">${ui.esc(
       report.message,
     )}</div>${ui.stepsHtml(report.steps)}`;
   };
 
-  const config = () => ({
-    enable: true,
-    host: (root.querySelector("#px-host") as HTMLInputElement).value.trim(),
-    port: Number((root.querySelector("#px-port") as HTMLInputElement).value || 0),
-    bypass: (root.querySelector("#px-bypass") as HTMLInputElement).value.trim(),
-    force: false,
-  });
+  // 地址与端口都为空 = 该协议不启用；Windows 分支没有这两个输入框，读不到就是 undefined
+  const ep = (hSel: string, pSel: string) => {
+    const h = (root.querySelector(hSel) as HTMLInputElement | null)?.value.trim() ?? "";
+    const p = Number((root.querySelector(pSel) as HTMLInputElement | null)?.value || 0);
+    return h || p ? { host: h, port: p } : undefined;
+  };
+  const val = (sel: string) => (root.querySelector(sel) as HTMLInputElement | null)?.value ?? "";
+
+  const config = () => {
+    // HTTP 也是可选的：留空 = 关闭该协议（macOS 三个开关互相独立）
+    const http = ep("#px-host", "#px-port");
+    return {
+      enable: true,
+      host: http?.host ?? "",
+      port: http?.port ?? 0,
+      https: ep("#px-https-host", "#px-https-port"),
+      socks: ep("#px-socks-host", "#px-socks-port"),
+      bypass: val("#px-bypass").trim(),
+      force: false,
+    };
+  };
 
   const saveForm = () => {
     writeLastForm({
-      host: (root.querySelector("#px-host") as HTMLInputElement).value,
-      port: (root.querySelector("#px-port") as HTMLInputElement).value,
-      bypass: (root.querySelector("#px-bypass") as HTMLInputElement).value,
+      host: val("#px-host"),
+      port: val("#px-port"),
+      https_host: val("#px-https-host"),
+      https_port: val("#px-https-port"),
+      socks_host: val("#px-socks-host"),
+      socks_port: val("#px-socks-port"),
+      bypass: val("#px-bypass"),
     });
   };
 
   root.querySelector("#px-enable")?.addEventListener("click", async () => {
     const cfg = config();
     saveForm();
-    if (!cfg.host || !cfg.port) {
-      ui.toast("error", "请先填写地址与端口", "端口范围 1–65535");
+    // HTTP 也是可选的（macOS 三个协议互相独立）；Windows 分支没有 HTTPS / SOCKS 输入框，
+    // 而且那边只有 HTTP 一项 —— 留空就等于什么都不写，所以仍按必填拦下
+    const http = cfg.host || cfg.port ? { host: cfg.host, port: cfg.port } : undefined;
+    const pairs: Array<[string, { host: string; port: number } | undefined]> = os.IS_MACOS
+      ? [
+          ["HTTP", http],
+          ["HTTPS", cfg.https],
+          ["SOCKS", cfg.socks],
+        ]
+      : [["HTTP", http]];
+    // 逐协议成对校验：只填一半会让"这个协议到底开不开"变得含糊
+    const half = pairs.find(([, e]) => e && (!e.host || !e.port));
+    if (half) {
+      ui.toast("error", `${half[0]} 代理的地址与端口要成对填写`, "整套留空表示关闭该协议");
+      return;
+    }
+    if (!pairs.some(([, e]) => e)) {
+      ui.toast(
+        "error",
+        os.IS_MACOS ? "至少填写一个代理协议" : "请先填写地址与端口",
+        os.IS_MACOS ? "HTTP / HTTPS / SOCKS 三个都留空 = 不开代理" : "端口范围 1–65535",
+      );
       return;
     }
     const probe = (root.querySelector("#px-probe") as HTMLInputElement).checked;
@@ -174,7 +255,9 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
   root.querySelector("#px-clear")?.addEventListener("click", async () => {
     const yes = await ui.confirmModal({
       title: "彻底清除系统代理设置？",
-      body: "将执行：ProxyEnable=0、删除 AutoConfigURL、清空 ProxyServer，保留绕过列表。\n\n这个操作不区分代理来源，公司 VPN / 企业网关的代理配置也会被一起抹掉。清除后 5 秒内可撤销。",
+      body: os.IS_MACOS
+        ? "将执行：关闭 HTTP / HTTPS / SOCKS 三个代理开关，并关闭自动代理（PAC）。\n\n这个操作不区分代理来源，公司 VPN / 企业网关的代理配置也会被一起抹掉。清除后 5 秒内可撤销。"
+        : "将执行：ProxyEnable=0、删除 AutoConfigURL、清空 ProxyServer，保留绕过列表。\n\n这个操作不区分代理来源，公司 VPN / 企业网关的代理配置也会被一起抹掉。清除后 5 秒内可撤销。",
       confirmText: "清除",
       danger: true,
     });
@@ -208,13 +291,29 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
 }
 
 // 表单在标签页切换后保留草稿（避免反复输入）
-let draft: { host?: string; port?: string; bypass?: string } = {};
+let draft: {
+  host?: string;
+  port?: string;
+  https_host?: string;
+  https_port?: string;
+  socks_host?: string;
+  socks_port?: string;
+  bypass?: string;
+} = {};
 
 function readLastForm() {
   return draft;
 }
 
-function writeLastForm(v: { host: string; port: string; bypass: string }) {
+function writeLastForm(v: {
+  host: string;
+  port: string;
+  https_host: string;
+  https_port: string;
+  socks_host: string;
+  socks_port: string;
+  bypass: string;
+}) {
   draft = v;
 }
 

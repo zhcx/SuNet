@@ -59,10 +59,21 @@ export interface HostsView {
 
 export interface ProxyState {
   enable: boolean;
+  /** 主落点（HTTP → HTTPS → SOCKS 里第一个开着的）：托盘 / 快捷面板这类只显示一个地址的地方用它 */
   server: string;
   bypass: string;
   autoconfig_url?: string | null;
   pac_present: boolean;
+  /** 逐协议落点（`host:port`）：只有 macOS 有这三个字段，未开启 / 未回读时为 null */
+  http_proxy?: string | null;
+  https_proxy?: string | null;
+  socks_proxy?: string | null;
+}
+
+/** 一个代理落点（逐协议代理用；地址与端口必须成对） */
+export interface ProxyEndpoint {
+  host: string;
+  port: number;
 }
 
 export interface ProxyView {
@@ -161,6 +172,12 @@ export interface ProfileProxy {
   host: string;
   port: number;
   bypass: string;
+  /** HTTPS 代理（macOS 逐协议；Windows 用不上，界面不显示） */
+  https_host: string;
+  https_port: number;
+  /** SOCKS 代理 */
+  socks_host: string;
+  socks_port: number;
 }
 
 export interface ProfileDns {
@@ -238,6 +255,8 @@ export interface SilentElevationStatus {
   supported: boolean;
   enabled: boolean;
   installed: boolean;
+  /** macOS：装好了且守护进程在跑；装了未跑 = 被 BTM 拦截。Windows 恒等于 installed */
+  running: boolean;
   /** 界面上这条通道叫什么（「静默提权通道」/「免密提权助手」） */
   noun: string;
   /** 状态说明；平台差异由后端收口，前端不判断平台 */
@@ -287,6 +306,11 @@ export interface ProfileBrief {
   proxy_host: string;
   proxy_port: number;
   proxy_bypass: string;
+  /** 逐协议落点：快捷开关一键开代理时得把它们一起发下去（macOS） */
+  proxy_https_host: string;
+  proxy_https_port: number;
+  proxy_socks_host: string;
+  proxy_socks_port: number;
   dns_enabled: boolean;
   dns_alias: string;
 }

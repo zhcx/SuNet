@@ -64,16 +64,21 @@ export const AUTOSTART_HINT = IS_MACOS
 
 /** 代理一层的落点（macOS 写系统代理要 root，与 Windows 的 HKCU 完全不同） */
 export const PROXY_NEEDS_ADMIN = IS_MACOS;
-export const PROXY_TITLE = IS_MACOS ? "系统代理（网络设置里的 Web 代理）" : "系统代理（WinINET 全局代理）";
+export const PROXY_TITLE = IS_MACOS ? "系统代理（网络设置里的 HTTP / HTTPS / SOCKS）" : "系统代理（WinINET 全局代理）";
 export const PROXY_HINT = IS_MACOS
-  ? "对所有活动网络服务写入 <b>HTTP 代理</b>（networksetup）；只写这一项 —— HTTPS 请求由系统复用 HTTP 代理，多写 SOCKS / 安全 Web 反而会让只支持 HTTP 的代理端口收到错协议的请求。"
+  ? "对所有活动网络服务写入代理（<code>networksetup</code>）。macOS 把 <b>HTTP / HTTPS / SOCKS 当成三个独立开关</b>：<b>填了地址的协议就打开，留空的就是关闭</b>；<b>三个都留空就等于不开代理</b>，至少要填一个。<br />一般只填 HTTP 就够了 —— 系统在有安全 Web 代理时按协议分别转发，没有时 HTTPS 请求会复用 HTTP 代理（CONNECT）；如果你的代理软件只支持 HTTP，就别填 HTTPS / SOCKS，否则错协议的请求会被送去那个端口。"
   : "写入 HKCU\\...\\Internet Settings 并调用 InternetSetOptionW 通知系统，<b>全程不需要管理员权限</b>。";
 export const PROXY_SWITCH_NOTICE = IS_MACOS ? "即将开关系统代理（需要一次管理员授权）" : "即将开关系统代理（无需管理员权限）";
 
+/** 方案编辑器里的代理提示（macOS 才有逐协议概念） */
+export const PROXY_PROFILE_HINT = IS_MACOS
+  ? "三个协议都是可选的：<b>留空 = 不启用该协议</b>（不是\"保持原样\"）—— 一键开代理时会把填了的写进系统，留空的显式关闭（顺手清掉 ≤ 0.0.2 三项同端口的残留）；至少要填一个，全留空等于没配代理。"
+  : "";
+
 /** 代理页「为什么有的程序不跟随」的正文（各平台作用域完全不同） */
 export const PROXY_SCOPE_WHY = IS_MACOS
-  ? `系统代理写在各网络服务的 Web 代理（HTTP）设置里（由 configd 管理），
-         Safari / 系统 WebKit 与大多数原生应用都会读它（HTTPS 请求也复用这一项）；
+  ? `系统代理写在各网络服务的 HTTP / HTTPS / SOCKS 三个独立开关里（由 configd 管理），
+         Safari / 系统 WebKit 与大多数原生应用都会读它；
           而 <code>curl</code> / <code>git</code> / <code>npm</code> / Homebrew 等命令行工具默认不读系统代理
           （需要自己设 <code>http_proxy</code> 环境变量），App Store 与部分软件更新走独立通道。`
   : `系统代理位于 WinINET 层，Chrome / Edge / Electron 应用 / 大部分办公软件都会读它；

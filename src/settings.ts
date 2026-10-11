@@ -45,7 +45,11 @@ export async function openSettingsModal(): Promise<void> {
       <span>提权</span>
       <div class="actions" style="flex-direction:column;align-items:flex-start">
         <label class="row"><input type="checkbox" id="set-elev-notice" /> 修改 hosts/DNS 前先显示说明对话框</label>
-        <button class="sm" id="set-silent-toggle" type="button" hidden>安装静默提权通道</button>
+        <div class="row" id="set-silent-row" hidden>
+          <span class="badge plain" id="set-silent-badge">…</span>
+          <button class="sm" id="set-silent-reinstall" type="button" hidden>重新安装</button>
+          <button class="sm" id="set-silent-toggle" type="button" hidden>安装静默提权通道</button>
+        </div>
         <span class="hint" id="set-silent-hint"></span>
       </div>
       <span>开机自启</span>
@@ -114,22 +118,38 @@ export async function openSettingsModal(): Promise<void> {
   q<HTMLInputElement>("#set-snap-keep").value = String(s.hosts_backup_keep);
   q("#set-version").textContent = `程序版本 ${st.version} · 配置目录 ${st.read_only ? "（只读模式）" : ""}`;
 
-  // 静默提权通道（Windows）：装 / 卸各需要一次提权确认；装好后 hosts / DNS 写入不再弹 UAC。
-  // 开关状态由后端在安装 / 卸载时写进配置，这里用本地变量记住，保存设置时原样带回，
-  // 免得用弹层打开时的旧快照把它覆盖回去。
+  // 静默提权通道（Windows 计划任务 / macOS 免密助手）：装 / 卸各需要一次提权确认；
+  // 装好后 hosts / DNS / 代理写入不再逐次授权。
+  // 状态徽标由后端字段驱动（installed/running），前端不解析文案、不判断平台。
   const silentHint = q<HTMLElement>("#set-silent-hint");
   const silentBtn = q<HTMLButtonElement>("#set-silent-toggle");
+  const silentReinstall = q<HTMLButtonElement>("#set-silent-reinstall");
+  const silentRow = q<HTMLElement>("#set-silent-row");
+  const silentBadge = q<HTMLElement>("#set-silent-badge");
   let silentEnabled = s.silent_elevation;
   const renderSilent = (v: SilentElevationStatus) => {
     silentEnabled = v.installed && v.enabled;
+    silentRow.hidden = !v.supported;
     silentBtn.hidden = !v.supported;
     if (!v.supported) {
+      silentBadge.textContent = "不支持";
       silentHint.textContent = v.detail || "本平台不支持";
       return;
     }
-    // 名称与说明都由后端按平台给出：Windows = 静默提权通道（计划任务），
-    // macOS = 免密提权助手（LaunchDaemon）—— 前端不做平台判断
+    // 状态优先级：装好且在跑 > 装了没跑（BTM 拦截）> 未安装
+    if (v.installed && v.running) {
+      silentBadge.textContent = `已生效 · 切换不再输密码`;
+      silentBadge.className = "badge ok";
+    } else if (v.installed) {
+      silentBadge.textContent = `已安装 · 未运行`;
+      silentBadge.className = "badge warn";
+    } else {
+      silentBadge.textContent = `未安装 · 切换时需输密码`;
+      silentBadge.className = "badge plain";
+    }
     silentBtn.textContent = `${v.installed ? "卸载" : "安装"}${v.noun}`;
+    // 装了但没跑起来时给一个「重新安装」副按钮（覆盖卸载→重装两步，常见于 BTM 拦截后）
+    silentReinstall.hidden = !v.supported || !v.installed || v.running;
     silentHint.textContent = v.detail;
   };
   try {
@@ -137,24 +157,43 @@ export async function openSettingsModal(): Promise<void> {
   } catch {
     silentHint.textContent = "无法读取静默提权状态";
   }
-  silentBtn.addEventListener("click", async () => {
+  const applySilent = async (op: "install" | "reinstall" | "uninstall") => {
     silentBtn.disabled = true;
+    silentReinstall.disabled = true;
     try {
-      const v = silentBtn.textContent?.startsWith("卸载")
-        ? await api.silentElevationUninstall()
-        : await api.silentElevationInstall();
+      const v =
+        op === "uninstall"
+          ? await api.silentElevationUninstall()
+          : op === "reinstall"
+            ? await api.silentElevationUninstall().then(() => api.silentElevationInstall())
+            : await api.silentElevationInstall();
       renderSilent(v);
-      ui.toast(
-        "info",
-        `${v.installed ? "已安装" : "已卸载"}${v.noun}`,
-        v.installed ? "之后的写入不再弹 UAC / 不再输密码" : "已恢复为逐次确认",
-      );
+      if (v.installed && !v.running) {
+        // macOS：装上了但守护进程没起来——最常见原因是 BTM 拦截，给明确放行指引
+        ui.toast(
+          "warn",
+          `${v.noun}已安装但未运行`,
+          "请在「系统设置 → 通用 → 登录项与扩展」中允许它在后台运行，或稍后点「重新安装」。",
+        );
+      } else {
+        ui.toast(
+          "info",
+          `${v.installed ? "已安装" : "已卸载"}${v.noun}`,
+          v.installed ? "之后的写入不再弹 UAC / 不再输密码" : "已恢复为逐次确认",
+        );
+      }
     } catch (e) {
       ui.toast("error", "静默提权通道操作失败", errText(e));
     } finally {
       silentBtn.disabled = false;
+      silentReinstall.disabled = false;
     }
+  };
+  silentBtn.addEventListener("click", () => {
+    // 按钮文字在 render 后只会是「安装…」或「卸载…」，看前缀分流
+    void applySilent(silentBtn.textContent?.startsWith("卸载") ? "uninstall" : "install");
   });
+  silentReinstall.addEventListener("click", () => void applySilent("reinstall"));
 
   // ------------------------------------------------------------------
   // 全局热键：按键捕获（不再要求用户手打 "Ctrl+Alt+S"）

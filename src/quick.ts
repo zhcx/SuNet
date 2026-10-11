@@ -65,6 +65,7 @@ async function refresh(): Promise<void> {
 
 function renderFatal(msg: string): void {
   const app = document.getElementById("app")!;
+  // pi-lens-ignore: no-inner-html-js -- 动态内容均经 esc/ui.esc 转义后拼接（项目统一模板写法）
   app.innerHTML = `
     <div class="flyout">
       <div class="flyout-head" data-tauri-drag-region="deep">
@@ -118,6 +119,7 @@ function render(): void {
   const v = view();
   const s = state;
 
+  // pi-lens-ignore: no-inner-html-js -- 动态内容均经 esc/ui.esc 转义后拼接（项目统一模板写法）
   document.getElementById("app")!.innerHTML = `
   <div class="flyout">
     <div class="flyout-head" data-tauri-drag-region="deep">
@@ -231,9 +233,23 @@ function notes(): string {
 
 /** 代理瓦片：面板里的头号操作，用大号开关 + 一个通栏 */
 function tileProxy(v: View): string {
-  const addr =
-    state!.proxy.server ||
-    (v.active ? `${v.active.proxy_host}:${v.active.proxy_port}` : "");
+  // HTTP 留空时用方案里配好的其它协议顶上（macOS 三个开关互相独立）
+  const fromProfile = v.active
+    ? [
+        v.active.proxy_host.trim() && v.active.proxy_port
+          ? `${v.active.proxy_host}:${v.active.proxy_port}`
+          : "",
+        v.active.proxy_https_host.trim() && v.active.proxy_https_port
+          ? `HTTPS ${v.active.proxy_https_host}:${v.active.proxy_https_port}`
+          : "",
+        v.active.proxy_socks_host.trim() && v.active.proxy_socks_port
+          ? `SOCKS ${v.active.proxy_socks_host}:${v.active.proxy_socks_port}`
+          : "",
+      ]
+        .filter(Boolean)
+        .join(" · ")
+    : "";
+  const addr = state!.proxy.server || fromProfile;
   const stateText = v.proxyOn
     ? "所有遵循系统代理的应用都会走它"
     : state!.proxy.pac_present
@@ -355,6 +371,7 @@ function inlineConfirm(
   holder.querySelectorAll(".inline-confirm").forEach((n) => n.remove());
   const strip = document.createElement("div");
   strip.className = `inline-confirm ${danger ? "danger" : ""}`;
+  // pi-lens-ignore: no-inner-html-js -- 动态内容均经 esc/ui.esc 转义后拼接（项目统一模板写法）
   strip.innerHTML = `
     <span class="grow">${esc(text)}</span>
     <button class="sm" id="ic-cancel">取消</button>
@@ -375,6 +392,7 @@ function flash(text: string, danger = false, retry?: () => void): void {
   holder.querySelectorAll(".inline-confirm").forEach((n) => n.remove());
   const strip = document.createElement("div");
   strip.className = `inline-confirm ${danger ? "danger" : "warn"}`;
+  // pi-lens-ignore: no-inner-html-js -- 动态内容均经 esc/ui.esc 转义后拼接（项目统一模板写法）
   strip.innerHTML = `<span class="grow">${esc(text)}</span>
     ${retry ? `<button class="sm danger" id="fc-retry">仍然开启</button>` : ""}
     <button class="sm" id="fc-close">知道了</button>`;
@@ -520,10 +538,30 @@ function activeProfile(): ProfileBrief | undefined {
   return state?.profiles.find((x) => x.id === state?.active_profile_id);
 }
 
-function activeProxy(): { host: string; port: number; bypass: string } | null {
+function activeProxy(): {
+  host: string;
+  port: number;
+  https?: { host: string; port: number };
+  socks?: { host: string; port: number };
+  bypass: string;
+} | null {
   const p = activeProfile();
-  if (!p || !p.proxy_host.trim() || !p.proxy_port) return null;
-  return { host: p.proxy_host, port: p.proxy_port, bypass: p.proxy_bypass };
+  if (!p) return null;
+  // 逐协议落点：只有 macOS 的方案会填这两项，Windows 侧恒为空（后端也只在 macOS 消费）
+  const ep = (host: string, port: number) =>
+    host.trim() && port > 0 ? { host: host.trim(), port } : undefined;
+  const https = ep(p.proxy_https_host, p.proxy_https_port);
+  const socks = ep(p.proxy_socks_host, p.proxy_socks_port);
+  // 三个协议都可留空（macOS 三个独立开关）：HTTP 没配但 HTTPS / SOCKS 配了也算配好了
+  const http = p.proxy_host.trim() && p.proxy_port > 0;
+  if (!http && !https && !socks) return null;
+  return {
+    host: p.proxy_host.trim(),
+    port: p.proxy_port,
+    https,
+    socks,
+    bypass: p.proxy_bypass,
+  };
 }
 
 /** 还原 DNS 需要一个网卡；面板不摆选择器，用当前方案里记的那个 */
