@@ -16,10 +16,10 @@ pub struct ProxyConfig {
     pub port: u16,
     #[serde(default)]
     pub bypass: String,
-    /// HTTPS 代理落点（`null` / 缺省 = 关闭该协议）；只有 macOS 会发它
+    /// HTTPS 代理落点（`null` / 缺省 = 关闭该协议）
     #[serde(default)]
     pub https: Option<ProxyEndpoint>,
-    /// SOCKS 代理落点（`null` / 缺省 = 关闭该协议）；只有 macOS 会发它
+    /// SOCKS 代理落点（`null` / 缺省 = 关闭该协议）
     #[serde(default)]
     pub socks: Option<ProxyEndpoint>,
     /// 前端可覆盖全局设置（§3.4 第 2 步的"仍然开启"出口）
@@ -128,7 +128,7 @@ pub async fn proxy_set(
                 port: cfg.port,
                 bypass,
                 probe: effective_probe,
-                // 逐协议落点：前端没发（Windows）或整套留空就是"关闭该协议"；
+                // 逐协议落点：前端没发或整套留空就是"关闭该协议"；
                 // 只填一半的要留到校验里报错，所以这里只滤掉"完全为空"的
                 https: cfg.https.clone().filter(|e| !empty_endpoint(e)),
                 socks: cfg.socks.clone().filter(|e| !empty_endpoint(e)),

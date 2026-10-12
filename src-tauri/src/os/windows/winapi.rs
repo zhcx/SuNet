@@ -211,6 +211,8 @@ extern "system" {
         cy: c_int,
         uFlags: c_uint,
     ) -> BOOL;
+    /// 当前前台窗口（快捷面板失焦判定用，见 `tray::quick_still_foreground`）
+    pub fn GetForegroundWindow() -> HANDLE;
 }
 
 pub const MOD_ALT: DWORD = 0x0001;

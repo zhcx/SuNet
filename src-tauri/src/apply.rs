@@ -70,10 +70,11 @@ pub struct ProxyTarget {
     pub bypass: String,
     /// 开启前是否做 TCP 连通性自检（§3.4 硬性需求）
     pub probe: bool,
-    /// HTTPS 代理落点（`None` = 关闭该协议）。只有 macOS 有"逐协议"这个概念，
-    /// Windows 的 WinINET 只有一个 `ProxyServer`，那里恒为 None
+    /// HTTPS 代理落点（`None` = 关闭该协议）。macOS 写到各网络服务的 HTTPS 开关；
+    /// Windows 编进 `ProxyServer` 的 `https=` 段
     pub https: Option<ProxyEndpoint>,
-    /// SOCKS 代理落点（`None` = 关闭该协议）
+    /// SOCKS 代理落点（`None` = 关闭该协议）。macOS 写 `-setsocksfirewallproxy`；
+    /// Windows 编进 `ProxyServer` 的 `socks=` 段（系统代理对 SOCKS 的原生写法）
     pub socks: Option<ProxyEndpoint>,
 }
 
@@ -667,20 +668,15 @@ fn probe_endpoint(label: Option<&str>, e: &ProxyEndpoint) -> Result<()> {
 fn prepare_proxy(t: &ProxyTarget) -> Result<ProxyPlan> {
     if t.enable {
         // 逐协议落点：**三个协议都是可选的**（留空 = 关闭该协议），但至少要填一个。
-        // HTTPS / SOCKS 的独立落点是 macOS 特有的（系统里是三个独立开关）；WinINET 只有一个
-        // 系统代理值，所以 Windows 上直接忽略这两个字段，避免对无关端口做校验与探测 ——
-        // 那边 HTTP 仍是必填（否则"开代理"什么也不写）。
-        let is_macos = cfg!(target_os = "macos");
+        // 两平台语义一致：macOS 写到各网络服务的三个独立开关；Windows 编进
+        // `ProxyServer` 的分段语法（`http=…;https=…;socks=…`）。
         let http = resolve_endpoint(None, &t.host, t.port)?;
-        let (https, socks) = if is_macos {
-            let pick = |label: &'static str, ep: Option<&ProxyEndpoint>| match ep {
-                Some(e) => resolve_endpoint(Some(label), &e.host, e.port),
-                None => Ok(None),
-            };
-            (pick("HTTPS", t.https.as_ref())?, pick("SOCKS", t.socks.as_ref())?)
-        } else {
-            (None, None)
+        let pick = |label: &'static str, ep: Option<&ProxyEndpoint>| match ep {
+            Some(e) => resolve_endpoint(Some(label), &e.host, e.port),
+            None => Ok(None),
         };
+        let https = pick("HTTPS", t.https.as_ref())?;
+        let socks = pick("SOCKS", t.socks.as_ref())?;
         // 展示与探测的顺序固定 HTTP → HTTPS → SOCKS
         let mut endpoints: Vec<(Option<&'static str>, ProxyEndpoint)> = Vec::new();
         for (label, e) in [
@@ -693,11 +689,9 @@ fn prepare_proxy(t: &ProxyTarget) -> Result<ProxyPlan> {
             }
         }
         if endpoints.is_empty() {
-            return Err(AppError::coded(E4002).with_detail(if is_macos {
-                "请至少填写一个代理协议的地址与端口（HTTP / HTTPS / SOCKS）"
-            } else {
-                "请填写代理地址与端口（1–65535）"
-            }));
+            return Err(AppError::coded(E4002).with_detail(
+                "请至少填写一个代理协议的地址与端口（HTTP / HTTPS / SOCKS）",
+            ));
         }
         // 先全部校验（便宜、在本地），再逐项探测（要连网、慢）
         for (label, e) in &endpoints {

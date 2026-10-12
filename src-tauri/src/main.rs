@@ -362,15 +362,28 @@ fn run_gui() {
                 }
             }
             tauri::WindowEvent::Focused(true) if window.label() == "quick" => {
+                // 激活同时刷新宽限起点：前台拉锯（面板激活后又被系统短暂抢走、
+                // 再抢回来）会产生成对的 true/false，宽限从**最后一次**激活算起，
+                // 拉锯稳定后面板才进入"可收起"状态
                 tray::set_quick_focus_seen(window.app_handle(), true);
+                tray::refresh_quick_grace(window.app_handle());
             }
-            // 快捷面板：点到别处就收起。两种例外都不收：
+            // 快捷面板：点到别处就收起。收起需要同时满足（三种例外都不收）：
             //   1. 正在执行操作（UAC 授权框会抢焦点，收起来用户就看不到结果了）
-            //   2. 自上次弹出以来还没真正获得过焦点（启动瞬间的失焦事件会把面板立刻收掉）
+            //   2. 刚弹出不久 —— 显示瞬间的激活抖动也会投递一次失焦，按时间阈值忽略，
+            //      否则面板会在弹出的瞬间消失（表现为"点托盘没反应"）
+            //   3. 显示以来从未真正激活过 —— 冷启动 / 后台弹出时 SetForegroundWindow
+            //      可能被前台锁定拒绝，面板看得见却没焦点，之后任何失焦（WebView2
+            //      就绪、别的窗口激活）都不该把它收掉；点面板内部激活后再点外面才收
             tauri::WindowEvent::Focused(false) if window.label() == "quick" => {
                 let app = window.app_handle();
-                if !tray::is_quick_pinned(app) && tray::quick_focus_seen(app) {
+                if !tray::is_quick_pinned(app)
+                    && tray::quick_focus_seen(app)
+                    && !tray::quick_blur_within_grace(app)
+                    && !tray::quick_still_foreground(window)
+                {
                     let _ = window.hide();
+                    tray::set_quick_blur_hidden_now(app);
                 }
             }
             _ => {}

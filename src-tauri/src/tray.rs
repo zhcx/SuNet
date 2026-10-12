@@ -10,10 +10,11 @@
 
 use crate::error::AppError;
 use crate::os::system_proxy::{self, ProxyState};
-use crate::state::AppState;
+use crate::state::SharedState;
 use serde::Serialize;
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem};
+use tauri::Emitter;
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{
     AppHandle, Manager, Monitor, PhysicalPosition, PhysicalSize, Rect, WebviewWindow, Wry,
@@ -169,7 +170,7 @@ fn on_menu(app: &AppHandle, id: &str) -> Result<(), AppError> {
         "clear_proxy" => crate::cmd::proxy::tray_clear_proxy(app)?,
         "autostart" => {
             let enable = app
-                .try_state::<AppState>()
+                .try_state::<SharedState>()
                 .and_then(|s| s.cfg_clone().ok())
                 .map(|c| !c.settings.autostart.enabled)
                 .unwrap_or(true);
@@ -196,7 +197,7 @@ fn on_menu(app: &AppHandle, id: &str) -> Result<(), AppError> {
 
 /// 托盘里的代理开关：没有可用配置时明确提示，而不是静默失败
 fn tray_toggle_proxy(app: &AppHandle) -> Result<(), AppError> {
-    let Some(state) = app.try_state::<AppState>() else {
+    let Some(state) = app.try_state::<SharedState>() else {
         return Ok(());
     };
     let cfg = state.cfg_clone()?;
@@ -291,10 +292,9 @@ pub fn show_window(app: &AppHandle, tab: Option<&str>) {
         let _ = win.set_focus();
     }
     if let Some(tab) = tab {
-        use tauri::Emitter;
         let _ = app.emit("sunet://navigate", tab);
     }
-    if let Some(state) = app.try_state::<AppState>() {
+    if let Some(state) = app.try_state::<SharedState>() {
         state.clear_warn_unread();
     }
 }
@@ -305,13 +305,13 @@ pub fn show_window(app: &AppHandle, tab: Option<&str>) {
 
 /// 面板是否处于「操作进行中」：进行中时失焦不收起
 pub fn is_quick_pinned(app: &AppHandle) -> bool {
-    app.try_state::<AppState>()
+    app.try_state::<SharedState>()
         .and_then(|s| s.runtime.lock().ok().map(|r| r.quick_pinned))
         .unwrap_or(false)
 }
 
 pub fn set_quick_pinned(app: &AppHandle, pinned: bool) {
-    if let Some(s) = app.try_state::<AppState>() {
+    if let Some(s) = app.try_state::<SharedState>() {
         if let Ok(mut rt) = s.runtime.lock() {
             rt.quick_pinned = pinned;
         }
@@ -325,19 +325,98 @@ pub fn hide_quick(app: &AppHandle) {
     set_quick_pinned(app, false);
 }
 
-/// 面板是否真正获得过焦点（用于过滤"刚弹出就失焦"的竞态事件）
+/// 记录面板本次显示的时刻（失焦收起的时间阈值起点），并重置焦点标记
+pub fn set_quick_shown_now(app: &AppHandle) {
+    if let Some(s) = app.try_state::<SharedState>() {
+        if let Ok(mut rt) = s.runtime.lock() {
+            rt.quick_shown_at = Some(std::time::Instant::now());
+            rt.quick_focus_seen = false;
+            rt.quick_blur_hidden_at = None;
+        }
+    }
+}
+
+/// 刷新失焦宽限起点（每次真正激活时调用）：前台拉锯产生的成对激活/失焦
+/// 事件里，宽限要从**最后一次**激活算起，否则拉锯稳定后的第一次失焦
+/// 会带着过期的宽限把面板误收
+pub fn refresh_quick_grace(app: &AppHandle) {
+    if let Some(s) = app.try_state::<SharedState>() {
+        if let Ok(mut rt) = s.runtime.lock() {
+            rt.quick_shown_at = Some(std::time::Instant::now());
+        }
+    }
+}
+
+/// 面板本次显示以来是否真的获得过焦点（Focused(true) 已到达）
 pub fn quick_focus_seen(app: &AppHandle) -> bool {
-    app.try_state::<AppState>()
+    app.try_state::<SharedState>()
         .and_then(|s| s.runtime.lock().ok().map(|r| r.quick_focus_seen))
         .unwrap_or(false)
 }
 
 pub fn set_quick_focus_seen(app: &AppHandle, seen: bool) {
-    if let Some(s) = app.try_state::<AppState>() {
+    if let Some(s) = app.try_state::<SharedState>() {
         if let Ok(mut rt) = s.runtime.lock() {
             rt.quick_focus_seen = seen;
         }
     }
+}
+
+/// 面板刚弹出后短窗口内（几百毫秒）的失焦是显示瞬间的激活抖动，不算
+/// "点到别处"；过了这个窗口的失焦才是真的点了面板以外。
+pub fn quick_blur_within_grace(app: &AppHandle) -> bool {
+    const GRACE: std::time::Duration = std::time::Duration::from_millis(600);
+    app.try_state::<SharedState>()
+        .and_then(|s| {
+            s.runtime.lock().ok().map(|r| {
+                r.quick_shown_at
+                    .map(|t| t.elapsed() < GRACE)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// 记录"面板刚因失焦被收起"。托盘左键的 click 既会让面板失焦（走到这里）
+/// 又会进入 [`toggle_quick`] —— toggle 认得这个标记就不会把用户刚收起的
+/// 面板再弹出来。
+pub fn set_quick_blur_hidden_now(app: &AppHandle) {
+    if let Some(s) = app.try_state::<SharedState>() {
+        if let Ok(mut rt) = s.runtime.lock() {
+            rt.quick_blur_hidden_at = Some(std::time::Instant::now());
+        }
+    }
+}
+
+/// 面板是否仍是前台窗口。
+///
+/// WebView2 加载完成会把键盘焦点移进自己的子窗口，顶层随之收到一轮
+/// WM_KILLFOCUS（tao 报 `Focused(false)`）——**此时前台窗口还是面板本身**，
+/// 这不是"点到别处"，不能收。真失焦时前台必然已换成别的窗口。
+pub fn quick_still_foreground(window: &tauri::Window) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(h) = window.hwnd() {
+            let fg = unsafe { crate::os::winapi::GetForegroundWindow() };
+            return fg == h.0;
+        }
+    }
+    // 非 Windows / 取不到 hwnd：保守不收（macOS 的 tao 焦点事件是可靠的）
+    true
+}
+
+/// 面板是否在极近时刻（几百毫秒）刚因失焦被收起
+pub fn quick_recently_blur_hidden(app: &AppHandle) -> bool {
+    const WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+    app.try_state::<SharedState>()
+        .and_then(|s| {
+            s.runtime.lock().ok().map(|r| {
+                r.quick_blur_hidden_at
+                    .map(|t| t.elapsed() < WINDOW)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// 开/关面板。`at` = 左键点击事件里的（托盘图标外框, 光标位置）；右键菜单唤出时是 None。
@@ -353,6 +432,12 @@ pub fn toggle_quick(app: &AppHandle, at: Option<(Rect, PhysicalPosition<f64>)>) 
         hide_quick(app);
         return;
     }
+    // 点击托盘本身会让面板失焦并触发收起（记在 blur_hidden_at）；click 事件随后
+    // 到达时若把这次收起当成"面板本来就没开"就会再弹出来 —— 用户点托盘想关
+    // 面板却关了又开。极近时刻的收起视为用户意图，保持隐藏。
+    if quick_recently_blur_hidden(app) {
+        return;
+    }
     let scale = win.scale_factor().unwrap_or(1.0);
     let anchor = at
         .as_ref()
@@ -366,14 +451,16 @@ pub fn toggle_quick(app: &AppHandle, at: Option<(Rect, PhysicalPosition<f64>)>) 
             let _ = win.center();
         }
     }
-    // 每次重新显示都重置"曾获得焦点"标记，否则上一轮的状态会让本次弹出被误收起
-    set_quick_focus_seen(app, false);
+    // 必须在 show **之前**重置：show 的同步消息里就会到达 Focused(true)，
+    // 重置放后面会把那个 true 擦掉，导致之后任何失焦都收不掉面板
+    set_quick_shown_now(app);
     let _ = win.show();
     let _ = win.set_focus();
     // 面板里的状态也需要是最新的
-    if let Some(state) = app.try_state::<AppState>() {
+    if let Some(state) = app.try_state::<SharedState>() {
         state.clear_warn_unread();
     }
+    let _ = app.emit("sunet://quick-shown", ());
     refresh(app);
 }
 
@@ -390,12 +477,14 @@ pub fn show_quick_anchored(app: &AppHandle) {
             let _ = win.center();
         }
     }
-    set_quick_focus_seen(app, false);
+    // 必须在 show **之前**重置（理由同 toggle_quick）
+    set_quick_shown_now(app);
     let _ = win.show();
     let _ = win.set_focus();
     // 面板是常驻窗口：失焦只隐藏、不重建，WebView 里的状态不会自己变新。
     // 每次唤出都让前端重新拉一次状态，避免面板显示上一个方案 / 旧代理状态。
     crate::cmd::emit_refresh(app);
+    let _ = app.emit("sunet://quick-shown", ());
     refresh(app);
 }
 
@@ -637,7 +726,7 @@ pub fn status_with(
     proxy: Option<ProxyState>,
 ) -> TrayStatus {
     let mut out = TrayStatus::default();
-    if let Some(state) = app.try_state::<AppState>() {
+    if let Some(state) = app.try_state::<SharedState>() {
         if let Ok(cfg) = state.cfg_clone() {
             out.profile_name = cfg.active_profile().map(|p| p.name.clone());
             out.autostart_enabled = cfg.settings.autostart.enabled;
@@ -729,7 +818,7 @@ pub fn dns_summary_of(state: &crate::os::dns_client::DnsState) -> (String, Strin
 
 /// 写入运行时 DNS 摘要（真实状态缓存，供托盘 tooltip 显示）
 pub fn remember_dns(app: &AppHandle, alias: &str) {
-    let Some(state) = app.try_state::<AppState>() else {
+    let Some(state) = app.try_state::<SharedState>() else {
         return;
     };
     if let Ok(d) = crate::os::dns_client::get(alias) {

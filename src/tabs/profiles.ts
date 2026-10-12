@@ -80,7 +80,7 @@ export async function renderProfiles(root: HTMLElement, ctx: TabCtx): Promise<vo
             proxyView.state.pac_present
               ? "PAC 接管中（手动代理不生效）"
               : proxyOn
-                ? // 逐协议列出：macOS 三个开关互相独立，可以同时开着且各指一个地址，
+                ? // 逐协议列出：两平台的三个协议都互相独立，可以同时开着且各指一个地址，
                   // 只报 `server`（第一个开着的）会漏掉另外两个
                   proxyEndpoints(proxyView.state)
                     .map(
@@ -268,7 +268,7 @@ export async function renderProfiles(root: HTMLElement, ctx: TabCtx): Promise<vo
   root.querySelector("#pf-proxy-switch")?.addEventListener("change", async (e) => {
     const box = e.target as HTMLInputElement;
     const wantOn = box.checked;
-    // 三个协议任一配好就能开（macOS 可以只配 HTTPS / SOCKS；Windows 只有 HTTP 这一项）
+    // 三个协议任一配好就能开（只配 HTTPS / SOCKS 也算配好了）
     const anyEp = active
       ? (active.proxy_host.trim() !== "" && active.proxy_port > 0) ||
         (active.proxy_https_host.trim() !== "" && active.proxy_https_port > 0) ||
@@ -282,7 +282,7 @@ export async function renderProfiles(root: HTMLElement, ctx: TabCtx): Promise<vo
     }
     const ok = await ui.elevationNotice(os.PROXY_SWITCH_NOTICE, os.PROXY_NEEDS_ADMIN);
     if (!ok) return;
-    // 逐协议落点：只有 macOS 会让用户填 HTTPS / SOCKS，Windows 侧这两个字段恒为空
+    // 逐协议落点：留空 = 关闭该协议
     const ep = (host: string, port: number) =>
       host.trim() && port > 0 ? { host: host.trim(), port } : undefined;
     try {
@@ -426,7 +426,7 @@ async function profileEditor(
         host: "127.0.0.1",
         port: 7890,
         bypass: "localhost;127.*;<local>",
-        // 逐协议代理（macOS）：默认留空 = 不开启这两个协议，与 ≤ 0.0.2 只写 HTTP 一致
+        // 逐协议代理：默认留空 = 不开启这两个协议，与 ≤ 0.0.2 只写 HTTP 一致
         https_host: "",
         https_port: 0,
         socks_host: "",
@@ -479,17 +479,13 @@ async function profileEditor(
       <span>HTTP 端口</span><input type="number" id="pe-proxy-port" value="${draft.proxy.port}" min="1" max="65535" style="width:120px" />
       <span>绕过列表</span><input type="text" id="pe-proxy-bypass" value="${ui.esc(draft.proxy.bypass)}" />
     </div>
-    ${
-      os.IS_MACOS
-        ? `<div class="field-grid" style="margin-top:8px">
+    <div class="field-grid" style="margin-top:8px">
       <span>HTTPS 代理</span><input type="text" id="pe-proxy-https-host" value="${ui.esc(draft.proxy.https_host)}" placeholder="留空 = 不启用" />
       <span>HTTPS 端口</span><input type="number" id="pe-proxy-https-port" value="${draft.proxy.https_port || ""}" min="1" max="65535" style="width:120px" placeholder="端口" />
       <span>SOCKS 代理</span><input type="text" id="pe-proxy-socks-host" value="${ui.esc(draft.proxy.socks_host)}" placeholder="留空 = 不启用" />
       <span>SOCKS 端口</span><input type="number" id="pe-proxy-socks-port" value="${draft.proxy.socks_port || ""}" min="1" max="65535" style="width:120px" placeholder="端口" />
     </div>
-    <p class="hint" style="margin-top:6px">${os.PROXY_PROFILE_HINT}</p>`
-        : ""
-    }
+    <p class="hint" style="margin-top:6px">${os.PROXY_PROFILE_HINT}</p>
 
     <div class="section-title">系统 DNS</div>
     <div class="actions">
@@ -548,7 +544,7 @@ async function profileEditor(
   `;
 
   const q = <T extends HTMLElement>(sel: string) => box.querySelector(sel) as T;
-  // 可选字段读取器：非 macOS 平台不渲染 HTTPS/SOCKS 输入框，取不到元素时回落到 draft 原值。
+  // 可选字段读取器：取不到元素时回落到 draft 原值（防御旧模板分叉）。
   const optVal = (sel: string) => (box.querySelector(sel) as HTMLInputElement | null)?.value.trim() ?? null;
   const optNum = (sel: string) => {
     const el = box.querySelector(sel) as HTMLInputElement | null;
@@ -649,7 +645,7 @@ async function profileEditor(
         host: q<HTMLInputElement>("#pe-proxy-host").value.trim(),
         port: Number(q<HTMLInputElement>("#pe-proxy-port").value || 0),
         bypass: q<HTMLInputElement>("#pe-proxy-bypass").value.trim(),
-        // 逐协议字段只在 macOS 的编辑器里存在；Windows 保留原值（不显示 = 不改动）
+        // 逐协议字段：编辑器里渲染了就读用户输入，理论上读不到才保留原值
         https_host: optVal("#pe-proxy-https-host") ?? draft.proxy.https_host,
         https_port: optNum("#pe-proxy-https-port") ?? draft.proxy.https_port,
         socks_host: optVal("#pe-proxy-socks-host") ?? draft.proxy.socks_host,

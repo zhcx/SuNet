@@ -134,7 +134,7 @@ pub struct ProfileProxy {
     pub host: String,
     pub port: u16,
     pub bypass: String,
-    /// HTTPS 代理地址（macOS 把三个协议当独立开关；Windows 用不上 → 界面不显示）
+    /// HTTPS 代理地址（两平台都逐协议配置；写入形式由各平台 system_proxy 解释）
     pub https_host: String,
     pub https_port: u16,
     /// SOCKS 代理地址
@@ -145,7 +145,7 @@ pub struct ProfileProxy {
 impl ProfileProxy {
     /// 有没有任何一个协议配好了（HTTP 或 HTTPS / SOCKS）——
     /// 决定“一键开代理”（托盘 / 快捷面板 / 方案开关）能不能用：
-    /// macOS 三个协议都是可选的，只配了 HTTPS / SOCKS 也算配好了。
+    /// 三个协议都是可选的，只配了 HTTPS / SOCKS 也算配好了。
     pub fn any_endpoint(&self) -> bool {
         (!self.host.trim().is_empty() && self.port > 0)
             || self.https_endpoint().is_some()

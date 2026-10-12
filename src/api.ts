@@ -64,7 +64,8 @@ export interface ProxyState {
   bypass: string;
   autoconfig_url?: string | null;
   pac_present: boolean;
-  /** 逐协议落点（`host:port`）：只有 macOS 有这三个字段，未开启 / 未回读时为 null */
+  /** 逐协议落点（`host:port`）：Windows 从 `ProxyServer` 分段解析而来（裸 `host:port` 记为 HTTP），
+   * macOS 从各服务的逐协议开关回读；未开启 / 未回读时为 null */
   http_proxy?: string | null;
   https_proxy?: string | null;
   socks_proxy?: string | null;
@@ -82,7 +83,7 @@ export interface ProxyEndpoint {
  * macOS 的三个协议是互相独立的开关，可以同时开着且各指一个地址；界面要**逐项**
  * 显示，否则用户会以为只走了一个代理（旧版只显示 `server`，另两个完全不可见）。
  *
- * 老快照 / Windows 的 `ProxyState` 没有这三个字段 —— 退回主落点、不加标签。
+ * 老快照没有这三个字段 —— 退回主落点、不加标签。
  * 快捷面板、主窗口系统代理页、方案总览页三处共用，口径必须一致。
  */
 export function proxyEndpoints(st: ProxyState): { label: string; addr: string }[] {

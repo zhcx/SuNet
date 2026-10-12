@@ -533,7 +533,7 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Internet Settings
 | 值名 | 类型 | 含义 |
 |---|---|---|
 | `ProxyEnable` | `REG_DWORD` | `1` 启用 / `0` 关闭 |
-| `ProxyServer` | `REG_SZ` | 形如 `127.0.0.1:7890` 或 `http=127.0.0.1:7890;https=127.0.0.1:7890` |
+| `ProxyServer` | `REG_SZ` | 形如 `127.0.0.1:7890` 或 `http=127.0.0.1:7890;https=127.0.0.1:7890`；逐协议分段里 SOCKS 的段名是 `socks=`（与系统代理设置里 SOCKS 一项同款写法） |
 | `ProxyOverride` | `REG_SZ` | 绕过列表，默认 `localhost;127.*;<local>` |
 | `AutoConfigURL` | `REG_SZ` | PAC 地址。**存在时优先级高于手动代理** |
 

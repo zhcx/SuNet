@@ -9,7 +9,7 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
   const view: ProxyView = await api.proxyGet();
   const st = view.state;
   const last = readLastForm();
-  // 逐协议落点：三个协议都**可选**（留空 = 关闭该协议，macOS 三个开关互相独立），至少要填一个
+  // 逐协议落点：三个协议都**可选**（留空 = 关闭该协议，两平台三个开关互相独立），至少要填一个
   const splitEp = (v?: string | null) => {
     if (!v) return { host: "", port: "" };
     const i = v.lastIndexOf(":");
@@ -47,10 +47,10 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
         </div>
       </div>
 
-      ${os.IS_MACOS ? `<div class="field-grid">
+      ${true ? `<div class="field-grid">
         <span>HTTP 代理</span>
         <div style="display:flex;gap:8px">
-          <input type="text" id="px-host" value="${ui.esc(host)}" placeholder="留空 = 不启用" />
+          <input type="text" id="px-host" value="${ui.esc(host)}" placeholder="${os.IS_MACOS ? "留空 = 不启用" : "127.0.0.1 或 proxy.local"}" />
           <input type="number" id="px-port" min="1" max="65535" value="${ui.esc(port)}" placeholder="7890" style="width:120px" />
         </div>
         <span>HTTPS 代理</span>
@@ -65,14 +65,7 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
         </div>
         <span>绕过列表</span>
         <input type="text" id="px-bypass" value="${ui.esc(bypass)}" />
-      </div>` : `<div class="field-grid">
-        <span>地址</span>
-        <input type="text" id="px-host" value="${ui.esc(host)}" placeholder="127.0.0.1 或 proxy.local" />
-        <span>端口</span>
-        <input type="number" id="px-port" min="1" max="65535" value="${ui.esc(port)}" placeholder="7890" style="width:120px" />
-        <span>绕过列表</span>
-        <input type="text" id="px-bypass" value="${ui.esc(bypass)}" />
-      </div>`}
+      </div>` : ""}
 
       <div style="margin:12px 0">
         <label class="row"><input type="checkbox" id="px-probe" ${view.probe_before_enable ? "checked" : ""} />
@@ -146,7 +139,7 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
     )}</div>${ui.stepsHtml(report.steps)}`;
   };
 
-  // 地址与端口都为空 = 该协议不启用；Windows 分支没有这两个输入框，读不到就是 undefined
+  // 地址与端口都为空 = 该协议不启用（读不到元素时兜底为 undefined）
   const ep = (hSel: string, pSel: string) => {
     const h = (root.querySelector(hSel) as HTMLInputElement | null)?.value.trim() ?? "";
     const p = Number((root.querySelector(pSel) as HTMLInputElement | null)?.value || 0);
@@ -183,16 +176,13 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
   root.querySelector("#px-enable")?.addEventListener("click", async () => {
     const cfg = config();
     saveForm();
-    // HTTP 也是可选的（macOS 三个协议互相独立）；Windows 分支没有 HTTPS / SOCKS 输入框，
-    // 而且那边只有 HTTP 一项 —— 留空就等于什么都不写，所以仍按必填拦下
+    // HTTP 也是可选的：留空 = 关闭该协议（两平台的三个协议互相独立）
     const http = cfg.host || cfg.port ? { host: cfg.host, port: cfg.port } : undefined;
-    const pairs: Array<[string, { host: string; port: number } | undefined]> = os.IS_MACOS
-      ? [
-          ["HTTP", http],
-          ["HTTPS", cfg.https],
-          ["SOCKS", cfg.socks],
-        ]
-      : [["HTTP", http]];
+    const pairs: Array<[string, { host: string; port: number } | undefined]> = [
+      ["HTTP", http],
+      ["HTTPS", cfg.https],
+      ["SOCKS", cfg.socks],
+    ];
     // 逐协议成对校验：只填一半会让"这个协议到底开不开"变得含糊
     const half = pairs.find(([, e]) => e && (!e.host || !e.port));
     if (half) {
@@ -202,8 +192,8 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
     if (!pairs.some(([, e]) => e)) {
       ui.toast(
         "error",
-        os.IS_MACOS ? "至少填写一个代理协议" : "请先填写地址与端口",
-        os.IS_MACOS ? "HTTP / HTTPS / SOCKS 三个都留空 = 不开代理" : "端口范围 1–65535",
+        "至少填写一个代理协议",
+        "HTTP / HTTPS / SOCKS 三个都留空 = 不开代理",
       );
       return;
     }

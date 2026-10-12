@@ -22,6 +22,8 @@ const esc = ui.esc;
 
 let state: AppStateView | null = null;
 let busy = false;
+/** 面板本次显示的时刻：blur 收起要忽略弹出瞬间的加载/激活抖动 */
+let shownAt = Date.now();
 
 export async function bootQuick(): Promise<void> {
   os.markPlatform();
@@ -38,6 +40,23 @@ export async function bootQuick(): Promise<void> {
   // 面板被反复唤出（失焦只隐藏），每次弹出都重新拉状态，
   // 否则设置改动、方案删除、主窗口里的操作都可能在面板上留下陈旧显示。
   await listen("sunet://refresh", () => void refresh());
+  // 每次弹出都重置失焦宽限计时：后端 show 时会发 quick-shown；
+  // 这里再以 WebView 的可见性变化兜底（事件可能在页面就绪前发出而丢失）
+  await listen("sunet://quick-shown", () => {
+    shownAt = Date.now();
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") shownAt = Date.now();
+  });
+
+  // 点到面板以外就收起（Windows 系统代理面板的标准交互）：
+  // 顶层窗口的失焦事件在 WebView2 里会丢（tao 的激活/键盘焦点状态机被
+  // WebView2 抢焦点打乱），浏览器标准的 window blur 是可靠信号。
+  // 刚弹出的 ~1 秒里有加载/激活抖动引起的 blur，按时间阈值忽略。
+  window.addEventListener("blur", () => {
+    if (Date.now() - shownAt < 1000) return;
+    void api.quickHide();
+  });
 
   document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") void api.quickHide();
@@ -240,17 +259,17 @@ function notes(): string {
  * 只走了一个代理，其实系统里还挂着两个。
  *
  * 开着时一律以**系统回读**为准（真实生效的才是该显示的）；只有回读拿不到逐协议
- * 信息时（老快照 / Windows 的 `ProxyState` 没有这三个字段）才退回主落点。
+ * 信息时（老快照）才退回主落点。
  */
 function proxyRows(v: View): { label: string; addr: string }[] {
   if (!v.proxyOn) return [];
 
   // 开着时以系统回读为准（真实生效的才是该显示的）；`proxyEndpoints` 负责逐协议过滤，
-  // 回读拿不到逐协议信息时（老快照 / Windows）它自己会退回主落点。
+  // 回读拿不到逐协议信息时（老快照）它自己会退回主落点。
   const live = proxyEndpoints(state!.proxy);
   if (live.length) return live;
 
-  // 没有逐协议信息：退回主落点（老快照 / Windows）
+  // 没有逐协议信息：退回主落点（老快照）
   const main = state!.proxy.server.trim();
   if (main) return [{ label: "", addr: main }];
 
@@ -572,7 +591,7 @@ function activeProxy(): {
 } | null {
   const p = activeProfile();
   if (!p) return null;
-  // 逐协议落点：只有 macOS 的方案会填这两项，Windows 侧恒为空（后端也只在 macOS 消费）
+  // 逐协议落点：方案编辑器里填了就发（两平台都逐协议配置，写入形式由后端按平台解释）
   const ep = (host: string, port: number) =>
     host.trim() && port > 0 ? { host: host.trim(), port } : undefined;
   const https = ep(p.proxy_https_host, p.proxy_https_port);

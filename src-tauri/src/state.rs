@@ -57,11 +57,21 @@ pub struct RuntimeStatus {
     /// 用户看不到操作结果）
     #[serde(skip)]
     pub quick_pinned: bool,
-    /// 面板自上次显示以来是否真的获得过焦点。
-    /// 窗口刚 show 出来时系统可能立即投递一次失焦事件（启动竞态），
-    /// 若无条件收起，面板会在弹出的瞬间消失 —— 表现为"点托盘没反应"。
+    /// 面板本次显示的时刻：show 后短窗口内（约几百毫秒）系统会投递一次
+    /// 竞态失焦（显示瞬间的激活抖动），按时间阈值忽略。
+    #[serde(skip)]
+    pub quick_shown_at: Option<Instant>,
+    /// 面板本次显示以来是否真的获得过焦点。**冷启动 / 后台弹出时
+    /// `SetForegroundWindow` 可能被前台锁定拒绝** —— 面板看得见却从未激活，
+    /// 之后任何失焦（WebView2 就绪、别的窗口激活）都不该把它收掉；
+    /// 只有真的拿到过焦点，"点到别处收起"才成立。
     #[serde(skip)]
     pub quick_focus_seen: bool,
+    /// 面板最近一次因失焦被收起的时刻：托盘左键点击既会让面板失焦（触发
+    /// 收起）又会到达 toggle —— 若不认得"刚被失焦收起"，toggle 会把它
+    /// 当成"面板本来就没开"再弹出来，表现为点托盘关不上。
+    #[serde(skip)]
+    pub quick_blur_hidden_at: Option<Instant>,
 }
 
 impl RuntimeStatus {

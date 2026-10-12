@@ -105,16 +105,6 @@ mod imp {
         }
     }
 
-    /// 通道健康度：ok（装好且可用）/ missing（未安装）。
-    /// Windows 计划任务没有「装了没跑起来」这个状态。
-    pub fn health() -> &'static str {
-        if usable() {
-            "ok"
-        } else {
-            "missing"
-        }
-    }
-
     /// 切换后是否提示"装一次就不用再输密码"。
     ///
     /// Windows 返回 `None`：静默通道等价于"一次授权、长期有效"（见模块头「安全边界」），

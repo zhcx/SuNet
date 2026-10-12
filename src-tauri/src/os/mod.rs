@@ -41,9 +41,13 @@ use serde::{Deserialize, Serialize};
 /// 落点，所以这里逐协议给值：`None`（或空串）表示**显式关闭该协议**——不是"保持原样"，
 /// 用户把 HTTPS 那一行的地址清空就是要关掉它。
 ///
-/// Windows 的 WinINET 只有一个 `ProxyServer` 值（支持 `http=` / `https=` / `socks=`
-/// 分段语法，但本工具维持单一落点写 `http`），因此 Windows 只读 [`ManualProxy::http`]，
-/// 另外两项忽略——「HTTP 代理与 HTTPS 代理分开配」这件事只有 macOS 需要。
+/// Windows 的 WinINET 用一个 `ProxyServer` 值承载全部协议（分段语法
+/// `http=…;https=…;socks=…`，即系统代理设置里逐协议填地址的写法；`socks=` 是
+/// 系统对 SOCKS 的原生段名），因此 Windows 对 [`ManualProxy::https`] / [`ManualProxy::socks`]
+/// 与 macOS 同语义：有值就编进对应段，`None` = 关闭该协议——
+/// 「HTTP 代理与 HTTPS / SOCKS 代理分开配」在两平台上都成立。
+/// 只有 HTTP 一个落点时 Windows 仍写裸 `host:port`（与 0.0.1 起的单一落点一致，
+/// 旧版还原与第三方工具都认这个形态）。
 ///
 /// `enable = false` 时三个落点全部忽略：语义是"关掉所有协议"，
 /// **必须把三项残留一起清掉**（0.0.2 及更早的 macOS 版本会把 HTTPS / SOCKS
@@ -57,7 +61,7 @@ use serde::{Deserialize, Serialize};
 pub struct ManualProxy {
     /// 总开关；false = 关闭全部协议（三协议的落点都不看）
     pub enable: bool,
-    /// HTTP 落点 `host:port`（macOS 的必填主落点；提权载荷里叫 `server`）
+    /// HTTP 落点 `host:port`（提权载荷里叫 `server`；留空 = 关闭该协议）
     #[serde(rename = "server")]
     pub http: String,
     /// HTTPS 落点 `host:port`；`None` = 关闭该协议
@@ -82,7 +86,7 @@ impl ManualProxy {
         }
     }
 
-    /// 只有 HTTP 一个落点（Windows 的唯一形态；macOS 的「只写 HTTP」也走它）
+    /// 只有 HTTP 一个落点（macOS 的「只写 HTTP」与 Windows 的传统单落点形态）
     ///
     /// 仅测试构造用：生产路径由 `apply.rs` 的 `prepare_proxy` 逐项拼装载荷，
     /// 没有"只可能是 HTTP"的调用点，标 `cfg(test)` 免得在 release 里变成死代码。
