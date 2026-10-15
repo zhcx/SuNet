@@ -30,29 +30,38 @@ pub async fn profile_save(
     let s: Arc<_> = state.inner().clone();
     let list = crate::cmd::blocking(move || {
         s.assert_writable()?;
-        let mut p = profile;
-        if p.name.trim().is_empty() {
-            return Err(AppError::internal("方案名称不能为空"));
-        }
-        if p.id.trim().is_empty() {
-            p.id = uuid::Uuid::new_v4().to_string();
-        }
-        if p.is_builtin {
-            return Err(AppError::internal("内置方案不可修改"));
-        }
-        s.with_cfg_mut(|c| {
-            match c.profiles.iter_mut().find(|x| x.id == p.id) {
-                Some(slot) => *slot = p.clone(),
-                None => c.profiles.push(p.clone()),
-            }
-            Ok(())
-        })?;
+        s.with_cfg_mut(|c| save_profile_in_config(c, profile))?;
         s.save_cfg()?;
         Ok(s.cfg_clone()?.profiles)
     })
     .await?;
     crate::cmd::after_change(&app);
     Ok(list)
+}
+
+fn save_profile_in_config(c: &mut crate::config::Config, mut p: Profile) -> Result<()> {
+    // 内置身份以已存 ID 为准，不能让客户端清掉 is_builtin 绕过保护。
+    if p.id == crate::config::BUILTIN_PROFILE_ID
+        || c.profile(&p.id).is_some_and(|saved| saved.is_builtin)
+    {
+        let mut direct = crate::config::builtin_profile();
+        direct.hosts = p.hosts;
+        direct.hosts.enabled = true;
+        p = direct;
+    } else if p.is_builtin {
+        return Err(AppError::internal("不可新增内置方案"));
+    }
+    if p.name.trim().is_empty() {
+        return Err(AppError::internal("方案名称不能为空"));
+    }
+    if p.id.trim().is_empty() {
+        p.id = uuid::Uuid::new_v4().to_string();
+    }
+    match c.profiles.iter_mut().find(|x| x.id == p.id) {
+        Some(slot) => *slot = p.clone(),
+        None => c.profiles.push(p.clone()),
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -317,6 +326,46 @@ fn toggle_direct(state: &crate::state::AppState) -> Result<ToggleDirect> {
 mod tests {
     use super::*;
     use crate::config::{Config, Profile, ProfileDns, ProfileHosts, ProfileProxy};
+
+    #[test]
+    fn builtin_hosts_can_be_saved_and_resolved_after_reload() {
+        let mut cfg = Config::default();
+        let mut p = cfg.profiles[0].clone();
+        p.hosts.source_ids = vec!["src-github".into()];
+        cfg.source_entries.push(crate::config::SourceEntries {
+            source_id: "src-github".into(),
+            entries: vec![crate::os::hosts_file::HostsEntry::new(
+                "1.1.1.1",
+                "example.com",
+            )],
+            ..Default::default()
+        });
+        save_profile_in_config(&mut cfg, p).unwrap();
+        let reloaded: Config = serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        let saved = reloaded.profile(crate::config::BUILTIN_PROFILE_ID).unwrap();
+        let targets = apply::build_targets(&reloaded, saved);
+        assert_eq!(targets.hosts.unwrap()[0].hostname, "example.com");
+        assert!(!targets.proxy.unwrap().enable);
+        assert_eq!(targets.dns.unwrap().v4, Some(vec![]));
+    }
+
+    #[test]
+    fn builtin_identity_cannot_be_bypassed_by_clearing_flag() {
+        let mut cfg = Config::default();
+        let mut p = cfg.profiles[0].clone();
+        p.is_builtin = false;
+        p.name = "改名".into();
+        p.hosts.enabled = false;
+        p.proxy.enabled = true;
+        p.dns.mode = "manual".into();
+        save_profile_in_config(&mut cfg, p).unwrap();
+        let saved = &cfg.profiles[0];
+        assert!(saved.is_builtin);
+        assert_eq!(saved.name, "默认 · 直连");
+        assert!(saved.hosts.enabled);
+        assert!(!saved.proxy.enabled);
+        assert_eq!(saved.dns.mode, "dhcp");
+    }
 
     fn profile_with(id: &str) -> Profile {
         Profile {

@@ -1,7 +1,7 @@
 // 速网 SuNet 前端入口：外壳、路由、状态栏、事件桥
 
 import { listen } from "@tauri-apps/api/event";
-import { api, errText, type AppStateView, type Settings } from "./api";
+import { api, errText, proxyEndpoints, type AppStateView, type Settings } from "./api";
 import * as ui from "./ui";
 import { initTheme, onThemeChange } from "./theme";
 import { icon } from "./icons";
@@ -151,13 +151,16 @@ function renderFooter(): void {
   hosts.onclick = () => void navigate("hosts");
 
   const proxy = h("status-proxy");
-  proxy.innerHTML = `${ic("proxy", 14)}${
-    proxyOn
-      ? `代理 ${state.proxy.server || "已开启"}`
-      : state.proxy.pac_present
-        ? "代理 PAC 接管"
-        : "代理 关闭"
-  }`;
+  const endpoints = proxyEndpoints(state.proxy);
+  const summary = endpoints.length === 1 && endpoints[0].addr.length <= 48
+    ? `${endpoints[0].label} ${endpoints[0].addr}`
+    : endpoints.map((e) => e.label).join(" / ") || "已开启";
+  // 底栏只给摘要，完整地址放在提示和代理页，不能由原始分段串撑高整栏。
+  proxy.innerHTML = ic("proxy", 14);
+  proxy.append(document.createTextNode(proxyOn ? `代理 ${summary}` : state.proxy.pac_present ? "代理 PAC 接管" : "代理 关闭"));
+  proxy.title = proxyOn
+    ? endpoints.map((e) => `${e.label} ${e.addr}`).join("\n")
+    : "去代理页";
   proxy.className = `status-item ${proxyOn ? "on" : state.proxy.pac_present ? "warn" : "faint"}`;
   proxy.onclick = () => void navigate("proxy");
 
@@ -174,12 +177,15 @@ function renderFooter(): void {
   restore.disabled = !!state.read_only;
 }
 
+let renderGeneration = 0;
+
 async function renderActiveTab(): Promise<void> {
+  const generation = ++renderGeneration;
   // 启动初期的竞态：状态还没回来时点标签，不能再静默吞掉（否则表现为"点了没反应"），
   // 等一次状态刷新后继续渲染
   if (!state) {
     await refreshState();
-    if (!state) return;
+    if (!state || generation !== renderGeneration) return;
   }
   const view = h("view");
   const tab = TABS.find((t) => t.id === activeTab) ?? TABS[0];
@@ -198,13 +204,17 @@ async function renderActiveTab(): Promise<void> {
     openSettings: openSettingsModal,
     navigate: (t) => navigate(t),
   };
+  // 每次先在独立容器渲染。较慢的旧请求只能改它自己的容器，不能覆盖后来选中的标签页。
+  const content = document.createElement("div");
   try {
-    await tab.render(view, ctx);
+    await tab.render(content, ctx);
   } catch (e) {
-    view.innerHTML = `<div class="card"><h2>加载失败</h2><div class="error-text">${ui.esc(
+    content.innerHTML = `<div class="card"><h2>加载失败</h2><div class="error-text">${ui.esc(
       errText(e),
     )}</div></div>`;
   }
+  if (generation !== renderGeneration) return;
+  view.replaceChildren(content);
   if (keepScroll && view.scrollTop !== keepScroll) {
     // 临时关掉平滑滚动，否则恢复位置会被动画成"自己滑一下"
     const prev = view.style.scrollBehavior;
@@ -243,6 +253,7 @@ function renderTabs(): void {
 async function navigate(tab: string): Promise<void> {
   if (!TABS.some((t) => t.id === tab)) return;
   activeTab = tab;
+  renderTabs();
   await renderActiveTab();
 }
 

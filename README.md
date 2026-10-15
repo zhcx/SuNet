@@ -62,6 +62,21 @@ npm run tauri -- build -- --target x86_64-apple-darwin --bundles dmg    # Intel 
 ```
 
 需要 Node 22+ 与 stable Rust 工具链；dev server 用 **5180** 端口（不是 Tauri 默认的 5173）。
+
+默认直连方案可在「方案 → 默认 · 直连 → 编辑 hosts / 订阅」中勾选条目及订阅源，
+保存后切换到此方案应用。新增订阅需先在 Hosts 页添加、同步并确认变更；默认方案仍关闭代理、DNS 自动获取。
+
+回归检查（PowerShell，在项目根目录执行）：
+
+```powershell
+npm run check
+npm test
+npm run test:ui
+cargo test --locked --manifest-path src-tauri/Cargo.toml
+```
+
+浏览器测试会自行启动独立的 5181 端口服务，模拟应用命令，不修改系统网络配置。
+Windows 默认使用已安装的 Edge；其他平台默认使用 Chrome，可用 `$env:SUNET_TEST_BROWSER = 'chrome'` 指定浏览器通道。
 两个平台的平台层代码是分开的（`src-tauri/src/os/windows` 与 `os/macos`），
 所以**在哪个平台构建就只能跑那个平台的功能**。
 

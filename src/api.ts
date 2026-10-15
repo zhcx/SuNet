@@ -98,7 +98,21 @@ export function proxyEndpoints(st: ProxyState): { label: string; addr: string }[
     .map(([label, addr]) => ({ label, addr: addr.trim() }));
   if (live.length) return live;
   const main = (st.server || "").trim();
-  return main ? [{ label: "", addr: main }] : [];
+  if (!main) return [];
+  // 旧版只有原始 ProxyServer；先分协议再拆地址，避免把 socks= 当成主机名。
+  if (!main.includes("=")) return [{ label: "HTTP", addr: main }];
+  const segments = new Map<string, string>();
+  for (const segment of main.split(";")) {
+    const i = segment.indexOf("=");
+    if (i < 0) continue;
+    const scheme = segment.slice(0, i).trim().toLowerCase();
+    const label = ({ http: "HTTP", https: "HTTPS", socks: "SOCKS", socks5: "SOCKS" } as Record<string, string>)[scheme];
+    const addr = segment.slice(i + 1).trim();
+    if (label && addr) segments.set(label, addr);
+  }
+  return ["HTTP", "HTTPS", "SOCKS"]
+    .filter((label) => segments.has(label))
+    .map((label) => ({ label, addr: segments.get(label)! }));
 }
 
 /** 往一个容器里写逐协议落点（每协议一行，协议名当标签）。

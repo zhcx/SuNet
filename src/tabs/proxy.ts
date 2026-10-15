@@ -15,12 +15,12 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
     const i = v.lastIndexOf(":");
     return i <= 0 ? { host: v, port: "" } : { host: v.slice(0, i), port: v.slice(i + 1) };
   };
-  // 老状态（≤ 0.0.2）只记了一个主落点，那时它就是 HTTP；新状态逐协议记录 ——
-  // HTTP 留空就是"没开 HTTP"，**不能**拿 `server` 顶上（那时它可能是 HTTPS / SOCKS 的落点）
-  const legacy = !st.http_proxy && !st.https_proxy && !st.socks_proxy;
-  const http0 = splitEp(st.http_proxy ?? (legacy ? st.server : ""));
-  const https0 = splitEp(st.https_proxy);
-  const socks0 = splitEp(st.socks_proxy);
+  // 兼容旧版只记录原始 ProxyServer 的状态；先按协议解析，再拆地址与端口。
+  // SOCKS / HTTPS 的落点不能回填到 HTTP，也不能把 socks= 前缀当成主机名。
+  const endpoints = proxyEndpoints(st);
+  const http0 = splitEp(endpoints.find((e) => e.label === "HTTP")?.addr);
+  const https0 = splitEp(endpoints.find((e) => e.label === "HTTPS")?.addr);
+  const socks0 = splitEp(endpoints.find((e) => e.label === "SOCKS")?.addr);
   const host = last.host ?? http0.host;
   const port = last.port ?? http0.port;
   const httpsHost = last.https_host ?? https0.host;
@@ -130,6 +130,7 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
   renderState(view);
 
   const showReport = (report: import("../api").ApplyReport) => {
+    lastReport = report;
     const box = root.querySelector("#px-report") as HTMLElement;
     const body = root.querySelector("#px-report-body") as HTMLElement;
     box.hidden = false;
@@ -138,6 +139,7 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
       report.message,
     )}</div>${ui.stepsHtml(report.steps)}`;
   };
+  if (lastReport) showReport(lastReport);
 
   // 地址与端口都为空 = 该协议不启用（读不到元素时兜底为 undefined）
   const ep = (hSel: string, pSel: string) => {
@@ -173,7 +175,12 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
     });
   };
 
+  root.querySelectorAll<HTMLInputElement>(".field-grid input").forEach((input) => {
+    input.addEventListener("input", saveForm);
+  });
+
   root.querySelector("#px-enable")?.addEventListener("click", async () => {
+    if (enabling) return;
     const cfg = config();
     saveForm();
     // HTTP 也是可选的：留空 = 关闭该协议（两平台的三个协议互相独立）
@@ -198,13 +205,17 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
       return;
     }
     const probe = (root.querySelector("#px-probe") as HTMLInputElement).checked;
-    const okElev = await ui.elevationNotice("即将开启系统代理", false);
-    if (!okElev) return;
-    patchSettings(ctx, { proxy_probe_before_enable: probe });
+    enabling = true;
+    const button = root.querySelector<HTMLButtonElement>("#px-enable")!;
+    button.disabled = true;
+    button.textContent = "正在应用…";
     try {
+      const okElev = await ui.elevationNotice("即将开启系统代理", false);
+      if (!okElev) return;
+      patchSettings(ctx, { proxy_probe_before_enable: probe });
       const r = await api.proxySet(cfg, probe);
       showReport(r);
-      if (!r.ok) {
+      if (!r.ok && r.steps.some((step) => step.message.includes("[E3001]"))) {
         // 探测失败：给出"仍然开启"的明确出口（高级用户，明确知情）
         const reason = r.steps.map((s) => s.message).join("\n");
         const force = await ui.confirmModal({
@@ -217,12 +228,16 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
           const r2 = await api.proxySet({ ...cfg, force: true }, false);
           showReport(r2);
         }
-      } else {
+      } else if (r.ok) {
         ui.toast("info", "代理已开启", "Chromium 系应用通常无需重启即生效");
       }
       await ctx.refresh(true);
     } catch (e) {
       ui.toast("error", "开启失败", errText(e));
+    } finally {
+      enabling = false;
+      button.disabled = readonly;
+      button.textContent = "开启代理";
     }
   });
 
@@ -287,6 +302,8 @@ let draft: {
   socks_port?: string;
   bypass?: string;
 } = {};
+let enabling = false;
+let lastReport: import("../api").ApplyReport | null = null;
 
 function readLastForm() {
   return draft;

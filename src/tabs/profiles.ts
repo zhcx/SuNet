@@ -42,7 +42,7 @@ export async function renderProfiles(root: HTMLElement, ctx: TabCtx): Promise<vo
           <h2>${svg("shield", 17)}三层总览</h2>
           <p class="hint">
             当前生效：<b>${active ? ui.esc(active.name) : "未修改系统设置"}</b>　·　
-            托盘图标<b>左键</b>可随时唤出快捷面板（${ui.esc(s.settings.shortcuts.clear_proxy.binding)} 一键清除代理）
+            托盘图标<b>左键</b>可随时唤出快捷面板（${ui.esc(s.settings.shortcuts.clear_proxy.binding)} 切换直连 / 上一方案）
           </p>
         </div>
         <div class="actions">
@@ -183,7 +183,7 @@ export async function renderProfiles(root: HTMLElement, ctx: TabCtx): Promise<vo
         </div>
         <div class="actions">
           <button data-act="apply" class="primary" ${readonly ? "disabled" : ""}>切换到此方案</button>
-          <button data-act="edit" ${readonly || p.is_builtin ? "disabled" : ""}>编辑</button>
+          <button data-act="edit" ${readonly ? "disabled" : ""}>${p.is_builtin ? "编辑 hosts / 订阅" : "编辑"}</button>
           <button data-act="del" class="link danger" ${
             readonly || p.is_builtin ? "disabled" : ""
           }>删除</button>
@@ -408,7 +408,9 @@ async function profileEditor(
   let presets: DnsPreset[] = [];
   let interfaces: import("../api").DnsInterfaceView[] = [];
   try {
-    [presets, interfaces] = await Promise.all([api.dnsPresets(""), api.dnsInterfaces()]);
+    if (!p?.is_builtin) {
+      [presets, interfaces] = await Promise.all([api.dnsPresets(""), api.dnsInterfaces()]);
+    }
   } catch {
     /* 网卡读取失败时仍允许编辑其他项 */
   }
@@ -449,15 +451,15 @@ async function profileEditor(
   // pi-lens-ignore: no-inner-html-js -- 动态内容均经 esc/ui.esc 转义后拼接（项目统一模板写法）
   box.innerHTML += `
     <div class="field-grid">
-      <span>名称</span><input type="text" id="pe-name" value="${ui.esc(draft.name)}" />
-      <span>备注</span><input type="text" id="pe-note" value="${ui.esc(draft.note)}" />
+      <span>名称</span><input type="text" id="pe-name" value="${ui.esc(draft.name)}" ${draft.is_builtin ? "disabled" : ""} />
+      <span>备注</span><input type="text" id="pe-note" value="${ui.esc(draft.note)}" ${draft.is_builtin ? "disabled" : ""} />
     </div>
 
     <div class="section-title">Hosts（托管区块）</div>
     <div class="actions">
       <label class="row"><input type="checkbox" id="pe-hosts-en" ${
         draft.hosts.enabled ? "checked" : ""
-      } /> 该方案管理 hosts 托管区块</label>
+      } ${draft.is_builtin ? "disabled" : ""} /> 该方案管理 hosts 托管区块</label>
       <span class="muted">共 ${hosts.entries.length} 条手工条目可选</span>
       <button id="pe-hosts-all">全选</button>
       <button id="pe-hosts-none">全不选</button>
@@ -467,7 +469,9 @@ async function profileEditor(
     </div>
     ${sources.length ? `<div style="margin-top:8px"><span class="muted">订阅源：</span></div>` : ""}
     <div id="pe-sources"></div>
+    <p class="hint">${draft.is_builtin ? "默认直连可保留选中的 hosts 和订阅，系统代理保持关闭、DNS 自动获取。" : ""}保存后切换到此方案生效；新增订阅请到 Hosts 页添加并同步。</p>
 
+    <div ${draft.is_builtin ? "hidden" : ""}>
     <div class="section-title">系统代理</div>
     <div class="actions">
       <label class="row"><input type="checkbox" id="pe-proxy-en" ${
@@ -539,6 +543,7 @@ async function profileEditor(
       )}" /></label>
     </div>
     <p class="hint">取消勾选某地址族 = 切换时该族还原为自动获取（不留隐性残留）。</p>
+    </div>
     <div id="pe-err" class="error-text"></div>
     <div class="modal-actions"><button id="pe-cancel">取消</button><button class="primary" id="pe-save">保存</button></div>
   `;
@@ -548,7 +553,7 @@ async function profileEditor(
   const optVal = (sel: string) => (box.querySelector(sel) as HTMLInputElement | null)?.value.trim() ?? null;
   const optNum = (sel: string) => {
     const el = box.querySelector(sel) as HTMLInputElement | null;
-    return el && el.value.trim() ? Number(el.value) : null;
+    return el ? Number(el.value || 0) : null;
   };
   const selectedHosts = new Set(draft.hosts.entry_ids);
   const selectedSources = new Set(draft.hosts.source_ids);

@@ -406,7 +406,9 @@ pub fn apply(state: &AppState, targets: &ApplyTargets, reason: &str) -> Result<A
     // ── Verify：代理开启后的外网复检（§3.4 第 4 步）──
     if failure.is_none() {
         if let Some(t) = targets.proxy.as_ref() {
-            if t.enable {
+            // 手动代理已做端口自检和配置回读。直连外网探测既不经过代理，
+            // 也不能证明代理转发成功，不应让每次手动切换额外阻塞五秒。
+            if t.enable && targets.strict_verify {
                 let reachable = probe::probe_internet();
                 if reachable {
                     steps.push(step_ok("verify", "外网连通性正常"));

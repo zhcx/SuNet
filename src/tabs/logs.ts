@@ -84,7 +84,10 @@ export async function renderLogs(root: HTMLElement, ctx: TabCtx): Promise<void> 
           .join("") ||
         `<div class="empty">${ui.iconEl("logs", 22)}<div>没有匹配的日志</div>
          <div class="faint">换个关键字，或把级别调到 debug</div></div>`;
-      view.scrollTop = view.scrollHeight;
+      // 标签页先在独立容器中加载，等它挂到页面后才能量到真实滚动高度。
+      requestAnimationFrame(() => {
+        view.scrollTop = view.scrollHeight;
+      });
       stat.textContent = `共 ${all.length} 条，显示 ${filtered.length} 条（点"打开日志目录"可看完整文件）`;
     } catch (e) {
       view.innerHTML = `<div class="error-text">${ui.esc(errText(e))}</div>`;

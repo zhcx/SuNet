@@ -19,6 +19,7 @@ html,
 body {
   height: 100%;
   margin: 0;
+  overflow: hidden;
 }
 
 body {
@@ -89,8 +90,14 @@ code,
 
 #app {
   display: grid;
-  grid-template-rows: auto auto auto 1fr auto;
+  /* Grid 默认的 auto 最小宽度会被底栏长地址撑开，连带把整个主界面推出视口。 */
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
   height: 100vh;
+}
+
+#app > * {
+  min-width: 0;
 }
 
 .topbar {
@@ -171,6 +178,7 @@ code,
   align-items: center;
   gap: var(--sp-2);
   flex: 0 1 460px;
+  min-width: 0;
 }
 
 .profile-picker .label {
@@ -181,7 +189,8 @@ code,
 
 .profile-picker select {
   flex: 1;
-  min-width: 120px;
+  min-width: 0;
+  width: 100%;
 }
 
 .topbar-right {
@@ -189,6 +198,7 @@ code,
   display: flex;
   align-items: center;
   gap: var(--sp-2);
+  flex-shrink: 0;
 }
 
 .badge {
@@ -642,6 +652,8 @@ label.row {
 }
 
 .view {
+  min-width: 0;
+  min-height: 0;
   overflow: auto;
   padding: var(--sp-4);
   scroll-behavior: smooth;
@@ -702,7 +714,7 @@ label.row {
 
 .grid-2 {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: var(--sp-3);
 }
 
@@ -718,6 +730,12 @@ label.row {
   justify-content: space-between;
   gap: var(--sp-3);
   flex-wrap: wrap;
+}
+
+.row-between > *,
+.kv > :not(.k) {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .actions {
@@ -1099,9 +1117,15 @@ details.help summary {
 
 .field-grid {
   display: grid;
-  grid-template-columns: 118px 1fr;
+  grid-template-columns: 118px minmax(0, 1fr);
   gap: var(--sp-2) var(--sp-3);
   align-items: center;
+}
+
+.field-grid > *,
+.field-grid input {
+  min-width: 0;
+  max-width: 100%;
 }
 
 .field-grid > span:first-child,
@@ -1157,6 +1181,7 @@ details.help summary {
 
 .statusbar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--sp-1);
   padding: var(--sp-1) var(--sp-3);
@@ -1171,11 +1196,14 @@ details.help summary {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  height: 26px;
+  min-height: 26px;
+  min-width: 0;
+  max-width: 100%;
   padding: 0 var(--sp-2);
   border-radius: var(--r-sm);
   font-family: var(--mono);
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
   border: 1px solid transparent;
   cursor: pointer;
   transition:

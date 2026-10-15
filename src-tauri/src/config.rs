@@ -388,7 +388,7 @@ pub fn builtin_profile() -> Profile {
         id: BUILTIN_PROFILE_ID.into(),
         name: "默认 · 直连".into(),
         is_builtin: true,
-        note: "清除托管区块、关闭系统代理、DNS 还原为自动获取".into(),
+        note: "保留选中的 hosts / 订阅，关闭系统代理、DNS 还原为自动获取".into(),
         hosts: ProfileHosts {
             enabled: true,
             entry_ids: Vec::new(),
