@@ -7,7 +7,7 @@
 再由 matrix 并行构建并上传（Windows：NSIS `.exe` + MSI `.msi`；macOS：Apple Silicon 与 Intel 各一份 `.dmg`），
 **本文件里对应版本的段落会被自动提取为 Release 说明**，README 顶部的版本号与平台对照表也会同步刷新。
 
-## [未发布]
+## [0.0.4] - 2026-10-17
 
 ### 修复
 
@@ -15,6 +15,19 @@
 - 手动切换代理保留端口自检、配置回读和快照，移除最多约五秒的同步直连外网复检。
 - 修复 Windows 长代理状态撑开主窗口；底栏显示协议摘要，完整地址可悬停查看，内容区独立滚动。
 - 修复快速切换标签时旧请求覆盖新页面、代理失败报告刷新后消失，以及方案端口清空后残留旧值。
+- 修复快捷面板在**长 IPv6 / 长地址**下被切掉右侧：`.tiles` 用的是 `1fr 1fr`（轨道下限 = 内容的
+  min-content），而 `.tile` 作为 grid item 又是默认的 `min-width: auto`，于是 DNS 的
+  `2606:4700:4700::1111/2606:4700:4700::1001` 这种不带空格的长串把右列顶宽、整块瓦片溢出到面板外
+  （2026-10-17 用户截图）。改为 `minmax(0, 1fr)` 轨道 + `.tile { min-width: 0 }` +
+  `.tile-state { overflow-wrap: anywhere }`（`anywhere` 才会同时压小 min-content，`break-word` 不会）。
+- 修掉快捷面板在 **macOS** 上的两处回归（2026-10-17 审查）：
+  ① `quick_still_foreground()` 在非 Windows 平台返回 `true`，而 `main.rs` 的收起条件是
+  `!quick_still_foreground(..)` —— 后端的"点到别处收起"在 macOS 上恒不成立，连带
+  `quick_blur_hidden_at` 永不写入、「点托盘关面板不会关了又开」的保护一起失效。
+  改为 macOS 返回 `false`（tao 的焦点事件在 macOS 上是可靠的，失焦就是失焦）。
+  ② 前端新增的 `window.blur → quickHide()` 没看"操作进行中"的钉住状态，而 macOS 每次写
+  系统代理 / hosts / DNS 都会弹一次管理员密码框 —— 授权框一抢焦点面板就被收掉，与
+  `quickSetPinned` 的本意正好相反。blur 处理里补上 `busy` 闸（与后端 `quick_pinned` 同义）。
 
 ### 新增
 

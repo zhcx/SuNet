@@ -388,11 +388,18 @@ pub fn set_quick_blur_hidden_now(app: &AppHandle) {
     }
 }
 
-/// 面板是否仍是前台窗口。
+/// 这次 `Focused(false)` 是不是"其实还在前台"（是 → 不该收起）。
 ///
-/// WebView2 加载完成会把键盘焦点移进自己的子窗口，顶层随之收到一轮
+/// Windows：WebView2 加载完成会把键盘焦点移进自己的子窗口，顶层随之收到一轮
 /// WM_KILLFOCUS（tao 报 `Focused(false)`）——**此时前台窗口还是面板本身**，
-/// 这不是"点到别处"，不能收。真失焦时前台必然已换成别的窗口。
+/// 这不是"点到别处"，不能收；真失焦时前台必然已换成别的窗口，所以拿
+/// `GetForegroundWindow()` 核对一次。取不到 hwnd 时保守不收（宁可留着面板）。
+///
+/// macOS：tao 的焦点事件是可靠的，收到失焦就是真失焦 —— **这里必须返回 `false`**。
+/// 返回 `true` 会让 `main.rs` 里的 `!quick_still_foreground(..)` 恒为假：
+/// 后端的"点到别处收起"、以及唯一会写 `quick_blur_hidden_at` 的那条路径都会变成死代码
+/// （2026-10-17 审出：macOS 上面板只剩前端 `window.blur` 一条兜底信号，
+/// 且"点托盘关面板不会关了又开"的保护跟着失效）。
 pub fn quick_still_foreground(window: &tauri::Window) -> bool {
     #[cfg(target_os = "windows")]
     {
@@ -400,9 +407,13 @@ pub fn quick_still_foreground(window: &tauri::Window) -> bool {
             let fg = unsafe { crate::os::winapi::GetForegroundWindow() };
             return fg == h.0;
         }
+        return true;
     }
-    // 非 Windows / 取不到 hwnd：保守不收（macOS 的 tao 焦点事件是可靠的）
-    true
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        false
+    }
 }
 
 /// 面板是否在极近时刻（几百毫秒）刚因失焦被收起

@@ -49,11 +49,15 @@ export async function bootQuick(): Promise<void> {
     if (document.visibilityState === "visible") shownAt = Date.now();
   });
 
-  // 点到面板以外就收起（Windows 系统代理面板的标准交互）：
+  // 点到面板以外就收起（浮窗的标准交互）：
   // 顶层窗口的失焦事件在 WebView2 里会丢（tao 的激活/键盘焦点状态机被
   // WebView2 抢焦点打乱），浏览器标准的 window blur 是可靠信号。
   // 刚弹出的 ~1 秒里有加载/激活抖动引起的 blur，按时间阈值忽略。
   window.addEventListener("blur", () => {
+    // 操作进行中不收：授权框（macOS 的管理员密码框 / Windows 的 UAC）必然抢焦点，
+    // 而这正是用户要"看着结果"的时候。后端那条 Focused(false) 有 quick_pinned 闸，
+    // 这里是前端这条独立信号的同义闸（busy 与 pinned 在同一处置位/复位）。
+    if (busy) return;
     if (Date.now() - shownAt < 1000) return;
     void api.quickHide();
   });

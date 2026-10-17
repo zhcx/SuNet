@@ -1527,7 +1527,10 @@ details.help summary {
 
 .tiles {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  /* `1fr` 的最小值等于内容的 min-content：DNS 的 `2606:4700:…/2606:4700:…` 这种不带空格的长串
+     会把右列顶开，整块瓦片从面板右侧溢出去（2026-10-17 用户截图：DNS 瓦片被切掉一半）。
+     minmax(0, 1fr) 才允许轨道缩到 0，再配合 .tile / .tile-state 的 min-width:0 与断行。 */
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
   gap: 8px;
 }
 
@@ -1535,6 +1538,8 @@ details.help summary {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  /* grid item 的 min-width 默认是 auto（= min-content）：长地址会把瓦片本身撑破轨道 */
+  min-width: 0;
   padding: 10px;
   border: 1px solid var(--border);
   border-radius: var(--r-lg);
@@ -1593,6 +1598,10 @@ details.help summary {
   font-size: var(--fs-xs);
   color: var(--fg-muted);
   line-height: 1.5;
+  /* DNS 摘要可能是 `手动(v6) 2606:4700:4700::1111/2606:4700:4700::1001` 这种长串：
+     anywhere（不是 break-word）才会同时影响 min-content，"留空即关闭"这类长地址也一并兜住 */
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .tile-addr {
