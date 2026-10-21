@@ -542,36 +542,13 @@ fn ensure_proxy_snapshot(before: &ProxyState) -> Result<()> {
     Ok(())
 }
 
-/// 两个状态是否"实际等效"：总开关、逐协议落点、PAC 接管状态。
+/// 两个状态是否"实际等效"（总开关 / 逐协议落点 / PAC）。
 ///
-/// 不比 `server` 原始串（平台写法不同）、不比 `bypass`（系统会补默认值）。
-///
-/// **落点按 (host, port) 语义比，不按字符串比**：同一个地址有 `[::1]:7890`
-/// 与 `::1:7890` 两种合法写法（我们自己写出去时补方括号，系统读回来可能不补），
-/// 大小写与首尾空白也会变。按字符串比会把"还是我们那份"判成"被改过"，
-/// 于是每次关闭代理都丢弃还原点、退回只关开关 —— 用户原配置就还原不回来了。
+/// 实现放在 `os::proxy_snapshot::same_state`：macOS 平台层判它**自己**那份逐服务
+/// 还原点是否过期时用的是同一条规则（root helper 的 HOME 与用户不同，读不到这里的
+/// `proxy_last_applied.json`，但"算不算被改过"的口径必须一致）。
 fn same_proxy_state(a: &ProxyState, b: &ProxyState) -> bool {
-    fn norm(addr: &str) -> (String, u16) {
-        match crate::os::proxy_addr::parse(addr) {
-            Some((host, port)) => (host.to_ascii_lowercase(), port),
-            // 解析不出来就原样留作标记：两边同样解析失败且文本一致时才算相同
-            None => (addr.trim().to_ascii_lowercase(), 0),
-        }
-    }
-    let eps = |st: &ProxyState| -> Vec<(String, (String, u16))> {
-        st.endpoints()
-            .into_iter()
-            .map(|(label, addr)| (label.to_string(), norm(addr)))
-            .collect()
-    };
-    a.enable == b.enable
-        && a.pac_present == b.pac_present
-        && norm_pac(a.autoconfig_url.as_deref()) == norm_pac(b.autoconfig_url.as_deref())
-        && eps(a) == eps(b)
-}
-
-fn norm_pac(u: Option<&str>) -> Option<&str> {
-    u.map(str::trim).filter(|s| !s.is_empty())
+    crate::os::proxy_snapshot::same_state(a, b)
 }
 
 /// 我们上次**成功写下去**的代理状态（判还原点是否过期用）

@@ -412,7 +412,7 @@ fn read_service(service: &str) -> Result<ServiceProxy> {
         }
         Err(_) => String::new(),
     };
-    let auto = parse_proxy_block(
+    let (pac_on, pac_url) = parse_autoproxy(
         &net::networksetup_soft(&["-getautoproxyurl".to_string(), service.to_string()])
             .map(|(_, o)| o)
             .unwrap_or_default(),
@@ -424,13 +424,41 @@ fn read_service(service: &str) -> Result<ServiceProxy> {
         secure,
         socks,
         bypass,
-        autoconfig_url: if auto.1.is_empty() {
-            None
-        } else {
-            Some(auto.1.clone())
-        },
-        pac_present: auto.0 && !auto.1.is_empty(),
+        autoconfig_url: pac_url.clone(),
+        pac_present: pac_on && pac_url.is_some(),
     })
+}
+
+/// 解析 `-getautoproxyurl` 的输出：(是否启用, PAC 地址)
+///
+/// 这个命令的键名与逐协议那三个**不一样**：地址在 `URL:` 下而不是 `Server:` 下，
+/// 拿 [`parse_proxy_block`] 解会得到 `enabled=true, server=""` —— 于是两份信息同时丢：
+///
+///   · `autoconfig_url` 永远是 `None`（`URL:` 那一行没人认），还原时走
+///     [`write_pac`] 的 `None` 分支把 PAC **关掉**，用户原本的 PAC 就此消失；
+///   · `pac_present` 永远为 false，而[关闭代理时"被 PAC 接管"要诚实报告]、
+///     [快照时效判定]都靠它。
+///
+/// 实测（macOS 27.0.1）：没配过时输出 `URL: (null)`；配过但关着时 URL 仍然在，
+/// 只是 `Enabled: No`。所以这两件事必须分开记 —— 只留 URL 会让"关着的 PAC"
+/// 在还原时被打开。
+fn parse_autoproxy(text: &str) -> (bool, Option<String>) {
+    let mut enabled = false;
+    let mut url = String::new();
+    for line in text.lines() {
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix("Enabled:") {
+            enabled = rest.trim().eq_ignore_ascii_case("yes");
+        } else if let Some(rest) = l.strip_prefix("URL:") {
+            url = rest.trim().to_string();
+        }
+    }
+    // 没配过时是占位符 `(null)`，不是地址
+    if url.eq_ignore_ascii_case("(null)") {
+        url.clear();
+    }
+    let url = if url.is_empty() { None } else { Some(url) };
+    (enabled, url)
 }
 
 /// 读单个协议的 (是否开启, "host:port")
@@ -488,9 +516,32 @@ pub fn write_manual(p: &crate::os::ManualProxy) -> Result<()> {
         services.len(),
         if p.enable { "on" } else { "off" }
     );
-    snapshot_services(&services)?; // 先留还原点
+    // 还原点只在**开启**时留：关闭意味着我们不再接管，此时再记一份"当前状态"
+    // （也就是我们写下去的代理）会让下一次关闭按它还原成"代理开着"——
+    // 正是 HANDOFF §6.5 那条陈旧还原点故障，只是换了个生成时机。
+    if p.enable {
+        // 旧还原点还成不成立：判据 =「系统代理是否仍等于我们上次写下去的那份」。
+        // 用平台层自己的记录（与还原点同目录、同身份读写）：这段代码跑在 root helper 里，
+        // 看不到用户家目录下 app 层的 `proxy_last_applied.json`。
+        // 读不到当前状态时保守按「成立」处理 —— 无法证伪就不该丢掉已有还原能力。
+        let still_ours = match (last_applied(), read()) {
+            (Some(prev), Ok(now)) => crate::os::proxy_snapshot::same_state(&prev, &now),
+            _ => true,
+        };
+        snapshot_services(&services, still_ours)?; // 先留还原点
+    }
     for svc in &services {
         write_service_manual(svc, &plan, &p.bypass)?;
+    }
+    if p.enable {
+        // 写成功之后才记「我们写下去的是什么」：下次据此判断旧还原点还成不成立。
+        // 记录失败不影响本次切换（只是下一次会更保守地重写还原点）。
+        if let Ok(now) = read() {
+            write_last_applied(&now);
+        }
+    } else {
+        // 关闭后我们不再持有接管：任何残留的还原点都不再代表"接管前"
+        drop_snapshot();
     }
     invalidate_cache();
     Ok(())
@@ -510,6 +561,9 @@ pub fn restore(state: &ProxyState) -> Result<()> {
             }
         }
         invalidate_cache();
+        // 还原 = 接管结束：留着"上次写入"记录，下次开启会把一份已经还原过的状态
+        // 当成"我们还在接管"，反而把新还原点判成过期。
+        drop_last_applied();
         return match first_err {
             Some(e) => Err(e),
             None => Ok(()),
@@ -525,6 +579,7 @@ pub fn restore(state: &ProxyState) -> Result<()> {
         write_service_manual(svc, &plan, &state.bypass)?;
         write_pac(svc, state.autoconfig_url.as_deref(), state.pac_present)?;
     }
+    drop_last_applied();
     invalidate_cache();
     Ok(())
 }
@@ -569,21 +624,40 @@ pub fn hard_clear() -> Result<()> {
             "off".to_string(),
         ]);
     }
+    // 清零之后系统里已经没有"我们接管前的样子"可还原了；留着还原点只会让
+    // 下一次 restore（例如「撤销清除」）优先吃这份更早的配置（见 [`take_snapshot`]）。
+    drop_snapshot();
     invalidate_cache();
     Ok(())
 }
 
-/// 按计划写一个服务：逐协议「写地址 + 打开」或「显式关闭」。
+/// 按计划要执行的动作，**顺序已经排好**：先打开要开的，最后关掉不要的。
 ///
-/// 顺序按 [`Proto::ALL`]（HTTP → HTTPS → SOCKS）：**先写要开的、后关不要的**。
-/// 关的动作用来做清残留（≤ 0.0.2 留下的 HTTPS / SOCKS），让正在工作的那个协议
-/// 多留在原位一瞬，比先关后写（中间有一段完全没有代理）更稳。
+/// 抽成纯函数是为了能单测「顺序」这件事本身 —— 它决定的是切换过程中
+/// 系统里有没有一段时间**一个代理都没有**。
+///
+/// 旧实现按 [`Proto::ALL`]（HTTP → HTTPS → SOCKS）一趟走完，只在注释里写着
+/// 「先写要开的、后关不要的」，实际并没有实现：HTTP 关、HTTPS 开时，第一步就把
+/// HTTP 关掉，等到第三步才打开 HTTPS，中间那一段所有走代理的应用都在直连外网
+/// —— 对用户是"每次切协议都断一下"。两趟走才是注释描述的行为。
+fn ordered_actions(plan: &ManualPlan) -> Vec<(Proto, Option<(String, u16)>)> {
+    let mut out: Vec<(Proto, Option<(String, u16)>)> = plan
+        .per_proto
+        .iter()
+        .filter(|(_, t)| t.is_some())
+        .cloned()
+        .collect();
+    out.extend(plan.per_proto.iter().filter(|(_, t)| t.is_none()).cloned());
+    out
+}
+
+/// 按计划写一个服务：逐协议「写地址 + 打开」或「显式关闭」。
 fn write_service_manual(service: &str, plan: &ManualPlan, bypass: &str) -> Result<()> {
-    for (proto, target) in plan.per_proto.iter() {
+    for (proto, target) in ordered_actions(plan) {
         match target {
             // `-set*proxy` 这条命令同时会把该项打开
-            Some((host, port)) => set_proxy(service, *proto, host, *port)?,
-            None => set_proxy_state(service, *proto, false)?,
+            Some((host, port)) => set_proxy(service, proto, &host, port)?,
+            None => set_proxy_state(service, proto, false)?,
         }
     }
     write_exceptions(service, bypass)
@@ -619,7 +693,12 @@ fn set_proxy_state(service: &str, proto: Proto, on: bool) -> Result<()> {
 }
 
 /// 按还原点回填：**逐协议**写（三个协议是独立开关，合并成一个值正是 2026-10-10 那个断网 bug）
+///
+/// **PAC 先处理**：PAC 的优先级高于手动代理（与 Windows `restore` 同一顺序）。
+/// 还原点里 PAC 关着、手动代理开着时，若先写手动代理，那几秒内 PAC 仍是旧值并把
+/// 手动代理盖住；先落 PAC 就不会出现"写完了但没生效"的中间态。
 fn write_service_full(p: &ServiceProxy) -> Result<()> {
+    write_pac(&p.service, p.autoconfig_url.as_deref(), p.pac_present)?;
     for (proto, want) in [
         (Proto::Web, &p.web),
         (Proto::Secure, &p.secure),
@@ -627,7 +706,6 @@ fn write_service_full(p: &ServiceProxy) -> Result<()> {
     ] {
         write_protocol(&p.service, proto, want)?;
     }
-    write_pac(&p.service, p.autoconfig_url.as_deref(), p.pac_present)?;
     write_exceptions(&p.service, &p.bypass)
 }
 
@@ -716,12 +794,67 @@ fn snapshot_path() -> std::path::PathBuf {
     crate::paths::appdata_dir().join("proxy_prev.json")
 }
 
-fn snapshot_services(services: &[String]) -> Result<()> {
-    // 只在还没有还原点时留一份：开着代理再写一次、最后关闭，都不该把"接管前"的那份
-    // 覆盖成"接管后"的状态 —— 否则还原出来的是我们自己的代理配置（与 app 层的
-    // `ensure_proxy_snapshot` 同一约定）。
-    if snapshot_path().exists() {
+/// 丢弃还原点（接管结束后调用）
+fn drop_snapshot() {
+    let _ = std::fs::remove_file(snapshot_path());
+    drop_last_applied();
+}
+
+/// 平台层自己的「上次写下去的状态」记录。
+///
+/// 与 app 层的 `proxy_last_applied.json` 是**两份**，不是重复：app 层那份在用户
+/// 家目录、由 GUI 进程读写；这份在 root helper 的家目录、由提权进程读写。
+/// macOS 的代理写 / 还原**全部**在 root 身份下发生（`proxy_write_needs_root()` = true），
+/// 所以判「旧还原点还成不成立」只能靠这份 —— 读 app 层那份会是另一个用户的文件。
+fn last_applied_path() -> std::path::PathBuf {
+    crate::paths::appdata_dir().join("proxy_last_applied.json")
+}
+
+fn last_applied() -> Option<ProxyState> {
+    let text = std::fs::read_to_string(last_applied_path()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn write_last_applied(st: &ProxyState) {
+    let path = last_applied_path();
+    if let Some(dir) = path.parent() {
+        // 目录可能不存在（root 名下第一次写）：失败只记日志，不影响本次切换
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            log::warn!(target: "proxy", "创建代理状态记录目录失败（{}）：{e}", dir.display());
+            return;
+        }
+    }
+    match serde_json::to_string_pretty(st) {
+        Ok(text) => {
+            if let Err(e) = std::fs::write(&path, text.as_bytes()) {
+                log::warn!(target: "proxy", "写入代理状态记录失败（{}）：{e}", path.display());
+            }
+        }
+        Err(e) => log::warn!(target: "proxy", "序列化代理状态失败：{e}"),
+    }
+}
+
+fn drop_last_applied() {
+    let _ = std::fs::remove_file(last_applied_path());
+}
+
+/// 留还原点。**只在"接管前的原样仍然成立"时沿用旧文件**。
+///
+/// 从前这里只判「文件存在就不动」。那在 app 崩溃 / 被杀、或有人绕过 app 直接调
+/// helper 写入之后就错了：文件里记的是更早的接管前状态，下一次还原会按它把
+/// 用户后来配的代理整个抹掉（HANDOFF §6.5 实测 ①）。
+///
+/// 现在多一道判据 —— 交给调用方传进来的 `snapshot_still_ours`：
+///   · 成立 → 沿用（接管还在，旧文件就是接管前的原样）；
+///   · 不成立 → 用**当前状态**重写一份（下次还原回到的是"这次接管前"）。
+fn snapshot_services(services: &[String], snapshot_still_ours: bool) -> Result<()> {
+    if snapshot_path().exists() && snapshot_still_ours {
         return Ok(());
+    }
+    // 旧文件不再成立：先丢弃，下面的写入会生成新的一份（写失败时不会留下两份混用的状态）
+    if snapshot_path().exists() {
+        log::info!(target: "proxy", "已有代理还原点不再成立（系统代理已被外部改动），按当前状态重写");
+        drop_snapshot();
     }
     // 每个服务要起 5 个 networksetup（三个协议 + 例外列表 + PAC），串行读一台常见
     // 双服务机器就是 10+ 次进程启动 —— 这一步发生在"点开启"之后、写第一个字节之前，
@@ -962,6 +1095,60 @@ mod tests {
         );
         let off = "Enabled: No\nServer: (null)\nPort: 0\n";
         assert_eq!(parse_proxy_block(off), (false, String::new()));
+    }
+
+    /// `-getautoproxyurl` 的地址在 `URL:` 下，不在 `Server:` 下 —— 拿
+    /// [`parse_proxy_block`] 解会把地址与开关**同时**丢掉（本机 macOS 27.0.1
+    /// 的真实输出见用例里的字面量）。
+    #[test]
+    fn parse_autoproxy_reads_url_key_not_server_key() {
+        // 没配过：占位符 (null)，不是地址
+        assert_eq!(parse_autoproxy("URL: (null)\nEnabled: No\n"), (false, None));
+        // 配过但关着：URL 仍在，不能让还原把它打开
+        assert_eq!(
+            parse_autoproxy("URL: http://127.0.0.1:33331/commands/pac\nEnabled: No\n"),
+            (false, Some("http://127.0.0.1:33331/commands/pac".into()))
+        );
+        // 开着：URL 与开关都要留下，还原时才写得回去
+        assert_eq!(
+            parse_autoproxy("URL: http://wpad/wpad.dat\nEnabled: Yes\n"),
+            (true, Some("http://wpad/wpad.dat".into()))
+        );
+        // 命令失败（空输出）按"没有 PAC"处理
+        assert_eq!(parse_autoproxy(""), (false, None));
+    }
+
+    /// 写一个服务时**先开要开的、最后才关不要的**：反过来（按协议顺序一趟走完）
+    /// 会让 HTTP 先被关、HTTPS 还没打开，中间那一段系统里一个代理都没有。
+    #[test]
+    fn service_actions_open_before_closing() {
+        let plan = manual_plan(&crate::os::ManualProxy {
+            enable: true,
+            http: String::new(),
+            https: Some("127.0.0.1:7891".into()),
+            socks: None,
+            bypass: String::new(),
+        })
+        .unwrap();
+        let acts = ordered_actions(&plan);
+        let opens: Vec<Proto> = acts
+            .iter()
+            .filter(|(_, t)| t.is_some())
+            .map(|(p, _)| *p)
+            .collect();
+        let closes: Vec<Proto> = acts
+            .iter()
+            .filter(|(_, t)| t.is_none())
+            .map(|(p, _)| *p)
+            .collect();
+        assert_eq!(opens, vec![Proto::Secure]);
+        // HTTP / SOCKS 的关闭动作必须排在打开 HTTPS 之后
+        assert_eq!(acts.len(), 3);
+        assert_eq!(
+            &acts[..1],
+            &[(Proto::Secure, Some(("127.0.0.1".to_string(), 7891)))]
+        );
+        assert!(closes.contains(&Proto::Web) && closes.contains(&Proto::Socks));
     }
 
     #[test]

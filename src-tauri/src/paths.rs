@@ -32,9 +32,45 @@ pub fn local_appdata_dir() -> PathBuf {
 
 #[cfg(target_os = "macos")]
 fn home_dir() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/tmp"))
+    // 普通 GUI 进程一定有 HOME
+    if let Some(h) = std::env::var_os("HOME") {
+        let p = PathBuf::from(h);
+        if p.is_absolute() {
+            return p;
+        }
+    }
+    // launchd 拉起的 root helper **没有 HOME**。从前这里退回 `/tmp`，于是提权身份的
+    // 还原点落到了 `/tmp/Library/Application Support/SuNet/proxy_prev.json`
+    // （2026-10-21 在本机实测确认：`/tmp` 下真有这一份，属主 root）。后果有三个：
+    //   · `/tmp` 会被系统清理 ⇒ 跨重启的还原点直接丢失；
+    //   · 它不是用户目录里那份，排查时按文档去 `~/Library/...` 找永远找不到；
+    //   · `/tmp` 是 1777，别的本地用户可以先建同名目录把路径占住。
+    // 改成用 `getpwuid` 取真实家目录（root → `/var/root`）。写与读都在同一身份下
+    // （见 HANDOFF §4.21：不要把还原点改到用户家目录），所以两边仍然一致。
+    if let Some(p) = passwd_home() {
+        return p;
+    }
+    PathBuf::from("/tmp")
+}
+
+/// 当前**有效身份**的家目录（`getpwuid_r`，线程安全版本）
+#[cfg(target_os = "macos")]
+fn passwd_home() -> Option<PathBuf> {
+    let uid = unsafe { libc::geteuid() };
+    let mut buf = vec![0 as libc::c_char; 1024];
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result) };
+    if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+        return None;
+    }
+    let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+    let s = dir.to_string_lossy();
+    if s.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(s.as_ref()))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -113,4 +149,24 @@ pub fn ensure_dirs() -> std::io::Result<()> {
 
 pub fn exe_path() -> std::io::Result<PathBuf> {
     std::env::current_exe()
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    /// launchd 拉起的 root helper 没有 HOME：家目录必须仍能解析出来
+    /// （从前退回 `/tmp`，还原点被写到 `/tmp/Library/...` —— 2026-10-21 实测确认）
+    #[test]
+    fn home_dir_survives_missing_home_env() {
+        let home = super::passwd_home().expect("getpwuid_r 应当能取到本用户家目录");
+        assert!(
+            home.is_absolute(),
+            "家目录必须是绝对路径：{}",
+            home.display()
+        );
+        assert_ne!(home, std::path::PathBuf::from("/tmp"));
+        // 与 $HOME 一致（普通 GUI 进程两种取法给出同一个答案）
+        if let Some(env_home) = std::env::var_os("HOME") {
+            assert_eq!(home, std::path::PathBuf::from(env_home));
+        }
+    }
 }

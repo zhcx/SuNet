@@ -82,8 +82,13 @@ pub fn send(
 
     // 只有非 Info 才会置「未读警告」标记，进而改变托盘 tooltip 的「⚠ 」前缀；
     // Info 通知（后台完成等）不影响托盘状态，跳过刷新省掉一次整份 hosts 读盘。
+    //
+    // 查的必须是 `SharedState`（= `Arc<AppState>`）：`main.rs` 里 `.manage()` 的就是它，
+    // tauri 按 `TypeId` 严格匹配，写成裸 `AppState` 会恒返回 None —— 于是警告标记
+    // 永远置不上、托盘的「⚠ 」前缀也就永远不出现（与 tray.rs 2026-10-12 那批
+    // `try_state` 类型错配同一个根因，见 HANDOFF §7）。
     if level != Level::Info {
-        if let Some(state) = app.try_state::<crate::state::AppState>() {
+        if let Some(state) = app.try_state::<crate::state::SharedState>() {
             state.mark_warn_unread();
         }
         crate::tray::refresh(app);

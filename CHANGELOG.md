@@ -62,6 +62,32 @@
 - **托盘菜单在等待授权时卡住整个界面**：代理开关、清除代理、开机自启动三项
   原先在托盘菜单回调线程里同步执行，弹 UAC / 系统授权框期间托盘菜单与快捷面板
   都没有响应。现在移到后台线程，失败时发系统通知。
+- **macOS 把 PAC 地址读丢了**：`networksetup -getautoproxyurl` 的地址在 `URL:` 行、
+  开关在 `Enabled:` 行，与逐协议那三条命令的 `Server:` / `Enabled:` 格式不同；复用
+  同一个解析器只能得到 `enabled=true, server=""`，于是 `autoconfig_url` 恒为 `None`、
+  `pac_present` 恒为 false。后果不只是界面少显示一行：还原时会把用户原有的 PAC
+  关掉，「被 PAC 接管」的报告与还原点时效判定也一起失效。改为独立解析，并区分
+  `(null)` 占位符（没配过）与真实地址（配过但可能关着）。
+- **macOS 切换协议时中间会有一段完全没有代理**：`write_service_manual` 按 HTTP →
+  HTTPS → SOCKS 一趟走完，注释写着「先写要开的、后关不要的」，实现却是先关再开
+  —— 从 HTTP 切到 HTTPS 时，第一步就把 HTTP 关掉，最后一步才打开 HTTPS。改为两趟：
+  先把要开的全部写好，最后才关不要的。
+- **macOS 还原时 PAC 排在手动代理之后**：PAC 优先级高于手动代理，先写手动代理会
+  在 PAC 尚未关掉的那几秒里被盖住。还原改为 PAC 先处理（与 Windows 同一顺序）。
+- **macOS 平台层的还原点绕过了时效保护**：app 层会用 `proxy_last_applied.json` 判
+  旧还原点是否仍成立，但 macOS 的代理写入 / 还原全部发生在 root helper 里，读不到
+  用户家目录那份 —— 平台层 `proxy_prev.json` 仍可能按陈旧快照把用户后来配的代理
+  整个覆盖。平台层现在记录自己那份「上次写下去的状态」（与还原点同目录、同身份），
+  并用共用的 `os::proxy_snapshot::same_state` 判定；关闭、彻底清除、还原后丢弃。
+- **root helper 拿不到 `HOME` 时还原点落到 `/tmp`**：launchd 拉起的进程没有 `HOME`，
+  `paths::home_dir()` 退回 `/tmp`，还原点被写到 `/tmp/Library/Application Support/
+  SuNet/proxy_prev.json`（2026-10-21 实测确认，属主 root）。`/tmp` 会被系统清理、
+  排查时按文档去 `~/Library/...` 找不到，而且 1777 权限下别的本地用户能先占住路径。
+  改用 `getpwuid_r(geteuid())` 取真实家目录（root → `/var/root`）；读写仍在同一身份，
+  不跨用户目录。
+- **警告通知永远置不上托盘的「⚠」前缀**：`notify::send` 查的是裸 `AppState`，而
+  `main.rs` manage 的是 `Arc<AppState>`；Tauri 按 `TypeId` 严格匹配，`try_state`
+  恒返回 `None`。与 tray.rs 2026-10-12 那批类型错配同一根因。
 
 ### 优化
 
@@ -78,7 +104,8 @@
 - **快捷面板切换方案点一下即切**：原先每次切换都要点两次（一律先确认）。
   现在只有这次切换**真的会弹管理员授权框**时才多问一句；判据由后端在
   `ProfileBrief.needs_elevation` 里算好（hosts / DNS 恒需提权、代理仅 macOS 需提权、
-  已是管理员则全程不弹），前端不再自己拼条件。
+  已是管理员或免密通道可用则全程不弹 —— 装了 helper / 计划任务后提权是静默的，
+  再确认一次就成了多余的一步），前端不再自己拼条件。
 - 代理页的授权说明只在真正会提权的平台且开启该提示时出现（Windows 写 HKCU，
   不会弹 UAC，多一个「需要管理员权限」的弹层只会让人以为要输密码）；
   HTTP 代理输入框提示补充 IPv6 写法。
