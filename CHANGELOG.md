@@ -7,7 +7,7 @@
 再由 matrix 并行构建并上传（Windows：NSIS `.exe` + MSI `.msi`；macOS：Apple Silicon 与 Intel 各一份 `.dmg`），
 **本文件里对应版本的段落会被自动提取为 Release 说明**，README 顶部的版本号与平台对照表也会同步刷新。
 
-## [未发布]
+## [0.0.5] - 2026-10-21
 
 ### 修复
 
