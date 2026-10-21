@@ -166,24 +166,63 @@ fn on_menu(app: &AppHandle, id: &str) -> Result<(), AppError> {
             };
             show_window(app, Some(tab));
         }
-        "proxy" => tray_toggle_proxy(app)?,
-        "clear_proxy" => crate::cmd::proxy::tray_clear_proxy(app)?,
+        // 两个代理菜单项都可能停下来等管理员授权（macOS 必弹；Windows 装了静默通道
+        // 之外的情形要等 UAC），同样不能占住托盘菜单回调所在的线程，否则授权框弹出
+        // 期间整个界面（含快捷面板）都没有响应。
+        "proxy" => {
+            let a = app.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = tray_toggle_proxy(&a) {
+                    log::warn!(target: "tray", "托盘代理开关失败：{e}");
+                    crate::notify::send(
+                        &a,
+                        crate::notify::Level::Error,
+                        "系统代理操作失败",
+                        &e.to_string(),
+                        vec![crate::notify::action("去代理页", "open:proxy")],
+                        false,
+                    );
+                }
+            });
+        }
+        "clear_proxy" => {
+            let a = app.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = crate::cmd::proxy::tray_clear_proxy(&a) {
+                    log::warn!(target: "tray", "托盘清除代理失败：{e}");
+                    crate::notify::send(
+                        &a,
+                        crate::notify::Level::Error,
+                        "清除代理设置失败",
+                        &e.to_string(),
+                        vec![crate::notify::action("去代理页", "open:proxy")],
+                        false,
+                    );
+                }
+            });
+        }
         "autostart" => {
             let enable = app
                 .try_state::<SharedState>()
                 .and_then(|s| s.cfg_clone().ok())
                 .map(|c| !c.settings.autostart.enabled)
                 .unwrap_or(true);
-            if let Err(e) = crate::cmd::system::set_autostart(app, enable) {
-                crate::notify::send(
-                    app,
-                    crate::notify::Level::Error,
-                    "开机自启动设置失败",
-                    &e.to_string(),
-                    vec![crate::notify::action("去设置", "open:settings")],
-                    true,
-                );
-            }
+            // 必须离开菜单回调线程：Windows 上这项要走一次提权（ShellExecuteExW + 等
+            // 子进程），macOS 上要起 launchctl —— 在回调里同步做，整个托盘菜单（以及
+            // 发消息的 UI 线程）就停在那里等 UAC，表现为"点了开机自启动，菜单卡住"。
+            let a = app.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = crate::cmd::system::set_autostart(&a, enable) {
+                    crate::notify::send(
+                        &a,
+                        crate::notify::Level::Error,
+                        "开机自启动设置失败",
+                        &e.to_string(),
+                        vec![crate::notify::action("去设置", "open:settings")],
+                        true,
+                    );
+                }
+            });
         }
         "open" => show_window(app, None),
         "quit" => {

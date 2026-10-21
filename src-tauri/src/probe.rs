@@ -14,19 +14,42 @@ pub const PROXY_PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 /// 开启后的外网复检超时（§3.4 第 4 步：5 秒内不通 → 提示）
 pub const INTERNET_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 主机名合法性（本工具面向本机用户，这里只做形状校验，
-/// 防止把奇怪的字符串塞进解析器与后续脚本）
+/// 主机名合法性（形状校验；与写前校验共用同一份规则，见
+/// [`crate::os::proxy_addr::host_ok`]）。
+///
+/// 从前这里是独立的一份 `chars().all(alnum | . | - | _)` —— 于是 IPv6 字面量
+/// 在写前校验通过了、到探测这一步又被判成非法，用户看到的是"地址非法"却查不出哪一步。
 fn host_shape_ok(host: &str) -> bool {
-    let h = host.trim();
-    if h.is_empty() || h.len() > 253 {
-        return false;
+    crate::os::proxy_addr::host_ok(host)
+}
+
+/// 带超时的地址解析。
+///
+/// `to_socket_addrs` 是**阻塞**的，且系统解析器（Windows 的 DNS Client、
+/// macOS 的 mDNSResponder）没有可设的超时：域名不通、或本机 DNS 正被改成
+/// 一个不可达的地址时，这一步能卡住数秒甚至更久，而调用它的位置是
+/// "点开启代理 → 前置自检"，用户侧就是按钮点了不动。
+///
+/// 把解析丢到一个短命线程里等结果：超时就按"探测失败"返回，让闸门在
+/// 预定的 800ms 附近结束，而不是被解析器拖走。线程本身无法被强杀，
+/// 但它只是阻塞在系统调用上，不持有任何锁，也不会影响后续操作。
+fn resolve_within(host: &str, port: u16, timeout: Duration) -> Option<Vec<SocketAddr>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let target = format!("{host}:{port}");
+    std::thread::spawn(move || {
+        let addrs = target
+            .to_socket_addrs()
+            .map(|it| it.collect::<Vec<_>>())
+            .unwrap_or_default();
+        let _ = tx.send(addrs);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(addrs) => Some(addrs),
+        Err(_) => {
+            log::warn!(target: "probe", "解析 {host} 超时（>{timeout:?}），按探测失败处理");
+            None
+        }
     }
-    if h.parse::<std::net::IpAddr>().is_ok() {
-        return true;
-    }
-    h.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
-        && !h.starts_with('-')
 }
 
 /// TCP 探测：连得上即视为端口在监听
@@ -35,9 +58,8 @@ pub fn tcp_probe(host: &str, port: u16, timeout: Duration) -> bool {
         return false;
     }
     let deadline = Instant::now() + timeout;
-    let addrs: Vec<SocketAddr> = match (host, port).to_socket_addrs() {
-        Ok(it) => it.collect(),
-        Err(_) => return false,
+    let Some(addrs) = resolve_within(host, port, timeout) else {
+        return false;
     };
     for addr in addrs {
         let remain = deadline.saturating_duration_since(Instant::now());
@@ -87,6 +109,18 @@ pub fn dns_latency(server: &str, name: &str, qtype: u16, timeout: Duration) -> s
         .trim()
         .parse()
         .map_err(|_| "地址非法".to_string())?;
+    dns_latency_at(ip, 53, name, qtype, timeout)
+}
+
+/// [`dns_latency`] 的实现体，端口可指定 —— 单测起本地假服务器走真实代码路径，
+/// 而不是把查询/校验逻辑在测试里再抄一遍（抄一遍只能证明抄得对）。
+fn dns_latency_at(
+    ip: std::net::IpAddr,
+    port: u16,
+    name: &str,
+    qtype: u16,
+    timeout: Duration,
+) -> std::result::Result<u128, String> {
     let bind = if ip.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
     let sock = std::net::UdpSocket::bind(bind).map_err(|e| format!("无法创建套接字({e})"))?;
     sock.set_read_timeout(Some(timeout))
@@ -110,64 +144,102 @@ pub fn dns_latency(server: &str, name: &str, qtype: u16, timeout: Duration) -> s
     q.extend_from_slice(&qtype.to_be_bytes()); // A=1 / AAAA=28
     q.extend_from_slice(&1u16.to_be_bytes()); // IN
 
+    let server = std::net::SocketAddr::new(ip, port);
     let start = Instant::now();
-    sock.send_to(&q, std::net::SocketAddr::new(ip, 53))
+    sock.send_to(&q, server)
         .map_err(|e| format!("发送失败({e})"))?;
+
+    // 只认**来自被探测服务器**的响应：`recv` 会收下任意来源的第一个 UDP 包，
+    // 本机若还跑着别的解析器（或上一个用例的迟到响应）就会串台。
+    // 同时按截止时间循环，而不是"一个包不对就判失败" —— 偶发的无关报文
+    // 不该让一个好地址显示成"无响应"。
+    let deadline = start + timeout;
     let mut resp = [0u8; 1024];
-    let n = sock
-        .recv(&mut resp)
-        .map_err(|_| "无响应（超时）".to_string())?;
-    let elapsed = start.elapsed().as_millis();
-    if n < 12 {
-        return Err("响应过短".into());
+    loop {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            return Err("无响应（超时）".to_string());
+        }
+        sock.set_read_timeout(Some(remain))
+            .map_err(|e| format!("设置超时失败({e})"))?;
+        let (n, from) = match sock.recv_from(&mut resp) {
+            Ok(v) => v,
+            Err(_) => return Err("无响应（超时）".to_string()),
+        };
+        if from.ip() != ip {
+            continue; // 不是我们问的那台服务器，忽略
+        }
+        let elapsed = start.elapsed().as_millis();
+        if n < 12 {
+            return Err("响应过短".into());
+        }
+        if resp[0..2] != id.to_be_bytes() {
+            continue; // 迟到的旧事务，继续等
+        }
+        let rcode = resp[3] & 0x0f;
+        if rcode != 0 {
+            return Err(format!("服务器返回错误码 {rcode}"));
+        }
+        return Ok(elapsed);
     }
-    if resp[0..2] != id.to_be_bytes() {
-        return Err("事务 ID 不匹配".into());
-    }
-    let rcode = resp[3] & 0x0f;
-    if rcode != 0 {
-        return Err(format!("服务器返回错误码 {rcode}"));
-    }
-    Ok(elapsed)
 }
 
 /// 批量测速：IPv4 用 A 记录、IPv6 用 AAAA 记录
 pub fn dns_test(servers: &[String], timeout: Duration) -> Vec<DnsTestResult> {
     const NAME: &str = "example.com";
-    let mut out = Vec::new();
-    for s in servers {
-        let family = match s.trim().parse::<std::net::IpAddr>() {
-            Ok(ip) if ip.is_ipv4() => ("v4", 1u16),
-            Ok(_) => ("v6", 28u16),
-            Err(_) => {
-                out.push(DnsTestResult {
-                    server: s.clone(),
-                    family: "?".into(),
-                    ok: false,
-                    latency_ms: 0,
-                    message: "地址非法".into(),
-                });
-                continue;
-            }
-        };
-        match dns_latency(s, NAME, family.1, timeout) {
-            Ok(ms) => out.push(DnsTestResult {
-                server: s.clone(),
-                family: family.0.into(),
-                ok: true,
-                latency_ms: ms,
-                message: format!("{ms} ms"),
-            }),
-            Err(e) => out.push(DnsTestResult {
-                server: s.clone(),
-                family: family.0.into(),
+    // 并发探测：串行时 8 个地址 × 1.5s 超时 = 最坏 12 秒，界面一直转圈。
+    // 并发后墙钟 ≈ 单个超时。结果按输入顺序归还（join 顺序 = 提交顺序）。
+    let handles: Vec<_> = servers
+        .iter()
+        .map(|s| {
+            let s = s.clone();
+            std::thread::spawn(move || test_one(&s, NAME, timeout))
+        })
+        .collect();
+    handles
+        .into_iter()
+        .map(|h| {
+            h.join().unwrap_or_else(|_| DnsTestResult {
+                server: "（线程异常）".into(),
+                family: "?".into(),
                 ok: false,
                 latency_ms: 0,
-                message: e,
-            }),
+                message: "探测线程异常终止".into(),
+            })
+        })
+        .collect()
+}
+
+fn test_one(s: &str, name: &str, timeout: Duration) -> DnsTestResult {
+    let family = match s.trim().parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_ipv4() => ("v4", 1u16),
+        Ok(_) => ("v6", 28u16),
+        Err(_) => {
+            return DnsTestResult {
+                server: s.to_string(),
+                family: "?".into(),
+                ok: false,
+                latency_ms: 0,
+                message: "地址非法".into(),
+            };
         }
+    };
+    match dns_latency(s, name, family.1, timeout) {
+        Ok(ms) => DnsTestResult {
+            server: s.to_string(),
+            family: family.0.into(),
+            ok: true,
+            latency_ms: ms,
+            message: format!("{ms} ms"),
+        },
+        Err(e) => DnsTestResult {
+            server: s.to_string(),
+            family: family.0.into(),
+            ok: false,
+            latency_ms: 0,
+            message: e,
+        },
     }
-    out
 }
 
 /// 解析 + 连通诊断（§8 system_resolve）
@@ -240,10 +312,118 @@ mod tests {
         assert!(!host_shape_ok("a b"));
         assert!(!host_shape_ok("a;calc"));
         assert!(!host_shape_ok(""));
+        // IPv6：探测侧必须与写前校验给同一个答案，否则代理页永远开不起来
+        assert!(host_shape_ok("::1"));
+        assert!(host_shape_ok("2606:4700:4700::1111"));
+    }
+
+    #[test]
+    fn unresolvable_host_fails_within_timeout() {
+        // 不依赖网络：非法形状在解析之前就被挡下，必须是即时的 false
+        let started = Instant::now();
+        assert!(!tcp_probe("bad host", 80, Duration::from_millis(50)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        // 本地回环上一个几乎不可能有人在监听的端口：探测要给出 false，
+        // 且不能因为连接被拒之外的原因拖过超时上限太多
+        let started = Instant::now();
+        let _ = tcp_probe("127.0.0.1", 9, Duration::from_millis(120));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
     fn probe_invalid_host_is_false() {
         assert!(!tcp_probe("a;b", 80, Duration::from_millis(50)));
+    }
+
+    /// 本地起一个假 DNS 服务器，验证 `dns_latency` 的完整往返：
+    /// 真正走发送 → 收包 → 校验来源 / 事务 ID / RCODE 的代码路径。
+    /// 不需要外网、不碰系统配置，只绑 127.0.0.1 的随机端口。
+    #[test]
+    fn dns_latency_roundtrip_against_local_server() {
+        use std::net::UdpSocket;
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (n, from) = server.recv_from(&mut buf).unwrap();
+            // 原样回一个"成功"响应：复制事务 ID + 置 QR 位，RCODE=0
+            let mut resp = buf[..n].to_vec();
+            resp[2] |= 0x80; // QR = response
+            resp[3] &= 0xf0; // RCODE = 0
+            server.send_to(&resp, from).unwrap();
+        });
+
+        let ms = dns_latency_at(
+            addr.ip(),
+            addr.port(),
+            "example.com",
+            1,
+            Duration::from_secs(1),
+        )
+        .expect("本地假服务器应当回应");
+        srv.join().unwrap();
+        assert!(ms < 1000, "往返耗时 {ms} ms 不合理");
+    }
+
+    /// 迟到的旧事务（ID 不匹配）必须被跳过，而不是当成失败或当成答案。
+    #[test]
+    fn dns_latency_ignores_mismatched_transaction_id() {
+        use std::net::UdpSocket;
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (n, from) = server.recv_from(&mut buf).unwrap();
+            // 先灌一个 ID 不对的包（模拟上一个用例的迟到响应）
+            let mut stale = buf[..n].to_vec();
+            stale[0] ^= 0xff;
+            stale[1] ^= 0xff;
+            stale[2] |= 0x80;
+            stale[3] &= 0xf0;
+            server.send_to(&stale, from).unwrap();
+            // 再发真正的响应
+            let mut resp = buf[..n].to_vec();
+            resp[2] |= 0x80;
+            resp[3] &= 0xf0;
+            server.send_to(&resp, from).unwrap();
+        });
+
+        let got = dns_latency_at(
+            addr.ip(),
+            addr.port(),
+            "example.com",
+            1,
+            Duration::from_secs(2),
+        );
+        srv.join().unwrap();
+        assert!(got.is_ok(), "旧事务不该让探测失败：{got:?}");
+    }
+
+    /// 服务器返回错误码时，探测要把 RCODE 带出来，而不是报"超时"。
+    #[test]
+    fn dns_latency_reports_server_rcode() {
+        use std::net::UdpSocket;
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let srv = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (n, from) = server.recv_from(&mut buf).unwrap();
+            let mut resp = buf[..n].to_vec();
+            resp[2] |= 0x80;
+            resp[3] = (resp[3] & 0xf0) | 3; // NXDOMAIN
+            server.send_to(&resp, from).unwrap();
+        });
+
+        let err = dns_latency_at(
+            addr.ip(),
+            addr.port(),
+            "example.com",
+            1,
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        srv.join().unwrap();
+        assert!(err.contains('3'), "错误信息应包含 RCODE 3：{err}");
     }
 }

@@ -56,9 +56,9 @@ pub struct ProxyEndpoint {
 }
 
 impl ProxyEndpoint {
-    /// 写入载荷里的 `host:port` 形式
+    /// 写入载荷里的 `host:port` 形式（IPv6 自动补方括号，见 `os::proxy_addr::format`）
     fn to_server(&self) -> String {
-        format!("{}:{}", self.host.trim(), self.port)
+        crate::os::proxy_addr::format(&self.host, self.port)
     }
 }
 
@@ -339,8 +339,11 @@ pub fn apply(state: &AppState, targets: &ApplyTargets, reason: &str) -> Result<A
     // 代理写入落在哪里：macOS 需要 root → 并入下面的提权批处理（一次切换只弹一次授权框）；
     // Windows 不需要 → 本进程直接写，行为与从前完全一致（不弹 UAC）。
     let proxy_needs_root = proxy_plan.as_ref().is_some_and(|p| p.write.needs_root());
+    // 是否真的向系统发起了代理写入（失败回滚据此决定要不要把代理层也还原一遍）
+    let mut proxy_write_attempted = false;
     if failure.is_none() && !proxy_needs_root {
         if let Some(p) = proxy_plan.as_ref() {
+            proxy_write_attempted = true;
             match p.write.write_here() {
                 Ok(notified) => {
                     let s = proxy_step(p, notified);
@@ -377,6 +380,7 @@ pub fn apply(state: &AppState, targets: &ApplyTargets, reason: &str) -> Result<A
                 // 子进程只写、不发变更通知（通知历来是调用方的事），这里补上，
                 // 与 proxy_ops::write_manual 的语义对齐（macOS 上本就是个 no-op）。
                 if let Some(p) = batch_proxy {
+                    proxy_write_attempted = true;
                     if let Some(i) = o.steps.iter().position(|s| s.applied && s.kind == "proxy") {
                         let notified = system_proxy::notify_changed();
                         o.steps[i] = proxy_step(p, notified);
@@ -435,7 +439,16 @@ pub fn apply(state: &AppState, targets: &ApplyTargets, reason: &str) -> Result<A
     let mut rolled_back = false;
     let mut recovery_required = false;
     if failure.is_some() {
-        let (rollback_steps, recovery) = rollback_layers(&snap, &applied);
+        // 代理"写了一半"也要回滚：写入本身可能已经部分改动系统（Windows 写注册表
+        // 三个值、macOS 遍历网络服务），此时 `applied` 里还没有 "proxy"
+        // （只有成功返回才 push），不回滚就等于把半套代理留在系统里。
+        // 回滚按快照还原，对"已写一半"和"写完才失败"都成立；多一次无害还原，
+        // 好过留下一个用户看不见的半开状态。
+        let mut layers = applied.clone();
+        if proxy_plan.is_some() && !layers.contains(&"proxy") && proxy_write_attempted {
+            layers.insert(0, "proxy");
+        }
+        let (rollback_steps, recovery) = rollback_layers(&snap, &layers);
         steps.extend(rollback_steps);
         rolled_back = true;
         recovery_required = recovery;
@@ -444,10 +457,20 @@ pub fn apply(state: &AppState, targets: &ApplyTargets, reason: &str) -> Result<A
         }
         log::warn!(
             target: "apply",
-            "事务失败并已回滚：原因={}，恢复需人工介入={}",
+            "事务失败并已回滚：原因={}，回滚层={:?}，恢复需人工介入={}",
             failure.as_ref().map(|e| e.to_string()).unwrap_or_default(),
+            layers,
             recovery_required
         );
+    }
+
+    // 代理还原点的生命周期：只有**提交成功**时才推进 / 丢弃。
+    // 失败并已回滚时保持原样 —— 系统已经回到"接管前"，文件也应当还是那份"接管前"的。
+    if failure.is_none() {
+        finish_proxy_takeover(proxy_plan.as_ref().map(|p| &p.write));
+    } else if rolled_back && !recovery_required {
+        // 回滚把系统还原了：我们不再持有接管，上次写入的记录随之失效
+        drop_last_applied();
     }
 
     // 脏标记：已应用且成功 → dirty；已回滚干净 → 不脏
@@ -484,35 +507,177 @@ fn proxy_snapshot_file() -> std::path::PathBuf {
 }
 
 /// 首次启用代理前，把"接管前"的完整状态落盘（§3.3：快照文件是崩溃恢复的依据）
+///
+/// **陈旧还原点的判定**（2026-10-21）：文件存在 ≠ 它还是"接管前"的状态。用户可能
+/// 在我们已经交出控制权之后自己改过系统代理（退出应用、换用公司 VPN、手动关掉），
+/// 这时旧文件里记的是更早的配置；下一次「关闭代理」按它还原，等于把用户后来
+/// 的设置整体抹掉（HANDOFF §6.5 实测记录里"陈旧还原点会胜出"就是这个）。
+///
+/// 判据是**当前状态是否仍等于我们上次写下去的状态**（`proxy_last_applied.json`）：
+///   · 相等 → 接管仍在生效，旧还原点就是接管前的原样，保留；
+///   · 不等 → 中间有人改过系统代理，旧还原点已过期，用当前状态重写一份；
+///   · 没有记录（从旧版本升级上来）→ 沿用既有还原点，并把当前状态记成"已写入"，
+///     从此开始精确判定 —— 升级当口不能猜，猜错就是把用户配置抹掉。
 fn ensure_proxy_snapshot(before: &ProxyState) -> Result<()> {
     let path = proxy_snapshot_file();
     if path.exists() {
-        return Ok(());
+        match read_last_applied() {
+            Some(applied) if same_proxy_state(&applied, before) => return Ok(()),
+            Some(_) => log::info!(
+                target: "proxy",
+                "代理还原点已过期（当前状态与上次写入不一致），按当前状态重写"
+            ),
+            None => {
+                log::info!(
+                    target: "proxy",
+                    "没有上次写入的记录（旧版本升级），沿用既有还原点并开始记录"
+                );
+                write_last_applied(before)?;
+                return Ok(());
+            }
+        }
     }
     let text = serde_json::to_string_pretty(before)?;
     std::fs::write(&path, text.as_bytes())?;
     Ok(())
 }
 
-fn take_proxy_snapshot_file() -> Option<ProxyState> {
+/// 两个状态是否"实际等效"：总开关、逐协议落点、PAC 接管状态。
+///
+/// 不比 `server` 原始串（平台写法不同）、不比 `bypass`（系统会补默认值）。
+///
+/// **落点按 (host, port) 语义比，不按字符串比**：同一个地址有 `[::1]:7890`
+/// 与 `::1:7890` 两种合法写法（我们自己写出去时补方括号，系统读回来可能不补），
+/// 大小写与首尾空白也会变。按字符串比会把"还是我们那份"判成"被改过"，
+/// 于是每次关闭代理都丢弃还原点、退回只关开关 —— 用户原配置就还原不回来了。
+fn same_proxy_state(a: &ProxyState, b: &ProxyState) -> bool {
+    fn norm(addr: &str) -> (String, u16) {
+        match crate::os::proxy_addr::parse(addr) {
+            Some((host, port)) => (host.to_ascii_lowercase(), port),
+            // 解析不出来就原样留作标记：两边同样解析失败且文本一致时才算相同
+            None => (addr.trim().to_ascii_lowercase(), 0),
+        }
+    }
+    let eps = |st: &ProxyState| -> Vec<(String, (String, u16))> {
+        st.endpoints()
+            .into_iter()
+            .map(|(label, addr)| (label.to_string(), norm(addr)))
+            .collect()
+    };
+    a.enable == b.enable
+        && a.pac_present == b.pac_present
+        && norm_pac(a.autoconfig_url.as_deref()) == norm_pac(b.autoconfig_url.as_deref())
+        && eps(a) == eps(b)
+}
+
+fn norm_pac(u: Option<&str>) -> Option<&str> {
+    u.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// 我们上次**成功写下去**的代理状态（判还原点是否过期用）
+fn last_applied_file() -> std::path::PathBuf {
+    paths::appdata_dir().join("proxy_last_applied.json")
+}
+
+fn read_last_applied() -> Option<ProxyState> {
+    let text = std::fs::read_to_string(last_applied_file()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+fn write_last_applied(st: &ProxyState) -> Result<()> {
+    let text = serde_json::to_string_pretty(st)?;
+    if let Some(dir) = last_applied_file().parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(last_applied_file(), text.as_bytes())?;
+    Ok(())
+}
+
+fn drop_last_applied() {
+    let _ = std::fs::remove_file(last_applied_file());
+}
+
+/// 读出还原点。**不在读的时候删**：写入失败时还要靠它把系统还原回去
+/// （从前这里 `remove_file` 在读之前执行，于是"写一半失败"之后回滚拿不到
+/// 接管前状态，只能走 hard_clear —— 用户原来的代理配置就此丢失）。
+/// 删除时机见 [`finish_proxy_takeover`]：只有真正提交、或明确不再需要时才清掉。
+fn read_proxy_snapshot_file() -> Option<ProxyState> {
     let path = proxy_snapshot_file();
     let text = std::fs::read_to_string(&path).ok()?;
-    let state: ProxyState = serde_json::from_str(&text).ok()?;
-    let _ = std::fs::remove_file(&path);
-    Some(state)
+    serde_json::from_str(&text).ok()
+}
+
+/// 这份还原点现在还成立吗（只有成立时才允许"关闭代理"按它还原）。
+///
+/// `ensure_proxy_snapshot` 在**开启**侧会重写过期还原点，但"关闭"路径用的是
+/// 上一次运行留下的文件：应用退出、崩溃，或用户在外面改过系统代理之后，
+/// 文件里的"接管前状态"已经与用户现在的配置无关。按它还原 = 把用户后来做的
+/// 设置整体抹掉（HANDOFF §6.5 实测：把原本开着的公司代理整个关掉）。
+///
+/// 判据与开启侧一致 —— 当前系统代理是否仍等于我们上次写下去的那份
+/// （`proxy_last_applied.json`）。没有记录（旧版本升级）时**放行**：
+/// 升级当口无法判定，退回旧行为，至少不会因为引入新机制而丢掉已有的还原能力。
+fn snapshot_still_ours() -> bool {
+    let applied = read_last_applied();
+    match system_proxy::read() {
+        Ok(now) => {
+            let ok = snapshot_usable(applied.as_ref(), &now);
+            if !ok {
+                log::warn!(
+                    target: "proxy",
+                    "代理还原点已过期（系统代理与上次写入不一致，可能被其他工具或用户改过），忽略它"
+                );
+            }
+            ok
+        }
+        Err(e) => {
+            // 读不出当前状态就无法证伪，保守放行（还原本身也是"恢复到接管前"）
+            log::warn!(target: "proxy", "读取系统代理状态失败，无法校验还原点时效：{e}");
+            true
+        }
+    }
+}
+
+/// 判定本身（纯函数，便于单测）：没有"上次写入"记录时放行 —— 旧版本升级当口
+/// 无从判断，退回旧行为；有记录时要求当前系统代理与之等效。
+fn snapshot_usable(applied: Option<&ProxyState>, now: &ProxyState) -> bool {
+    match applied {
+        None => true,
+        Some(a) => same_proxy_state(a, now),
+    }
+}
+
+/// 丢弃不再成立的还原点（连同"上次写入"记录）
+fn discard_stale_snapshot() {
+    let _ = std::fs::remove_file(proxy_snapshot_file());
+    drop_last_applied();
+}
+
+/// 事务提交后的还原点生命周期（只在代理层成功落地后调用）。
+///
+///   · 开启成功 → 记下"我们写下去的是什么"（下次据此判断还原点是否过期）
+///   · 关闭 / 按快照还原成功 → 接管结束，还原点与记录一起丢弃
+fn finish_proxy_takeover(write: Option<&ProxyWrite>) {
+    match write {
+        Some(ProxyWrite::Manual(p)) if p.enable => {
+            if let Ok(st) = system_proxy::read() {
+                if let Err(e) = write_last_applied(&st) {
+                    log::warn!(target: "proxy", "记录已写入的代理状态失败（不影响本次切换）：{e}");
+                }
+            }
+        }
+        Some(_) => {
+            // 关闭代理 / 按快照还原：无论哪条路径，接管都已结束
+            let _ = std::fs::remove_file(proxy_snapshot_file());
+            drop_last_applied();
+        }
+        None => {}
+    }
 }
 
 fn valid_proxy_host(host: &str) -> bool {
-    let h = host.trim();
-    if h.is_empty() || h.len() > 253 {
-        return false;
-    }
-    if h.parse::<std::net::IpAddr>().is_ok() {
-        return true;
-    }
-    h.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
-        && !h.starts_with('-')
+    // 与探测侧、两平台回读解析共用同一份形状规则（含 IPv6）
+    crate::os::proxy_addr::host_ok(host)
 }
 
 // ---------------------------------------------------------------------------
@@ -663,6 +828,32 @@ fn probe_endpoint(label: Option<&str>, e: &ProxyEndpoint) -> Result<()> {
     )))
 }
 
+/// 逐协议并发探测，失败时按 HTTP → HTTPS → SOCKS 的顺序报**第一个**失败的协议。
+///
+/// 串行探测最坏是 3 × 800ms（三个协议都没起来时）—— 用户点一次"开启"要等
+/// 2.4 秒才看到那句"无法连接到…"，而这期间界面只有一个忙碌态。并发之后
+/// 墙钟压到单次探测的上限，报告出来的仍是第一处问题（顺序由参数决定，
+/// 不能让"谁先失败"取决于调度，否则同样的配置每次报的协议都可能不同）。
+fn probe_endpoints(endpoints: &[(Option<&'static str>, ProxyEndpoint)]) -> Result<()> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = endpoints
+            .iter()
+            .map(|(label, e)| scope.spawn(move || (*label, e, probe_endpoint(*label, e))))
+            .collect();
+        // join 顺序 = endpoints 顺序 = 报告的优先级
+        for h in handles {
+            match h.join() {
+                Ok((_, _, Err(e))) => return Err(e),
+                Ok(_) => {}
+                Err(_) => {
+                    return Err(AppError::internal("代理探测线程异常终止"));
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
 /// 代理层的父进程侧准备：校验 → 前置连通性自检 → 接管前快照。
 ///
 /// 这一步**不碰系统代理配置**（写的部分见 [`ProxyWrite`]），所以授权框要等到
@@ -700,9 +891,7 @@ fn prepare_proxy(t: &ProxyTarget) -> Result<ProxyPlan> {
             validate_endpoint(*label, e)?;
         }
         if t.probe {
-            for (label, e) in &endpoints {
-                probe_endpoint(*label, e)?;
-            }
+            probe_endpoints(&endpoints)?;
         }
         let before = system_proxy::read()?;
         ensure_proxy_snapshot(&before)?;
@@ -739,7 +928,14 @@ fn prepare_proxy(t: &ProxyTarget) -> Result<ProxyPlan> {
         })
     } else {
         // 关闭代理：不用"ProxyEnable=0"简单粗暴，而是快照还原（§3.3）
-        match take_proxy_snapshot_file() {
+        //
+        // 但还原点必须仍然"是我们的"：应用退出后用户可能已经自己配过代理，
+        // 按一份更早的文件还原等于把那段配置抹掉。过期就丢弃，退回"只关开关"。
+        let usable = read_proxy_snapshot_file().filter(|_| snapshot_still_ours());
+        if usable.is_none() {
+            discard_stale_snapshot();
+        }
+        match usable {
             Some(snap) => {
                 let report = ProxyReport::Restored {
                     enable: snap.enable,
@@ -837,14 +1033,20 @@ fn proxy_step(plan: &ProxyPlan, notified: bool) -> ApplyStep {
             }
         }
         ProxyReport::Disabled { pac_present } => {
+            // 关闭后按**总开关**回读一次：PAC 存在时手动代理确实不生效，但 PAC
+            // 自己也是一个"代理开着"的状态，不能报成"已关闭"（旧实现直接给
+            // step_ok，界面显示"系统代理已关闭"，而实际所有应用还在走 PAC）。
+            let verified = system_proxy::verify(false).unwrap_or(false);
             if *pac_present {
                 // 诚实报告：PAC 接管时 ProxyEnable=0 并不生效
                 step_soft(
                     "proxy",
                     "[E3004] 已关闭手动代理，但系统存在 PAC（AutoConfigURL），代理仍由 PAC 接管；如需彻底清除请使用「清除代理设置」",
                 )
-            } else {
+            } else if verified {
                 step_ok("proxy", "系统代理已关闭")
+            } else {
+                step_soft("proxy", "已写入关闭状态，但回读显示代理仍开着，请刷新确认")
             }
         }
     }
@@ -1308,5 +1510,112 @@ mod tests {
         assert_eq!(op["task"], "proxy_restore");
         assert_eq!(op["data"]["state"]["server"], "10.0.0.1:1080");
         assert!(crate::task_runner::KNOWN_TASKS.contains(&op["task"].as_str().unwrap()));
+    }
+
+    /// 还原点是否过期：只比"实际等效"的三件事，不比平台的原始串
+    #[test]
+    fn snapshot_staleness_uses_semantics_not_raw_strings() {
+        let base = ProxyState {
+            enable: true,
+            server: "127.0.0.1:7890".into(),
+            bypass: "localhost".into(),
+            autoconfig_url: None,
+            pac_present: false,
+            http_proxy: Some("127.0.0.1:7890".into()),
+            https_proxy: None,
+            socks_proxy: Some("127.0.0.1:1080".into()),
+        };
+        // 同一份状态、平台写法不同（大小写 / 首尾空白 / 原始串不同）→ 不算过期
+        let mut same = base.clone();
+        same.server = "http=127.0.0.1:7890;socks=127.0.0.1:1080".into();
+        same.bypass = "localhost;127.*;<local>".into();
+        same.socks_proxy = Some(" 127.0.0.1:1080 ".into());
+        assert!(same_proxy_state(&base, &same));
+
+        // IPv6 的两种合法写法是同一个落点：我们自己写出去补方括号、读回来未必有
+        let mut v6 = base.clone();
+        v6.http_proxy = Some("[::1]:7890".into());
+        v6.socks_proxy = Some("[::1]:1080".into());
+        let mut v6_read_back = v6.clone();
+        v6_read_back.http_proxy = Some("::1:7890".into());
+        v6_read_back.socks_proxy = Some("[::1]:1080".into());
+        assert!(same_proxy_state(&v6, &v6_read_back));
+
+        // 但端口不同就是真的不同
+        let mut v6_other_port = v6.clone();
+        v6_other_port.http_proxy = Some("[::1]:7891".into());
+        assert!(!same_proxy_state(&v6, &v6_other_port));
+
+        // 用户在外面关掉了代理 → 过期
+        let mut off = base.clone();
+        off.enable = false;
+        assert!(!same_proxy_state(&base, &off));
+
+        // 用户换了落点 → 过期
+        let mut moved = base.clone();
+        moved.http_proxy = Some("10.0.0.2:8080".into());
+        assert!(!same_proxy_state(&base, &moved));
+
+        // 多出一个 PAC → 过期（PAC 优先级高于手动代理，属于"接管被覆盖"）
+        let mut pac = base.clone();
+        pac.pac_present = true;
+        pac.autoconfig_url = Some("http://wpad/wpad.dat".into());
+        assert!(!same_proxy_state(&base, &pac));
+    }
+
+    /// 关闭代理时若被 PAC 接管，报告必须是"诚实失败"而不是"已关闭"
+    #[test]
+    fn disabled_with_pac_reports_soft_failure() {
+        let plan = ProxyPlan {
+            write: ProxyWrite::Manual(ManualProxy::off("localhost")),
+            report: ProxyReport::Disabled { pac_present: true },
+        };
+        let step = proxy_step(&plan, true);
+        assert!(step.applied, "写入是成功的");
+        assert!(!step.verified, "但系统里仍有 PAC，不能报成已关闭");
+        assert!(step.message.contains("PAC"));
+    }
+
+    /// 关闭代理时能不能按还原点还原：只有系统状态仍等于我们上次写下的那份才允许
+    #[test]
+    fn stale_snapshot_is_not_restored_on_close() {
+        let applied = ProxyState {
+            enable: true,
+            server: "127.0.0.1:7890".into(),
+            bypass: String::new(),
+            autoconfig_url: None,
+            pac_present: false,
+            http_proxy: Some("127.0.0.1:7890".into()),
+            https_proxy: None,
+            socks_proxy: None,
+        };
+
+        // 系统仍是我们写下的样子 → 还原点成立
+        assert!(snapshot_usable(Some(&applied), &applied.clone()));
+
+        // 用户在应用之外改了代理（换成公司代理）→ 还原点已过期
+        let mut user_changed = applied.clone();
+        user_changed.http_proxy = Some("10.0.0.10:20173".into());
+        assert!(!snapshot_usable(Some(&applied), &user_changed));
+
+        // 用户把代理关掉了 → 同样过期（按旧还原点会把更早的配置翻出来）
+        let mut user_off = applied.clone();
+        user_off.enable = false;
+        assert!(!snapshot_usable(Some(&applied), &user_off));
+
+        // 旧版本升级：没有"上次写入"记录 → 放行，退回旧行为
+        assert!(snapshot_usable(None, &user_changed));
+    }
+
+    /// IPv6 落点必须能通过写前校验（两平台共用 host_ok）
+    #[test]
+    fn ipv6_endpoint_passes_validation() {
+        let ep = ProxyEndpoint {
+            host: "::1".into(),
+            port: 7890,
+        };
+        assert!(validate_endpoint(None, &ep).is_ok());
+        // 编码成 `host:port` 时补方括号，否则半段地址会被当成端口
+        assert_eq!(ep.to_server(), "[::1]:7890");
     }
 }

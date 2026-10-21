@@ -42,6 +42,10 @@ pub struct ProfileBrief {
     /// 方案里记的网卡：快捷面板不摆网卡选择器，「还原自动」直接作用于它
     pub dns_enabled: bool,
     pub dns_alias: String,
+    /// 这次切换会不会弹管理员授权框（hosts / DNS 恒需提权；代理仅在 macOS 需要）。
+    /// 快捷面板据此决定"点一下直接切"还是"先问一句" —— 判据与 `apply` 同口径，
+    /// 前端不再自己拼 host 字符串去猜。
+    pub needs_elevation: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -113,8 +117,10 @@ pub async fn get_app_state(app: AppHandle) -> Result<AppStateView> {
                 file_lines != draft_lines
             },
             settings: cfg.settings.clone(),
-            profiles: cfg
-                .profiles
+            profiles: {
+                // 提权状态在进程生命周期内不变，但这里只读一次，别在每次迭代里都问一遍
+                let elevated_for_brief = privilege::detect().is_elevated;
+                cfg.profiles
                 .iter()
                 .map(|p| ProfileBrief {
                     id: p.id.clone(),
@@ -130,8 +136,15 @@ pub async fn get_app_state(app: AppHandle) -> Result<AppStateView> {
                     proxy_socks_port: p.proxy.socks_port,
                     dns_enabled: p.dns.enabled,
                     dns_alias: p.dns.interface_alias.clone(),
+                    // hosts 与 DNS 的提权会合并成一次；代理只有 macOS 需要提权
+                    // （Windows 写 HKCU）。已是管理员时任何一项都不弹框。
+                    needs_elevation: !elevated_for_brief
+                        && (p.hosts.enabled
+                            || p.dns.enabled
+                            || (p.proxy.enabled && crate::os::system_proxy::proxy_write_needs_root())),
                 })
-                .collect(),
+                .collect()
+            },
             active_profile_id: cfg.active_profile_id.clone(),
             active_profile_name: cfg.active_profile().map(|p| p.name.clone()),
             autostart_enabled: cfg.settings.autostart.enabled,

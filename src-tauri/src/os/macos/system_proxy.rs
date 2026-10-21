@@ -16,6 +16,7 @@
 //!   - PAC 由 `-setautoproxyurl` / `-setautoproxystate` 管理（手动写入不动 PAC，同 Windows）
 
 use crate::error::{AppError, Result, E3003, E3004};
+use crate::os::proxy_restore::ProtocolRestore;
 use serde::{Deserialize, Serialize};
 
 use super::{dns_client, net};
@@ -230,7 +231,17 @@ const SNAPSHOT_FMT: u8 = 2;
 struct ServiceSnapshot {
     fmt: u8,
     services: Vec<ServiceProxy>,
+    /// 写这份还原点的时刻（RFC 3339）。旧文件没有这个字段 → 视为过期。
+    ///
+    /// 为什么需要：文件里的"接管前状态"只有在**我们确实还在接管**时才成立。
+    /// app 崩溃、被杀、或有人绕过 app 直接调 helper 写入，都会让这份文件一直躺着，
+    /// 下一次"关闭代理"按它还原就会回到很久以前（HANDOFF §6.5 实测：把用户原本
+    /// 开着的公司代理整个关掉）。所以读取时先看时效（见 [`take_snapshot`]）。
+    #[serde(default)]
+    created_at: String,
 }
+
+// 时效判定的常量与实现见 `crate::os::proxy_snapshot`（两平台共用、可在任一平台单测）。
 
 // ---------------------------------------------------------------------------
 // 例外列表映射
@@ -364,9 +375,16 @@ pub fn read() -> Result<ProxyState> {
     })
 }
 
+/// 拼成 `host:port`。IPv6 用共用的 [`crate::os::proxy_addr::format`] 补方括号 ——
+/// `scutil` 报回来的是裸地址（`::1`），直接拼成 `::1:7890` 会让界面上显示的落点
+/// 与写下去的那份（`[::1]:7890`）长得不一样，也让人以为端口是 7890 还是别的。
 fn join_host_port(host: Option<String>, port: Option<String>) -> String {
     match (host, port) {
-        (Some(h), Some(p)) if !h.is_empty() && !p.is_empty() => format!("{h}:{p}"),
+        (Some(h), Some(p)) if !h.is_empty() && !p.is_empty() => match p.trim().parse::<u16>() {
+            Ok(port) => crate::os::proxy_addr::format(&h, port),
+            // 端口读不出来就照原样留（宁可显示得怪，也不编一个 0 号端口）
+            Err(_) => format!("{h}:{p}"),
+        },
         (Some(h), _) => h,
         _ => String::new(),
     }
@@ -474,6 +492,7 @@ pub fn write_manual(p: &crate::os::ManualProxy) -> Result<()> {
     for svc in &services {
         write_service_manual(svc, &plan, &p.bypass)?;
     }
+    invalidate_cache();
     Ok(())
 }
 
@@ -490,6 +509,7 @@ pub fn restore(state: &ProxyState) -> Result<()> {
                 }
             }
         }
+        invalidate_cache();
         return match first_err {
             Some(e) => Err(e),
             None => Ok(()),
@@ -505,6 +525,7 @@ pub fn restore(state: &ProxyState) -> Result<()> {
         write_service_manual(svc, &plan, &state.bypass)?;
         write_pac(svc, state.autoconfig_url.as_deref(), state.pac_present)?;
     }
+    invalidate_cache();
     Ok(())
 }
 
@@ -610,19 +631,41 @@ fn write_service_full(p: &ServiceProxy) -> Result<()> {
     write_exceptions(&p.service, &p.bypass)
 }
 
-/// 把某个协议恢复成还原点里的样子：开着就写回服务器，关着就显式关掉
+/// 把某个协议恢复成还原点里的样子。
+///
+/// 「该做什么」由共用的 [`crate::os::proxy_restore::plan`] 决定（纯逻辑，
+/// 两平台都能单测），这里只负责照着执行 networksetup。
+///
+/// `-set*proxy` 会顺带把开关打开，所以「关着但预填了地址」必须紧跟一次 off ——
+/// 中间这一瞬间是开着的，但两次调用之间没有别的写入，用户感知不到。
 fn write_protocol(service: &str, proto: Proto, want: &ProtocolProxy) -> Result<()> {
-    if !want.enable {
-        return set_proxy_state(service, proto, false);
+    match crate::os::proxy_restore::plan(want.enable, &want.server) {
+        ProtocolRestore::Enable(host, port) => set_proxy(service, proto, &host, port),
+        ProtocolRestore::Invalid(raw) => Err(AppError::coded(E3003).with_detail(format!(
+            "还原点里的 {} 代理地址不合法：{raw}",
+            proto.label()
+        ))),
+        ProtocolRestore::PrefillThenDisable(host, port) => {
+            // 预填地址写回失败不该阻断还原：开关状态比地址栏里的预填值重要，
+            // 丢掉预填只是下次要重填，开关没关回去则是代理还在生效。
+            if let Err(e) = set_proxy(service, proto, &host, port) {
+                log::warn!(
+                    target: "proxy",
+                    "还原 {service} 的 {} 预填地址失败（仅影响预填值）：{e}",
+                    proto.label()
+                );
+            }
+            // 上一步会把开关打开（networksetup 没有"只改地址不改开关"的命令），
+            // 这里的 off 没成功 = 用户原本关着的协议现在开着，必须说清楚。
+            set_proxy_state(service, proto, false).map_err(|e| {
+                AppError::coded(E3003).with_detail(format!(
+                    "{} 代理地址已回填，但开关没能关回去（可能仍处于开启状态），请检查 {service} 的代理设置：{e}",
+                    proto.label()
+                ))
+            })
+        }
+        ProtocolRestore::Disable => set_proxy_state(service, proto, false),
     }
-    let (host, port) = parse_server(&want.server).ok_or_else(|| {
-        AppError::coded(E3003).with_detail(format!(
-            "还原点里的 {} 代理地址不合法：{}",
-            proto.label(),
-            want.server
-        ))
-    })?;
-    set_proxy(service, proto, &host, port)
 }
 
 /// PAC（`-setautoproxyurl` / `-setautoproxystate`）
@@ -680,16 +723,30 @@ fn snapshot_services(services: &[String]) -> Result<()> {
     if snapshot_path().exists() {
         return Ok(());
     }
-    let mut list = Vec::new();
-    for svc in services {
-        match read_service(svc) {
-            Ok(p) => list.push(p),
-            Err(e) => log::warn!(target: "proxy", "读取服务 {svc} 的代理设置失败（跳过）：{e}"),
+    // 每个服务要起 5 个 networksetup（三个协议 + 例外列表 + PAC），串行读一台常见
+    // 双服务机器就是 10+ 次进程启动 —— 这一步发生在"点开启"之后、写第一个字节之前，
+    // 用户看到的是长时间的"正在应用…"。各服务的读取互不依赖，并发后墙钟按单服务算。
+    // 顺序仍然保持 services 的顺序（join 按提交顺序取结果），还原点里的服务次序稳定。
+    let mut list: Vec<ServiceProxy> = Vec::new();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = services
+            .iter()
+            .map(|svc| (svc, scope.spawn(move || (svc, read_service(svc)))))
+            .collect();
+        for (svc, h) in handles {
+            match h.join() {
+                Ok((_, Ok(p))) => list.push(p),
+                Ok((_, Err(e))) => {
+                    log::warn!(target: "proxy", "读取服务 {svc} 的代理设置失败（跳过）：{e}")
+                }
+                Err(_) => log::warn!(target: "proxy", "读取服务 {svc} 的线程异常终止（跳过）"),
+            }
         }
-    }
+    });
     let snap = ServiceSnapshot {
         fmt: SNAPSHOT_FMT,
         services: list,
+        created_at: chrono::Local::now().to_rfc3339(),
     };
     let text = serde_json::to_string_pretty(&snap)?;
     let path = snapshot_path();
@@ -734,6 +791,17 @@ fn take_snapshot() -> Result<Option<Vec<ServiceProxy>>> {
             "代理还原点格式版本 {} 与当前 {} 不符（按无还原点处理）",
             snap.fmt,
             SNAPSHOT_FMT
+        );
+        let _ = std::fs::remove_file(&path);
+        return Ok(None);
+    }
+    // 时效检查：见 `crate::os::proxy_snapshot` 的说明。没有时间戳（旧文件）同样按
+    // 过期处理 —— 宁可"不还原"，也不能拿一份不知道多久以前的配置覆盖用户现在的设置。
+    if crate::os::proxy_snapshot::expired(&snap.created_at, chrono::Local::now()) {
+        log::warn!(
+            target: "proxy",
+            "代理还原点已超过 {} 小时（或缺少时间戳），按无还原点处理",
+            crate::os::proxy_snapshot::MAX_AGE_HOURS
         );
         let _ = std::fs::remove_file(&path);
         return Ok(None);
@@ -805,7 +873,10 @@ fn invalidate_cache() {
     dns_client::invalidate_cache();
 }
 
-/// 解析 "127.0.0.1:7890" 形式；兼容 "http=host:port;https=host:port"
+/// 解析 "127.0.0.1:7890" / "[::1]:7890" 形式；兼容 "http=host:port;https=host:port"
+///
+/// 单段解析与 Windows 共用 [`crate::os::proxy_addr::parse`]：方括号 IPv6 的规则
+/// 只能写一份，否则两平台对同一串地址的理解迟早分叉。
 pub fn parse_server(server: &str) -> Option<(String, u16)> {
     let s = server.trim();
     if s.is_empty() {
@@ -813,18 +884,15 @@ pub fn parse_server(server: &str) -> Option<(String, u16)> {
     }
     let first = s.split(';').next().unwrap_or(s);
     let seg = first.rsplit('=').next().unwrap_or(first);
-    let (host, port) = seg.rsplit_once(':')?;
-    let port: u16 = port.trim().parse().ok()?;
-    if host.trim().is_empty() {
-        return None;
-    }
-    Some((host.trim().to_string(), port))
+    let (host, port) = crate::os::proxy_addr::parse(seg)?;
+    (port > 0).then_some((host, port))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// 时效判定的用例在 `crate::os::proxy_snapshot`（两平台共用，Windows 上也会跑）
     #[test]
     fn parse_server_forms() {
         assert_eq!(
@@ -837,6 +905,35 @@ mod tests {
         );
         assert_eq!(parse_server(""), None);
         assert_eq!(parse_server("no-port"), None);
+        // 方括号 IPv6：方括号是字面量语法，不是主机名的一部分
+        assert_eq!(parse_server("[::1]:7890"), Some(("::1".to_string(), 7890)));
+        assert_eq!(
+            parse_server("https=[2606:4700:4700::1111]:8443"),
+            Some(("2606:4700:4700::1111".to_string(), 8443))
+        );
+        // 端口 0 不算落点（networksetup 会拒绝，界面也不该当成"已配置"）
+        assert_eq!(parse_server("localhost:0"), None);
+    }
+
+    /// `scutil` 报回来的是裸 IPv6 地址，拼成落点时必须补方括号，
+    /// 且拼出来的串要能被 `parse_server` 原样读回去（否则回读校验永远不通过）
+    #[test]
+    fn join_host_port_brackets_ipv6() {
+        assert_eq!(
+            join_host_port(Some("127.0.0.1".into()), Some("7890".into())),
+            "127.0.0.1:7890"
+        );
+        assert_eq!(
+            join_host_port(Some("::1".into()), Some("7890".into())),
+            "[::1]:7890"
+        );
+        assert_eq!(
+            parse_server(&join_host_port(Some("::1".into()), Some("7890".into()))),
+            Some(("::1".to_string(), 7890))
+        );
+        // 没有端口 / 没有地址：原样返回，不编一个 0
+        assert_eq!(join_host_port(Some("::1".into()), None), "::1");
+        assert_eq!(join_host_port(None, Some("7890".into())), "");
     }
 
     #[test]
@@ -1090,6 +1187,7 @@ mod tests {
                 autoconfig_url: None,
                 pac_present: false,
             }],
+            created_at: chrono::Local::now().to_rfc3339(),
         };
         let text = serde_json::to_string(&snap).unwrap();
         let back: ServiceSnapshot = serde_json::from_str(&text).unwrap();
@@ -1097,5 +1195,18 @@ mod tests {
         assert!(back.services[0].web.enable);
         assert!(!back.services[0].secure.enable);
         assert!(!back.services[0].socks.enable);
+        // 时间戳必须活过一次序列化往返，否则读回来就被判过期
+        assert_eq!(back.created_at, snap.created_at);
+    }
+
+    /// 「该还原成什么样」的决策在 `crate::os::proxy_restore`（两平台共用的纯逻辑，
+    /// Windows 上也会跑）；这里只验证平台层确实照着决策走。
+    #[test]
+    fn write_protocol_uses_shared_decision() {
+        // 关着但预填了地址 → 决策必须落在 PrefillThenDisable，而不是简单关开关
+        assert_eq!(
+            crate::os::proxy_restore::plan(false, "10.0.0.10:20173"),
+            ProtocolRestore::PrefillThenDisable("10.0.0.10".into(), 20173)
+        );
     }
 }

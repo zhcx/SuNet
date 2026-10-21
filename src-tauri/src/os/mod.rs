@@ -32,6 +32,18 @@ pub use macos::{dns_client, dock, fs_security, hosts_io, privilege, system_proxy
 
 pub mod dns_presets;
 pub mod hosts_file;
+/// 代理落点 `host:port` 的唯一解析 / 格式化实现（含 IPv6 方括号规则）
+pub mod proxy_addr;
+/// 还原单个协议时要执行的动作（纯逻辑，两平台共用；macOS 平台层照着执行）
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub mod proxy_restore;
+/// 代理还原点的时效判定（两平台共用，纯逻辑）
+///
+/// 生产代码里只有 macOS 的 `take_snapshot` 调用它（Windows 的还原点时效靠
+/// `apply.rs` 的 `same_proxy_state` 判定），但单测在 Windows 上也会跑 ——
+/// 所以只对非 macOS 的非测试构建放行 dead_code。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub mod proxy_snapshot;
 
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +74,9 @@ pub struct ManualProxy {
     /// 总开关；false = 关闭全部协议（三协议的落点都不看）
     pub enable: bool,
     /// HTTP 落点 `host:port`（提权载荷里叫 `server`；留空 = 关闭该协议）
+    ///
+    /// IPv6 写 `[::1]:7890`：`proxy_addr::format` 负责补方括号，两边平台层
+    /// 都按同一份规则解析（见 [`proxy_addr`]）。
     #[serde(rename = "server")]
     pub http: String,
     /// HTTPS 落点 `host:port`；`None` = 关闭该协议
