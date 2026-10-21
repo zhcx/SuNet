@@ -156,11 +156,24 @@ fn split_server(server: &str) -> (Option<String>, Option<String>, Option<String>
 ///   注意分段里**必须给每个非空协议都带上 scheme 前缀**：Chromium 一旦看到
 ///   `scheme=` 就只按分段解析，裸 `host:port` 段会被整体忽略
 fn join_server(p: &crate::os::ManualProxy) -> String {
-    let http = p.http.trim();
-    let https = p.https.as_deref().map(str::trim).unwrap_or("");
-    let socks = p.socks.as_deref().map(str::trim).unwrap_or("");
+    // 落点统一走 `proxy_addr::format`：IPv6 必须带方括号，否则分段串里的
+    // `host:port` 会退化成一串冒号，系统与 Chromium 都拆不回来
+    let canon = |raw: &str| -> String {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return String::new();
+        }
+        match crate::os::proxy_addr::parse(raw) {
+            Some((host, port)) if port > 0 => crate::os::proxy_addr::format(&host, port),
+            // 解析不出来就原样写（校验在准备阶段已经拦过一遍，这里不吞掉信息）
+            _ => raw.to_string(),
+        }
+    };
+    let http = canon(&p.http);
+    let https = p.https.as_deref().map(canon).unwrap_or_default();
+    let socks = p.socks.as_deref().map(canon).unwrap_or_default();
     if https.is_empty() && socks.is_empty() {
-        return http.to_string();
+        return http;
     }
     [
         (!http.is_empty()).then(|| format!("http={http}")),
@@ -179,10 +192,16 @@ fn join_server(p: &crate::os::ManualProxy) -> String {
 /// （与 0.0.3 前一致）；配了 HTTPS / SOCKS 时写系统代理同款分段语法
 /// `http=…;https=…;socks=…`（`socks=` 即系统设置里 SOCKS 一项的写法）。
 /// 三个协议的语义与 macOS 对齐：给了落点的写进去，`None` / 空串 = 关闭该协议。
+///
+/// **写入顺序：先改地址与绕过列表，最后动 `ProxyEnable`。**
+/// 反过来的话，从"打开开关"到"地址落盘"之间有一个瞬间系统代理已经启用、
+/// 但 `ProxyServer` 还是空的（或上一次的旧地址）——那一刻发起请求的应用会
+/// 全部失败，而且抓不到原因。关闭时同理：先关开关，再清地址（先清地址等于
+/// 在代理仍开着的时候把落点抽走）。
 pub fn write_manual(p: &crate::os::ManualProxy) -> Result<()> {
+    let key = open(false)?;
     if !p.enable {
-        // 关闭时不看落点：清掉已有的 proxy 字符串（与 macOS 的「三项全关」对齐）
-        let key = open(false)?;
+        // 关闭时不看落点：先关开关，再清掉已有的 proxy 字符串（与 macOS 的「三项全关」对齐）
         key.set_value("ProxyEnable", &0u32).map_err(|e| {
             crate::error::AppError::new(E3003, format!("写入 ProxyEnable 失败：{e}"))
         })?;
@@ -197,9 +216,7 @@ pub fn write_manual(p: &crate::os::ManualProxy) -> Result<()> {
         return Ok(());
     }
 
-    let key = open(false)?;
-    key.set_value("ProxyEnable", &1u32)
-        .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyEnable 失败：{e}")))?;
+    // 地址与绕过列表先落盘，最后才打开开关
     key.set_value("ProxyServer", &join_server(p))
         .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyServer 失败：{e}")))?;
     if !p.bypass.trim().is_empty() {
@@ -207,18 +224,20 @@ pub fn write_manual(p: &crate::os::ManualProxy) -> Result<()> {
             crate::error::AppError::new(E3003, format!("写入 ProxyOverride 失败：{e}"))
         })?;
     }
+    key.set_value("ProxyEnable", &1u32)
+        .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyEnable 失败：{e}")))?;
     Ok(())
 }
 
 /// 完整写回（含 PAC），用于快照还原
+///
+/// 顺序与 [`write_manual`] 同一原则：**先摆好所有内容，最后才打开开关**。
+/// 这里比 `write_manual` 多一个坑——PAC 的优先级高于手动代理，所以要先把
+/// `AutoConfigURL` 处理干净，再决定 `ProxyEnable`：若原状态本来就是
+/// 「手动代理开着 + 有 PAC」，先开开关、后写 PAC 会让系统短暂按手动代理走。
 pub fn restore(state: &ProxyState) -> Result<()> {
     let key = open(false)?;
-    key.set_value("ProxyEnable", &if state.enable { 1u32 } else { 0u32 })
-        .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyEnable 失败：{e}")))?;
-    key.set_value("ProxyServer", &state.server)
-        .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyServer 失败：{e}")))?;
-    key.set_value("ProxyOverride", &state.bypass)
-        .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyOverride 失败：{e}")))?;
+    // ① PAC：原状态有就写回，没有就删（残留 PAC 会盖掉手动代理）
     match &state.autoconfig_url {
         Some(url) if !url.trim().is_empty() => {
             key.set_value("AutoConfigURL", url).map_err(|e| {
@@ -226,10 +245,27 @@ pub fn restore(state: &ProxyState) -> Result<()> {
             })?;
         }
         _ => {
-            // 原状态无 PAC → 确保删除，否则残留 PAC 会覆盖手动代理
             let _ = key.delete_value("AutoConfigURL");
         }
     }
+    // ② 关闭时不看落点（开关已经在最后一步关掉），只清干净
+    if !state.enable {
+        key.set_value("ProxyEnable", &0u32).map_err(|e| {
+            crate::error::AppError::new(E3003, format!("写入 ProxyEnable 失败：{e}"))
+        })?;
+        key.set_value("ProxyServer", &state.server)
+            .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyServer 失败：{e}")))?;
+        key.set_value("ProxyOverride", &state.bypass)
+            .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyOverride 失败：{e}")))?;
+        return Ok(());
+    }
+    // ③ 开着：地址 → 绕过列表 → 最后才打开开关
+    key.set_value("ProxyServer", &state.server)
+        .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyServer 失败：{e}")))?;
+    key.set_value("ProxyOverride", &state.bypass)
+        .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyOverride 失败：{e}")))?;
+    key.set_value("ProxyEnable", &1u32)
+        .map_err(|e| crate::error::AppError::new(E3003, format!("写入 ProxyEnable 失败：{e}")))?;
     Ok(())
 }
 
@@ -265,6 +301,11 @@ pub fn verify(expect_enable: bool) -> Result<bool> {
 /// WinINET 的三个协议共用一个 `ProxyServer` 值，但语义上已是逐协议的
 /// （见 [`split_server`] / [`join_server`]）：把"想要的状态"逐协议与回读结果比对，
 /// 写一半（比如只落了 `http=` 段）会被发现。
+///
+/// 比对**按语义**（主机 + 端口）而不是按字符串：系统设置面板、第三方代理工具、
+/// 以及我们自己的 [`join_server`] 对同一个落点有多种合法写法
+/// （`[::1]:7890` / `::1:7890` / 大小写 / 首尾空白），按字符串比会把"写对了"
+/// 误判成"校验不通过"，界面于是提示"代理已写入但回读校验不通过"。
 pub fn verify_manual(want: &crate::os::ManualProxy) -> Result<bool> {
     let st = read()?;
     if !want.enable {
@@ -273,15 +314,32 @@ pub fn verify_manual(want: &crate::os::ManualProxy) -> Result<bool> {
     Ok(
         st.enable
             && !st.pac_present
-            && norm_opt(st.http_proxy.as_deref()) == norm_opt(Some(want.http.as_str()))
-            && norm_opt(st.https_proxy.as_deref()) == norm_opt(want.https.as_deref())
-            && norm_opt(st.socks_proxy.as_deref()) == norm_opt(want.socks.as_deref()),
+            && same_endpoint(st.http_proxy.as_deref(), Some(want.http.as_str()))
+            && same_endpoint(st.https_proxy.as_deref(), want.https.as_deref())
+            && same_endpoint(st.socks_proxy.as_deref(), want.socks.as_deref()),
     )
 }
 
 /// `None` / 空串统一成 `None`（逐协议比对用）
 fn norm_opt(s: Option<&str>) -> Option<&str> {
     s.map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// 两个落点是否指向同一个 `host:port`（None / 空串都算"该协议关闭"）
+fn same_endpoint(got: Option<&str>, want: Option<&str>) -> bool {
+    let got = norm_opt(got);
+    let want = norm_opt(want);
+    match (got, want) {
+        (None, None) => true,
+        (Some(g), Some(w)) => {
+            // 解析不出来时退回字符串比对：至少不把"明显不同"的当成一致
+            match (parse_single(g), parse_single(w)) {
+                (Some(a), Some(b)) => a == b,
+                _ => g.eq_ignore_ascii_case(w),
+            }
+        }
+        _ => false,
+    }
 }
 
 /// 通知系统配置已变更（§3.2）；失败只记 warning，不中断事务
@@ -320,7 +378,10 @@ pub fn proxy_write_needs_root() -> bool {
     false
 }
 
-/// 解析 "127.0.0.1:7890" 形式
+/// 解析 "127.0.0.1:7890" / "[::1]:7890" 形式
+///
+/// 单段解析交给共用的 [`crate::os::proxy_addr::parse`]（方括号 IPv6 的规则只写一遍），
+/// 这里只负责"分段串优先取 HTTP 段"这层 Windows 专属语义。
 pub fn parse_server(server: &str) -> Option<(String, u16)> {
     let s = server.trim();
     if s.is_empty() {
@@ -340,11 +401,10 @@ pub fn parse_server(server: &str) -> Option<(String, u16)> {
     parse_single(s)
 }
 
-/// 解析单个 `host:port` 段
+/// 解析单个 `host:port` 段（方括号 IPv6 由共用规则处理）
 fn parse_single(seg: &str) -> Option<(String, u16)> {
-    let (host, port) = seg.trim().rsplit_once(':')?;
-    let port: u16 = port.trim().parse().ok()?;
-    Some((host.trim().to_string(), port))
+    let (host, port) = crate::os::proxy_addr::parse(seg)?;
+    (port > 0).then_some((host, port))
 }
 
 #[cfg(test)]
@@ -419,6 +479,21 @@ mod tests {
             bypass: String::new(),
         };
         assert_eq!(join_server(&socks_only), "socks=127.0.0.1:1080");
+    }
+
+    #[test]
+    fn parse_server_handles_bracketed_ipv6() {
+        // 方括号 IPv6：方括号只属于字面量语法，解析结果不能带进主机名
+        assert_eq!(parse_server("[::1]:7890"), Some(("::1".into(), 7890)));
+        assert_eq!(parse_server("socks=[::1]:1080"), Some(("::1".into(), 1080)));
+        // 分段串里带方括号的 HTTPS 段同样要能读回来
+        assert_eq!(
+            parse_server("http=[2606:4700:4700::1111]:7890;socks=127.0.0.1:1080"),
+            Some(("2606:4700:4700::1111".into(), 7890))
+        );
+        // 端口缺失 / 非法一律 None（不能当成 0 号端口写进系统）
+        assert_eq!(parse_server("localhost:0"), None);
+        assert_eq!(parse_server("localhost"), None);
     }
 
     #[test]

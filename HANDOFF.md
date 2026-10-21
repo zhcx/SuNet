@@ -15,7 +15,7 @@ npm run tauri -- dev            # 开发（先起 vite:5180，再起 Tauri）
 npm run tauri -- build          # 生产包（真正内嵌前端资源的构建，见 §4.8）
 npm run check                   # 前端类型检查
 cd src-tauri && cargo test      # 本机平台跑自己那份单测（纯逻辑，不碰系统）
-                                # 2026-10-12 计：源码 85 个 #[test]，Windows 实测 73；macOS 未重跑（应仍为 73）
+                                # 2026-10-21 计：源码 120 个 #[test]，macOS 实测 107（平台专属各自只编译自己那份）
 
 # macOS（本机 = Apple Silicon + Xcode Command Line Tools ⇒ 本地就能出包）
 npm run tauri -- build -- --target aarch64-apple-darwin --bundles dmg   # Apple Silicon
@@ -74,6 +74,16 @@ git tag v0.0.1 && git push origin v0.0.1
 > · **第三层：WebView2 会吞掉 tao 的焦点事件**。WebView2 初始化把键盘焦点移进自己的子窗口，顶层收到 WM_KILLFOCUS（tao 记下 focused=false），之后用户真把面板切到后台时 `active_focus_changed` 判定「状态没变」**不再发 `Focused(false)`** —— Rust 侧收不到收起信号。兜底 = **前端 `window.blur` 监听**（浏览器标准语义，WebView2 可靠触发）调 `quickHide()`，1000ms 内的 blur（加载/激活抖动）忽略；后端在 show 时发 `sunet://quick-shown` 事件重置前端计时，前端再以 `visibilitychange` 兜底重置。**toggle_quick 同时认得「刚被失焦收起」**（`quick_blur_hidden_at`，400ms 窗口）：点托盘收面板不会「关了又开」。
 > · **自动化验证**（本机 Windows，debug 构建 + vite dev + PowerShell P/Invoke 脚本模拟鼠标）：冷启动 `--panel` → 点击面板中心激活 → 点击面板外 → 面板隐藏，**连续两轮 PASS**；`cargo test` 73 项全过、`npm run check` / `npm run build` 零错误。⚠️ 测试期间以 `--panel` 反复启停 debug 实例，用户屏幕上闪现过的「快捷小窗 404」是 dev 模式未连上 vite 的错误页，安装版无此问题。**release 打包冒烟又揪出两层时序问题**（debug 慢启动下竞态被 vite 加载延迟掩盖，release 内嵌页面秒开才暴露）：① 前台拉锯 —— 面板激活后又被系统短暂抢走再抢回来，成对的 true/false 使宽限过期，拉锯稳定后的第一次失焦误收 ⇒ 宽限起点改为**最后一次激活**（`Focused(true)` 时刷新）；② WebView2 加载完成把键盘焦点移进子窗口，顶层收一轮 WM_KILLFOCUS（tao 报 `Focused(false)`）而**前台仍是面板** ⇒ 收起判定加 `GetForegroundWindow() == quick_hwnd` 前台核对，前台没变就不收（`winapi.rs` 补了 `GetForegroundWindow` FFI）。release 冒烟：timeline 连续 9s 可见 × 2 轮全过。
 
+> 2026-10-21 macOS 兼容性收尾（`fix/proxy-switch-stability` 支线，真机复验）：
+> · **PAC 地址读丢**：`networksetup -getautoproxyurl` 的键是 `URL:` 而不是 `Server:`，此前复用逐协议解析器只能得到 `enabled=true, server=""` ⇒ `autoconfig_url` 恒为 `None`、`pac_present` 恒为 false；还原时反而会把用户原有的 PAC **关掉**，「被 PAC 接管」的报告与还原点时效判定也一起失效。已改为独立解析（区分 `URL: (null)` 与真实地址）并补单测。
+> · **写入顺序**：逐协议此前按 HTTP → HTTPS → SOCKS 一趟走完，注释写着「先开要开的、后关不要的」但实现是先关再开（HTTP→HTTPS 切换时中间一段系统里没有代理）。改为两趟：先全部打开，最后关闭。还原改为 **PAC 先于手动代理**（PAC 优先级更高），与 Windows 同序。
+> · **平台层还原点也会陈旧**：macOS 的代理写 / 还原全在 root helper 里，读不到用户家目录的 `proxy_last_applied.json`。平台层现在写自己那份（与 `proxy_prev.json` 同目录、同身份），用共用的 `proxy_snapshot::same_state` 判旧还原点是否仍成立；关闭、彻底清除、还原后丢弃。注意 `take_snapshot()` 读取即删除文件，所以还原路径不需要额外 `drop_snapshot`。
+> · **root 家目录**：launchd 不给 `HOME` 时旧代码退回 `/tmp`。**2026-10-21 实测确认** `/tmp/Library/Application Support/SuNet/proxy_prev.json` 存在（root 属主）——`/tmp` 会被清理、与文档路径不符、且 1777 下可被别的本地用户抢占。改用 `getpwuid_r(geteuid())` ⇒ `/var/root/Library/Application Support/SuNet/`；旧文件不会自动迁移，可手工删除。
+> · **通知类型错配**：`notify::send` 查裸 `AppState`，而 `main.rs` manage 的是 `SharedState` ⇒ `mark_warn_unread()` 从不执行、托盘「⚠」前缀永不出现（与 2026-10-12 tray.rs 同一根因）。已改 `try_state::<SharedState>()`。
+> · **免密通道下不再多问一次**：`ProfileBrief.needs_elevation` 现在算的是「这次切换**会不会真的弹框**」：`elevation_task::usable()` 为真（装了 helper / 计划任务）或已是管理员时不弹确认。
+> · **真机验证边界**：本机安装的助手仍是 **2026-10-10 的旧二进制**（未随 app 更新），所以新平台逻辑（`proxy_last_applied.json`、陈旧还原点重写、PAC 解析、写入顺序）只经过单测；验证只走到旧 helper 的写入。系统代理在验证中被临时改写，结束后已按预先抓取的逐服务快照用 `networksetup` 恢复，`diff` 完全一致。要完整复验需重新构建并 `--helper-install` 换掉助手（见 §6.4 第 7 条）。
+> · `cargo test` **107 项全过**（macOS 27.0.1 / Apple Silicon，2026-10-21）；`npm run check` / `npm run test` / `npm run build` 通过；`test:ui` 因本机未装 Chrome 未跑。
+
 | 事实 | 值 |
 |---|---|
 | 后端 | Rust 47 文件 / 13 827 行（`os/windows` 8 + `os/macos` 7 + `helper` 4）；Tauri 2.12.1 + tauri-build 2.7.1 |
@@ -81,7 +91,7 @@ git tag v0.0.1 && git push origin v0.0.1
 | Tauri 命令 | **62 个**，全部在 `src-tauri/src/main.rs` 的 `invoke_handler` 注册 |
 | 错误码 | 26 个（`src-tauri/src/error.rs`，含中文文案表与退出码映射） |
 | 配置 schema | `schema_version = 1`（迁移表在 `migrate.rs`） |
-| 单测 | 源码共 **80** 个 `#[test]`（覆盖 hosts 编解码/幂等、预设地址、订阅校验、迁移、脱敏、hex、IPC 映射、热键直连切换目标选择、快捷键键名收敛与非法组合拒绝、DNS/代理解析与 `pick_in_use`、代理载荷形状与逐协议落点）；其中平台专属 macOS 17 / Windows 7，各自只编译自己那份 → **macOS 实测 73**（2026-10-10），Windows 现应 63（未重跑） |
+| 单测 | 源码共 **120** 个 `#[test]`（覆盖 hosts 编解码/幂等、预设地址、订阅校验、迁移、脱敏、hex、IPC 映射、热键直连切换目标选择、快捷键键名收敛与非法组合拒绝、DNS/代理解析与 `pick_in_use`、代理载荷形状与逐协议落点、还原点时效与语义比较、macOS 写入顺序 / PAC 解析）；平台专属各自只编译自己那份 → **macOS 实测 107**（2026-10-21），Windows 数未重跑 |
 | 前端产物 | index.html + quick.html 双入口，约 98 KB JS / 25 KB CSS（压缩后 gzip 约 31 KB） |
 | 生产包体积 | Windows：`SuNet.exe` 6.2 MB（不含 WebView2，用系统自带）；NSIS 安装包 `SuNet_<版本>_x64-setup.exe` 约 2.2 MB（`target/release/bundle/nsis/`），MSI 在 `bundle/msi/`。macOS：`SuNet_<版本>_aarch64.dmg` / `SuNet_<版本>_x86_64.dmg`（ad-hoc 签名，未公证；此前 universal 包约 5.8 MB） |
 | 发布流水线 | `.github/workflows/release.yml`（结构参考同作者的 zeditor）：tag `v*` → `prepare-release`（先建 Release，说明取自 CHANGELOG）→ `build` matrix 并行（Windows nsis+msi；macOS aarch64 / x86_64 各一份 dmg，`fail-fast: false`）→ `readme`（把平台表与版本号写回 README 并提交）；各构建 job 只依赖 `prepare-release`，平台之间互不连坐 |
@@ -373,7 +383,7 @@ Hyper-V 的 vEthernet 报 IfType=6（会被 if_type∈{6,71} 的物理近似误�
 
 | 项 | 判据 |
 |---|---|
-| 单测 | `cargo test` → **55 passed**（2026-10-07 Windows 实测；此后源码增至 80 个 `#[test]`，macOS 专属 17 个不参与编译 ⇒ Windows 现应 63）。**macOS 2026-10-10 实测 73 passed**，见 §6.4 |
+| 单测 | `cargo test` → **107 passed**（**macOS 2026-10-21 实测**，源码 120 个 `#[test]`，Windows 专属不参与编译；Windows 侧数未重跑）。历史：2026-10-07 Windows 55 passed、2026-10-10 macOS 73 passed |
 | 前端 | `npm run check` 零错误；`npm run build` 双入口产物 |
 | 后端 | `cargo build` 零警告 |
 | IPC 延迟 | CDP 实测 `get_app_state` ≈ 2–6ms；`dns_interfaces`（FFI）≈ 8ms；主窗口五个标签页切换全部 ≈ 110ms（DNS 页曾 3080ms） |
@@ -548,11 +558,11 @@ WinHTTP 代理、PAC 代理模式、TUN/虚拟网卡、hosts 通配符规则、�
 6. **提权助手路径下的「写前还原点」**（§4.21）：修复前 root 身份写 `proxy_prev.json` 一律 ENOENT（已用普通用户身份在旧二进制上复现，逐字命中用户的 `[E0000]`）；修复后**必须在真正走助手的路径上验证一次**（GUI 里切换带代理层的方案），并确认 root 的 appdata 里真的出现了这份还原点：`sudo ls -l "/var/root/Library/Application Support/SuNet/proxy_prev.json"`。
    ✅ 2026-10-11 已在**助手路径**上验证：直接以控制台用户身份连 `/var/run/sunet-helper.sock` 发 `proxy_write` → `proxy_restore`（见 §6.5），root 身份落盘无 ENOENT，写入与还原都成功；GUI 点击那条路径仍未实跑。
 
-**本机验证边界**：2026-10-10 起开发机就是 **macOS 27.0.1 / Apple Silicon** ⇒ macOS 侧**现在能本地验证**：`cargo test` 73 项、`npm run tauri -- build` 出 `.app` / `.dmg`、回读可以直接看 `scutil --proxy`（不必依赖截图，见 §4.20 的离屏量法）。反过来 **Windows 侧只能靠 CI**（本机既跑不了 Windows 那份 `cargo test`，也没法在 Windows 上冒烟）。历史注（Intel iMac、无 `cc`）：`cargo check --target aarch64-apple-darwin` 曾死在 `objc2-exception-helper` 的 build script（`failed to find tool "cc"`），那时只能由 CI 回答「macOS 能不能编译」（CI 当年答：能编译、59 项单测、dmg 能出，见 §5.1）。
+**本机验证边界**：2026-10-10 起开发机就是 **macOS 27.0.1 / Apple Silicon** ⇒ macOS 侧**现在能本地验证**：`cargo test` 107 项（2026-10-21）、`npm run tauri -- build` 出 `.app` / `.dmg`、回读可以直接看 `scutil --proxy`（不必依赖截图，见 §4.20 的离屏量法）。反过来 **Windows 侧只能靠 CI**（本机既跑不了 Windows 那份 `cargo test`，也没法在 Windows 上冒烟）。历史注（Intel iMac、无 `cc`）：`cargo check --target aarch64-apple-darwin` 曾死在 `objc2-exception-helper` 的 build script（`failed to find tool "cc"`），那时只能由 CI 回答「macOS 能不能编译」（CI 当年答：能编译、59 项单测、dmg 能出，见 §5.1）。
 
 **Mac 实测清单（拿到 mac 后按顺序跑）**
 1. `npm ci` → `npm run tauri -- build -- --target aarch64-apple-darwin --bundles dmg`（Intel 机器换 `x86_64-apple-darwin`）→ 装 dmg（首次要在「系统设置 → 隐私与安全性」放行）。
-2. `cd src-tauri && cargo test` → 预期 **73 项**（80 − 7 项 Windows 专属；2026-10-10 本机实测 73 passed）。
+2. `cd src-tauri && cargo test` → 预期 **107 项**（2026-10-21 本机实测；Windows 专属测试不参与编译）。
 3. 启动三态冒烟：裸启 / `--minimized` / `--panel`；日志无 error；托盘菜单与 ⌘ 组合热键可用。
 4. hosts：写入 → `cat /etc/hosts` 看托管区块 → 还原 → 区块消失；`ls -l /etc/hosts` 应为 `root wheel` `0644`。
 5. 代理：HTTP / HTTPS / SOCKS 各填一个落点后开启，用 `scutil --proxy` 核对 `HTTPEnable` / `HTTPSEnable` / `SOCKSEnable` 与端口逐项对上（**留空的协议必须是 0**）；关闭后回到原值（逐协议还原点 `proxy_prev.json`）。顺手验证 §4.21：走**助手**（GUI 切换）时提权身份也要能落盘 —— `sudo ls -l "/var/root/Library/Application Support/SuNet/proxy_prev.json"` 应存在（用户身份跑复现命令则是 `~/Library/Application Support/SuNet/proxy_prev.json`）。
@@ -587,6 +597,8 @@ WinHTTP 代理、PAC 代理模式、TUN/虚拟网卡、hosts 通配符规则、�
 **副作用说明**：验证期间系统代理被临时改写（含一次未按预期还原、由手工 `networksetup` 命令补回），结束后已与写入前快照逐项 `diff` 一致；`scutil --proxy` 多出 `ProxyAutoConfigEnable:0` / `ProxyAutoDiscoveryEnable:0` 两个显式 0（语义与基线相同）。
 
 **仍未验证**：GUI 点击路径、`osascript` 回退路径、WPAD 自动发现（`-setproxyautodiscovery` 目前不在读/清/还原覆盖范围内）。
+
+**2026-10-21 复验（`fix/proxy-switch-stability` 支线）**：本机安装的助手仍是 2026-10-10 的旧二进制（未随 app 更新），因此只验证了旧助手路径：`proxy_write` 仍能写入；但发现 root 身份把 `proxy_prev.json` 落在了 **`/tmp/Library/Application Support/SuNet/proxy_prev.json`**（`HOME` 缺失时旧代码的 `/tmp` 兜底，实测文件存在、属主 root）——这正是 §4.21 里「也可能没有 `HOME`」那一支。代码已改用 `getpwuid_r` 取真实家目录；旧文件不会自动迁移，可手工删除。验证期间系统代理被临时改写，结束后已按预先抓取的逐服务快照用 `networksetup` 恢复，`before/after` 文本 `diff` 完全一致。新平台逻辑（`proxy_last_applied.json`、陈旧还原点重写、PAC 解析、写入顺序）均只经过单测，**尚未在换上新助手二进制后走 socket 复验** —— 重装助手见 §6.4 第 7 条。
 
 ---
 

@@ -564,26 +564,45 @@ function bind(): void {
     });
   });
 
-  // ---- 方案切换：点一下即切，需提权时先确认 ----
+  // ---- 方案切换：点一下即切；确实会弹授权框时才先确认 ----
   document.querySelectorAll<HTMLButtonElement>("[data-profile]").forEach((btn) => {
     btn.addEventListener("click", () => {
       const id = btn.dataset.profile!;
       const p = state?.profiles.find((x) => x.id === id);
       if (!p) return;
       if (id === state?.active_profile_id) return;
-      inlineConfirm(`切换到「${p.name}」？hosts / DNS 变更需要一次管理员授权`, "切换", () =>
+      const go = () =>
         run(btn, async () => {
           const r = await api.profileApply(id);
           if (r.ok) ui.toast("info", "切换完成", r.message);
           else ui.showReport(r, "切换失败");
-        }),
-      );
+        });
+      // 面板里的 chip 点一下就切，是它存在的意义。只有这次切换**真的会弹授权框**
+      // 时才多问一句 —— 否则每次切方案都要在浮窗里点两下，与"一步到位"相悖；
+      // 反过来，会弹 UAC / 系统授权框却不给预期，是更糟的体验。判据与后端一致：
+      // 只有要改 hosts（或 macOS 的代理）时才提权，已是管理员则全程静默。
+      if (profileNeedsPrompt(p)) {
+        inlineConfirm(`切换到「${p.name}」？需要一次管理员授权（${os.AUTH_HINT}）`, "切换", go);
+      } else {
+        void go();
+      }
     });
   });
 }
 
 function activeProfile(): ProfileBrief | undefined {
   return state?.profiles.find((x) => x.id === state?.active_profile_id);
+}
+
+/**
+ * 切到这个方案会不会弹管理员授权框 —— 直接读后端算好的 `needs_elevation`。
+ *
+ * 不在前端重算：判据（hosts / DNS 恒提权、代理仅 macOS 提权、已提权则都不弹）
+ * 必须与 `apply` 的落点一致，两边各写一份迟早分叉；前端手里的 `ProfileBrief`
+ * 本来也没有足够信息判断。
+ */
+function profileNeedsPrompt(p: ProfileBrief): boolean {
+  return p.needs_elevation;
 }
 
 function activeProxy(): {

@@ -366,7 +366,7 @@ export async function renderDns(root: HTMLElement, ctx: TabCtx): Promise<void> {
       out.innerHTML = `<span class="warn-text">当前没有勾选任何地址族</span>`;
       return;
     }
-    out.innerHTML = `<span class="muted">测速中（IPv4 走 A 记录、IPv6 走 AAAA 记录，单次超时 1.5s）…</span>`;
+    out.innerHTML = `<span class="muted">测速中（并发探测；IPv4 走 A 记录、IPv6 走 AAAA 记录，单次超时 1.5s）…</span>`;
     try {
       const results = await api.dnsTest(servers);
       out.innerHTML = `<table><thead><tr><th>地址</th><th>族</th><th>结果</th></tr></thead><tbody>${results

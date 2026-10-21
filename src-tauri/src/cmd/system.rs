@@ -42,6 +42,10 @@ pub struct ProfileBrief {
     /// 方案里记的网卡：快捷面板不摆网卡选择器，「还原自动」直接作用于它
     pub dns_enabled: bool,
     pub dns_alias: String,
+    /// 这次切换会不会弹管理员授权框（hosts / DNS 恒需提权；代理仅在 macOS 需要）。
+    /// 快捷面板据此决定"点一下直接切"还是"先问一句" —— 判据与 `apply` 同口径，
+    /// 前端不再自己拼 host 字符串去猜。
+    pub needs_elevation: bool,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -63,6 +67,25 @@ pub struct AppStateView {
     pub crash_recovery: Option<CrashInfo>,
     pub tray: TrayStatus,
     pub can_undo_clear: bool,
+}
+
+/// 切到这个方案会不会**弹出**管理员授权框。
+///
+/// 「要提权」与「会弹框」是两件事，快捷面板问的是后者：装了免密通道（Windows 计划任务 /
+/// macOS 常驻 helper）或本来就是管理员时，提权是静默的，这时先让用户确认一次只是多一步；
+/// 反过来，真会弹 UAC / 系统授权框却不给预期，比多问一句更糟。
+///
+/// hosts / DNS 恒需提权；代理只在 macOS 需要（Windows 写 HKCU）。
+fn profile_needs_elevation(
+    hosts: bool,
+    dns: bool,
+    proxy: bool,
+    is_elevated: bool,
+    silent_channel: bool,
+) -> bool {
+    let wants_privileged =
+        hosts || dns || (proxy && crate::os::system_proxy::proxy_write_needs_root());
+    wants_privileged && !is_elevated && !silent_channel
 }
 
 fn effective_state(app: &AppHandle) -> Option<Arc<AppState>> {
@@ -113,8 +136,14 @@ pub async fn get_app_state(app: AppHandle) -> Result<AppStateView> {
                 file_lines != draft_lines
             },
             settings: cfg.settings.clone(),
-            profiles: cfg
-                .profiles
+            profiles: {
+                // 提权状态在进程生命周期内不变，但这里只读一次，别在每次迭代里都问一遍
+                let elevated_for_brief = privilege::detect().is_elevated;
+                // 免密通道可用时提权是静默的：不弹 UAC / 授权框，也就不该让用户先确认一次。
+                // 本机装了 helper 时 `helper::available()` 为真，这一项把「会不会真的弹框」
+                // 与「要不要提权」区分开（见 `profile_needs_elevation`）。
+                let silent_for_brief = crate::elevation_task::usable();
+                cfg.profiles
                 .iter()
                 .map(|p| ProfileBrief {
                     id: p.id.clone(),
@@ -130,8 +159,16 @@ pub async fn get_app_state(app: AppHandle) -> Result<AppStateView> {
                     proxy_socks_port: p.proxy.socks_port,
                     dns_enabled: p.dns.enabled,
                     dns_alias: p.dns.interface_alias.clone(),
+                    needs_elevation: profile_needs_elevation(
+                        p.hosts.enabled,
+                        p.dns.enabled,
+                        p.proxy.enabled,
+                        elevated_for_brief,
+                        silent_for_brief,
+                    ),
                 })
-                .collect(),
+                .collect()
+            },
             active_profile_id: cfg.active_profile_id.clone(),
             active_profile_name: cfg.active_profile().map(|p| p.name.clone()),
             autostart_enabled: cfg.settings.autostart.enabled,
@@ -1279,6 +1316,33 @@ pub async fn silent_elevation_uninstall(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 快捷面板「点一下即切」的判据：**会不会真的弹框**，不是「要不要提权」。
+    ///
+    /// 装过免密通道 / 已是管理员时，提权是静默的 —— 这时还让用户先点一次确认，
+    /// 等于把「一步到位」的设计又退回去（而且确认框里写着"需要一次管理员授权"，
+    /// 实际并不会弹，误导用户）。反过来，真会弹框时必须有预期。
+    #[test]
+    fn profile_needs_elevation_only_when_a_prompt_appears() {
+        // 什么都不改：不弹
+        assert!(!profile_needs_elevation(false, false, false, false, false));
+        // hosts / DNS：要提权、无静默通道 → 弹
+        assert!(profile_needs_elevation(true, false, false, false, false));
+        assert!(profile_needs_elevation(false, true, false, false, false));
+        // 已是管理员 → 不弹
+        assert!(!profile_needs_elevation(true, true, true, true, false));
+        // 装了免密通道 → 不弹
+        assert!(!profile_needs_elevation(true, true, true, false, true));
+
+        // 代理这一项按平台分叉：Windows 写 HKCU 不需要提权（`proxy_write_needs_root()` = false），
+        // macOS 的 networksetup 需要。这条断言跟着平台层走，不写死平台。
+        let proxy_only = profile_needs_elevation(false, false, true, false, false);
+        assert_eq!(
+            proxy_only,
+            crate::os::system_proxy::proxy_write_needs_root(),
+            "代理是否需要弹框必须与平台层的答案一致"
+        );
+    }
 
     /// 界面上「按键录制」产出的组合串，全部必须能被后端收敛成规范形态。
     /// 这条测试是前端录制控件与后端注册器之间的契约：录制控件的输出 = `Ctrl+<KeyboardEvent.code>`，

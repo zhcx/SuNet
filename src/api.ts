@@ -379,6 +379,8 @@ export interface ProfileBrief {
   proxy_socks_port: number;
   dns_enabled: boolean;
   dns_alias: string;
+  /** 切到这个方案会不会弹管理员授权框（与后端同口径，快捷面板据此决定要不要先问一句） */
+  needs_elevation: boolean;
 }
 
 export interface AppStateView {

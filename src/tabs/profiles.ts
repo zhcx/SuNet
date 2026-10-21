@@ -281,7 +281,12 @@ export async function renderProfiles(root: HTMLElement, ctx: TabCtx): Promise<vo
       return;
     }
     const ok = await ui.elevationNotice(os.PROXY_SWITCH_NOTICE, os.PROXY_NEEDS_ADMIN);
-    if (!ok) return;
+    if (!ok) {
+      // 用户在授权说明里点了取消：开关必须弹回原位。不弹回去，界面就显示"代理已开"
+      // 而系统里什么都没变 —— 这是最容易被误信的一类状态错位。
+      box.checked = !wantOn;
+      return;
+    }
     // 逐协议落点：留空 = 关闭该协议
     const ep = (host: string, port: number) =>
       host.trim() && port > 0 ? { host: host.trim(), port } : undefined;

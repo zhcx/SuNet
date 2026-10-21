@@ -50,7 +50,7 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
       ${true ? `<div class="field-grid">
         <span>HTTP 代理</span>
         <div style="display:flex;gap:8px">
-          <input type="text" id="px-host" value="${ui.esc(host)}" placeholder="${os.IS_MACOS ? "留空 = 不启用" : "127.0.0.1 或 proxy.local"}" />
+          <input type="text" id="px-host" value="${ui.esc(host)}" placeholder="留空 = 不启用；IPv6 写 ::1 或 [::1]" />
           <input type="number" id="px-port" min="1" max="65535" value="${ui.esc(port)}" placeholder="7890" style="width:120px" />
         </div>
         <span>HTTPS 代理</span>
@@ -210,7 +210,12 @@ export async function renderProxy(root: HTMLElement, ctx: TabCtx): Promise<void>
     button.disabled = true;
     button.textContent = "正在应用…";
     try {
-      const okElev = await ui.elevationNotice("即将开启系统代理", false);
+      // 只有真会弹授权框的平台才提前说明（macOS 的 networksetup 需要 root）；
+      // Windows 写 HKCU 全程静默，多一个"需要管理员权限"的弹层只会让人以为要输密码。
+      const okElev = await ui.elevationNotice(
+        "即将开启系统代理",
+        os.PROXY_NEEDS_ADMIN && ctx.state.settings.confirm_elevation_notice,
+      );
       if (!okElev) return;
       patchSettings(ctx, { proxy_probe_before_enable: probe });
       const r = await api.proxySet(cfg, probe);
