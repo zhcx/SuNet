@@ -32,7 +32,7 @@
 ## 下载
 
 <!-- BEGIN:version -->
-当前版本 **v0.0.5**（2026-10-21） · [更新日志](CHANGELOG.md) · [下载安装包](https://github.com/zhcx/SuNet/releases/latest)
+当前版本 **v0.0.6**（2026-11-01） · [更新日志](CHANGELOG.md) · [下载安装包](https://github.com/zhcx/SuNet/releases/latest)
 <!-- END:version -->
 
 <!-- BEGIN:platforms -->
