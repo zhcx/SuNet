@@ -227,6 +227,56 @@ export interface DnsTestResult {
   message: string;
 }
 
+// ---------------- 网络优化（内嵌 netopt） ----------------
+
+/** netopt 的发现项；`code` 是稳定的机器可读标识，`message` 只用于展示 */
+export interface NetoptFinding {
+  code: string;
+  level: "info" | "warn" | "fail";
+  message: string;
+  server?: string | null;
+}
+
+/** 一条待执行的变更（`argv` 是即将执行的命令数组，界面只展示 desc） */
+export interface NetoptPlanItem {
+  desc: string;
+  argv: string[];
+  needs_admin: boolean;
+}
+
+export interface NetoptSection {
+  id: string;
+  title: string;
+  supported: boolean;
+  status: "ok" | "warn" | "fail" | "unsupported";
+  findings: NetoptFinding[];
+  plan: NetoptPlanItem[];
+  unsupported_reason?: string | null;
+}
+
+export interface NetoptSummary {
+  ok: number;
+  warn: number;
+  fail: number;
+  unsupported: number;
+}
+
+/**
+ * 巡检结果。`available === false` 时 `error` 一定非空 —— 界面据此给出可见原因
+ * （最常见的是本机没有 Python 3），而不是让入口点了没反应。
+ */
+export interface NetoptView {
+  available: boolean;
+  version: string;
+  generated_at: string;
+  mode: string;
+  summary: NetoptSummary;
+  sections: NetoptSection[];
+  exit_code: number;
+  python?: string | null;
+  error?: string | null;
+}
+
 export interface ProfileHosts {
   enabled: boolean;
   entry_ids: string[];
@@ -529,6 +579,15 @@ export const api = {
   dnsCustomDelete: (id: string) => call<DnsPreset[]>("dns_custom_delete", { id }),
   dnsV6Ready: (alias: string) => call<boolean>("dns_v6_ready", { alias }),
   dnsTest: (servers: string[]) => call<DnsTestResult[]>("dns_test", { servers }),
+
+  // 网络优化（内嵌 netopt）
+  netoptAudit: (only?: string | null) =>
+    call<NetoptView>("netopt_audit", { only: only ?? null }),
+  /** [需提权] 按巡检建议执行修复；没有可执行项时不会要求授权 */
+  netoptOptimize: (only?: string | null) =>
+    call<ApplyReport>("netopt_optimize", { only: only ?? null }),
+  netoptRollback: (to: "latest" | "baseline" = "latest") =>
+    call<ApplyReport>("netopt_rollback", { to }),
 
   // profile / 事务
   profileList: () => call<Profile[]>("profile_list"),

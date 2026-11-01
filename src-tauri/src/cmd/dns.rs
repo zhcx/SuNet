@@ -126,9 +126,10 @@ pub async fn dns_set(
     })
     .await?;
 
+    // 先重采真实值再推事件：前端收到 report / refresh 就会立刻拉状态，
+    // 顺序反过来会把还没更新的旧摘要发出去（切换成功却仍显示旧 DNS）
+    crate::cmd::after_dns_change(&app, Some(&alias_check));
     crate::cmd::emit_report(&app, &report);
-    crate::tray::remember_dns(&app, &alias_check);
-    crate::cmd::after_change(&app);
     if !report.ok {
         crate::notify::send(
             &app,
@@ -167,9 +168,9 @@ pub async fn dns_reset(
     })
     .await?;
 
+    // 顺序同 dns_set：缓存先更新，事件后到
+    crate::cmd::after_dns_change(&app, Some(&alias_check));
     crate::cmd::emit_report(&app, &report);
-    crate::tray::remember_dns(&app, &alias_check);
-    crate::cmd::after_change(&app);
     Ok(report)
 }
 

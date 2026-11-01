@@ -27,6 +27,9 @@ pub(crate) const KNOWN_TASKS: &[&str] = &[
     "proxy_restore",
     "proxy_clear",
     "probe",
+    // 网络优化（内嵌 netopt）：写 DNS / IPv6 前缀 / 防火墙，只能以管理员身份执行
+    "netopt_apply",
+    "netopt_rollback",
     // 登录自启计划任务（任务库只有管理员可写 → 只能在提权进程里做）
     "autostart_set",
     // 批处理外壳：内部只允许上面这些子任务，且不允许嵌套自己
@@ -156,6 +159,9 @@ pub fn execute(task: &str, data: &Value) -> TaskOutput {
         }),
         "hosts_apply" => hosts_apply(data),
         "hosts_restore" => hosts_restore(data),
+        // ── 网络优化（内嵌 netopt）：一次性改 DNS / IPv6 / 防火墙，必须 root ──
+        "netopt_apply" => crate::netopt::apply_elevated(data),
+        "netopt_rollback" => crate::netopt::rollback_elevated(data),
         "dns_set" => dns_set(data),
         "dns_reset" => dns_reset(data),
         "dns_flush" => {
