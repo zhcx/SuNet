@@ -510,6 +510,11 @@ pub fn toggle_quick(app: &AppHandle, at: Option<(Rect, PhysicalPosition<f64>)>) 
     if let Some(state) = app.try_state::<SharedState>() {
         state.clear_warn_unread();
     }
+    // 面板是常驻窗口：失焦只隐藏、不重建，WebView 里存的是上次显示时的状态。
+    // 托盘左键是最常用的弹出路径，必须和 `show_quick_anchored` 一样让前端重拉一次，
+    // 否则「切换 DNS 后打开面板仍显示旧值」——用户没法判断刚才到底成没成。
+    crate::cmd::emit_refresh(app);
+    resample_dns_after_show(app);
     let _ = app.emit("sunet://quick-shown", ());
     refresh(app);
 }
@@ -534,8 +539,28 @@ pub fn show_quick_anchored(app: &AppHandle) {
     // 面板是常驻窗口：失焦只隐藏、不重建，WebView 里的状态不会自己变新。
     // 每次唤出都让前端重新拉一次状态，避免面板显示上一个方案 / 旧代理状态。
     crate::cmd::emit_refresh(app);
+    resample_dns_after_show(app);
     let _ = app.emit("sunet://quick-shown", ());
     refresh(app);
+}
+
+/// 面板弹出后**后台**重采一次 DNS 摘要。
+///
+/// DNS 也可能被本应用之外的东西改掉（系统设置、别的网络工具、DHCP 续租），
+/// 而 `dns_summary` 是内存缓存，只靠"本应用改动时失效"是不够的 —— 用户打开面板
+/// 想确认的正是"现在到底生效的是哪一个解析器"。
+///
+/// 之所以放后台且只在**真的变了**时才推事件：
+///   · 采样要起 networksetup / ifconfig，放在托盘点击的同步路径上会让面板弹出卡顿；
+///   · 摘要没变还推事件，等于每次开面板都整块重绘一次，白闪。
+fn resample_dns_after_show(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        if refresh_dns_summary(&app) {
+            crate::cmd::emit_refresh(&app);
+            refresh(&app);
+        }
+    });
 }
 
 /// 面板锚点：托盘图标在屏幕上的外框（物理像素）。
@@ -866,16 +891,68 @@ pub fn dns_summary_of(state: &crate::os::dns_client::DnsState) -> (String, Strin
     (v4, v6)
 }
 
-/// 写入运行时 DNS 摘要（真实状态缓存，供托盘 tooltip 显示）
+/// 写入运行时 DNS 摘要（真实状态缓存，供托盘 tooltip / 快捷面板显示）
+///
+/// **必须先 `invalidate_cache()`**：网卡枚举有 2 秒 TTL，而 DNS 写入多半发生在
+/// 提权子进程里（`dns_set` / 方案切换都是），父进程那份缓存可能正是写入前的快照。
+/// 不清掉就会把刚被覆盖掉的旧值再写回缓存 —— 表现为"切换成功，界面还是旧 DNS"。
 pub fn remember_dns(app: &AppHandle, alias: &str) {
     let Some(state) = app.try_state::<SharedState>() else {
         return;
     };
-    if let Ok(d) = crate::os::dns_client::get(alias) {
-        let summary = dns_summary_of(&d);
-        if let Ok(mut rt) = state.runtime.lock() {
-            rt.dns_summary = Some(summary);
+    crate::os::dns_client::invalidate_cache();
+    match crate::os::dns_client::get(alias) {
+        Ok(d) => {
+            let summary = dns_summary_of(&d);
+            if let Ok(mut rt) = state.runtime.lock() {
+                rt.dns_summary = Some(summary);
+            }
         }
+        // 采样失败（网卡刚被移除 / networksetup 报错）时保留上一次的摘要：
+        // 一次读失败不该把界面上唯一的一条线索也抹掉
+        Err(e) => log::warn!(target: "dns", "重新采样 DNS 摘要失败（{alias}）：{e}"),
+    }
+}
+
+/// 不知道具体网卡时刷新 DNS 摘要：按「当前正在使用的网卡」重新采样。
+///
+/// 方案切换 / 回滚 / 全局还原 / 开机恢复都是「一次提权批量改多层」，调用方手里
+/// 没有单一的 alias；但这些路径都会改 DNS，缓存必须跟着变，否则快捷面板会一直
+/// 停在切换前的值上（用户无法判断切换是否成功）。
+/// 返回摘要是否真的发生了变化（调用方据此决定要不要再推一次刷新事件）。
+pub fn refresh_dns_summary(app: &AppHandle) -> bool {
+    let Some(state) = app.try_state::<SharedState>() else {
+        return false;
+    };
+    crate::os::dns_client::invalidate_cache();
+    let sampled = crate::os::dns_client::list_interfaces()
+        .ok()
+        .and_then(|list| crate::os::dns_client::pick_in_use(&list))
+        .map(|i| {
+            let st = crate::os::dns_client::DnsState {
+                interface_alias: i.alias.clone(),
+                interface_guid: i.guid.clone(),
+                v4: i.v4.clone(),
+                v6: i.v6.clone(),
+            };
+            dns_summary_of(&st)
+        });
+    // 先把结果绑到局部变量再取锁：`if let Ok(guard) = state.runtime.lock()` 直接写在
+    // 函数末尾时，`Result` 这个临时值的析构会晚于 `state`，借用检查器会报 E0597
+    let guard = state.runtime.lock();
+    if let Ok(mut rt) = guard {
+        match sampled {
+            Some(sampled) => {
+                let changed = rt.dns_summary.as_ref() != Some(&sampled);
+                rt.dns_summary = Some(sampled);
+                changed
+            }
+            // 采样失败（离线 / networksetup 报错）：保留上一次的摘要，
+            // 别把界面上唯一的一条线索抹成"未知"
+            None => false,
+        }
+    } else {
+        false
     }
 }
 

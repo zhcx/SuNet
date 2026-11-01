@@ -7,6 +7,7 @@
 
 pub mod dns;
 pub mod hosts;
+pub mod netopt;
 pub mod profile;
 pub mod proxy;
 pub mod system;
@@ -43,4 +44,25 @@ pub fn emit_refresh(app: &AppHandle) {
 /// 状态变化后统一刷新托盘
 pub fn after_change(app: &AppHandle) {
     crate::tray::refresh(app);
+}
+
+/// DNS 被改写之后的统一收尾：重采真实值 → 刷托盘 → 通知前端重拉状态。
+///
+/// `alias = Some(_)` 用于「明确知道改的是哪张网卡」的场景（DNS 页应用 / 还原），
+/// 采样那张网卡；`None` 用于方案切换 / 回滚 / 全局还原这类一次改多层的场景，
+/// 按「当前正在使用的网卡」采样。
+///
+/// **顺序不能反**：`emit_refresh` 会让快捷面板立刻 `get_app_state`，
+/// 缓存还没更新就推事件，面板拿到的仍是旧值 —— 这正是"切换成功但小窗还显示旧
+/// DNS"的竞态来源。所有会改 DNS 的路径都必须走这里，不要各自拼一遍。
+pub fn after_dns_change(app: &AppHandle, alias: Option<&str>) {
+    match alias {
+        Some(a) => crate::tray::remember_dns(app, a),
+        // 主动改动后不需要比对"是否变化"：事件本来就要推一次
+        None => {
+            crate::tray::refresh_dns_summary(app);
+        }
+    }
+    crate::tray::refresh(app);
+    emit_refresh(app);
 }

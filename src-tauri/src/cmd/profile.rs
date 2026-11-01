@@ -157,8 +157,9 @@ pub async fn profile_apply(
 ) -> Result<ApplyReport> {
     let s: Arc<_> = state.inner().clone();
     let report = crate::cmd::blocking(move || apply::apply_profile(&s, &id)).await?;
+    // 方案里可能含 DNS：先重采真实值再推事件，否则快捷面板会停在切换前的 DNS 上
+    crate::cmd::after_dns_change(&app, None);
     crate::cmd::emit_report(&app, &report);
-    crate::tray::refresh(&app);
 
     // 通知策略（§5.4.4）：成功只记日志，失败才提示
     if !report.ok {
@@ -428,8 +429,9 @@ pub fn do_restore_on_launch(app: &AppHandle) -> Result<()> {
     }
     let name = cfg.profile(&id).map(|p| p.name.clone()).unwrap_or_default();
     let report = apply::apply_profile(&s, &id)?;
+    // 开机恢复同样会写 DNS：缓存与事件都要跟上（同 profile_apply）
+    crate::cmd::after_dns_change(app, None);
     crate::cmd::emit_report(app, &report);
-    crate::tray::refresh(app);
     crate::notify::send(
         app,
         if report.ok {
@@ -460,8 +462,9 @@ pub async fn rollback(
     let report =
         crate::cmd::blocking(move || apply::restore_from_snapshot(&s, snapshot_id.as_deref()))
             .await?;
+    // 回滚会把 DNS 一起还原：重采真实值，避免面板继续显示回滚后的旧摘要
+    crate::cmd::after_dns_change(&app, None);
     crate::cmd::emit_report(&app, &report);
-    crate::tray::refresh(&app);
     hint_no_password(&app, &report);
     Ok(report)
 }
@@ -471,8 +474,9 @@ pub async fn rollback(
 pub async fn global_restore(app: AppHandle, state: State<'_, SharedState>) -> Result<ApplyReport> {
     let s: Arc<_> = state.inner().clone();
     let report = crate::cmd::blocking(move || apply::global_restore(&s)).await?;
+    // 全局还原会把 DNS 切回自动获取：缓存必须跟着清，否则面板还显示旧的手动 DNS
+    crate::cmd::after_dns_change(&app, None);
     crate::cmd::emit_report(&app, &report);
-    crate::tray::refresh(&app);
     hint_no_password(&app, &report);
     if !report.ok {
         crate::notify::send(

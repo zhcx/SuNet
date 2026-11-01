@@ -30,6 +30,8 @@ pub const E5004: &str = "E5004";
 pub const E6001: &str = "E6001";
 pub const E6002: &str = "E6002";
 pub const E6003: &str = "E6003";
+/// 网络优化组件不可用（内嵌 netopt 需要本机有 Python 3）
+pub const E7001: &str = "E7001";
 pub const E9001: &str = "E9001";
 pub const E9002: &str = "E9002";
 pub const E0000: &str = "E0000";
@@ -60,6 +62,7 @@ pub fn text(code: &str) -> &'static str {
         E6001 => "订阅主源与镜像均不可达（已保留本地内容，未清空）",
         E6002 => "订阅内容校验失败",
         E6003 => "订阅条目数超上限",
+        E7001 => "网络优化组件不可用（需要本机安装 Python 3）",
         E9001 => "配置文件由更新版本创建，已以只读模式启动",
         E9002 => "配置文件损坏或迁移失败，已以只读模式启动",
         E0000 => "内部错误",

@@ -11,6 +11,7 @@ import { renderDns } from "./tabs/dns";
 import { renderProfiles } from "./tabs/profiles";
 import { renderLogs } from "./tabs/logs";
 import { openSettingsModal } from "./settings";
+import { openOptimizeModal } from "./netopt";
 import * as os from "./platform";
 
 // 主窗口入口；快捷面板走 src/quick-main.ts（独立 HTML 入口）
@@ -344,6 +345,10 @@ async function boot(): Promise<void> {
   h("btn-hide").addEventListener("click", () => void api.windowHide());
   h("btn-settings").addEventListener("click", () => openSettingsModal());
   h("btn-global-restore").addEventListener("click", () => void globalRestore());
+  // 一键优化网络：弹层里先巡检，再由用户确认执行（见 src/netopt.ts）
+  h("btn-netopt").addEventListener("click", () =>
+    void openOptimizeModal(() => refreshState(true)),
+  );
 
   await listen<{ level: string; title: string; body: string; sticky?: boolean; actions: { label: string; action: string; args?: unknown }[] }>(
     "sunet://notify",

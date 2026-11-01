@@ -19,6 +19,7 @@ mod helper;
 mod ipc;
 mod logging;
 mod migrate;
+mod netopt;
 mod notify;
 mod os;
 mod paths;
@@ -419,6 +420,10 @@ fn run_gui() {
             cmd::dns::dns_custom_delete,
             cmd::dns::dns_v6_ready,
             cmd::dns::dns_test,
+            // 网络优化（内嵌 netopt）
+            cmd::netopt::netopt_audit,
+            cmd::netopt::netopt_optimize,
+            cmd::netopt::netopt_rollback,
             // profile / 事务 / 快照
             cmd::profile::profile_list,
             cmd::profile::profile_save,

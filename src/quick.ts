@@ -14,6 +14,7 @@ import { listen } from "@tauri-apps/api/event";
 import { api, errText, proxyEndpoints, type AppStateView, type ProfileBrief } from "./api";
 import { initTheme, onThemeChange, cycleTheme, currentMode } from "./theme";
 import { icon, type IconName } from "./icons";
+import { planPreview, summarize } from "./netopt";
 import * as ui from "./ui";
 import * as os from "./platform";
 
@@ -41,9 +42,12 @@ export async function bootQuick(): Promise<void> {
   // 否则设置改动、方案删除、主窗口里的操作都可能在面板上留下陈旧显示。
   await listen("sunet://refresh", () => void refresh());
   // 每次弹出都重置失焦宽限计时：后端 show 时会发 quick-shown；
-  // 这里再以 WebView 的可见性变化兜底（事件可能在页面就绪前发出而丢失）
+  // 这里再以 WebView 的可见性变化兜底（事件可能在页面就绪前发出而丢失）。
+  // 同时顺手重拉一次状态：面板是常驻窗口，停在隐藏状态时不会自己更新，
+  // 只有靠这两条事件把「切换过 DNS / 方案」的结果带到界面上。
   await listen("sunet://quick-shown", () => {
     shownAt = Date.now();
+    void refresh();
   });
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") shownAt = Date.now();
@@ -167,6 +171,7 @@ function render(): void {
       ${notes()}
       ${tileProxy(v)}
       <div class="tiles">${tileHosts(v)}${tileDns(v)}</div>
+      ${tileOptimize(v)}
       ${tileClear(v)}
       ${undoStrip()}
       <div class="flyout-section">${ic("profile", 13)}快速切换方案<span class="spacer"></span>${
@@ -367,6 +372,22 @@ function tileDns(v: View): string {
   </div>`;
 }
 
+/**
+ * 一键优化网络（内嵌 netopt）：
+ * 巡检是只读的，能不能改、改什么先摆出来，用户点了才申请提权。
+ */
+function tileOptimize(v: View): string {
+  return `<div class="tile wide">
+    <div class="tile-top">
+      <span class="tile-icon">${ic("zap", 15)}</span>
+      <span class="tile-name">一键优化网络</span>
+      <span class="spacer"></span>
+      <button class="sm" id="q-netopt" ${v.ro ? "disabled" : ""}>优化</button>
+    </div>
+    <div class="tile-state">巡检 DNS / IPv6 / 代理 / 防火墙，按建议修复</div>
+  </div>`;
+}
+
 function tileClear(v: View): string {
   return `<div class="tile wide">
     <div class="tile-top">
@@ -544,6 +565,11 @@ function bind(): void {
     );
   });
 
+  // ---- 一键优化网络：巡检只读，改动要用户确认 ----
+  $("#q-netopt")?.addEventListener("click", (e) => {
+    void auditThenConfirm(e.currentTarget as HTMLButtonElement);
+  });
+
   // ---- 彻底清除：破坏性，必须确认 ----
   $("#q-clear")?.addEventListener("click", () => {
     inlineConfirm(
@@ -635,6 +661,59 @@ function activeProxy(): {
 function activeAlias(): string | null {
   const p = activeProfile();
   return p && p.dns_alias.trim() ? p.dns_alias : null;
+}
+
+/**
+ * 一键优化网络：巡检 → 把计划摆出来 → 用户确认后才申请提权执行。
+ *
+ * 巡检本身不快（要探 DNS / IPv6 可达性），期间钉住面板并把按钮置忙 ——
+ * 否则授权框还没出现，面板就先因为失焦收起了。
+ *
+ * 单独成函数而不复用 `run()`：`run()` 结束时会 `refresh()` 重绘整块面板，
+ * 内联确认条会被冲掉，用户看到的"确认"一眨眼就没了。
+ */
+async function auditThenConfirm(btn: HTMLButtonElement | null): Promise<void> {
+  if (busy) {
+    flash("上一步操作还在执行，请稍候…");
+    return;
+  }
+  busy = true;
+  await api.quickSetPinned(true).catch(() => undefined);
+  if (btn) {
+    btn.setAttribute("aria-busy", "true");
+    btn.disabled = true;
+  }
+  try {
+    const view = await api.netoptAudit();
+    if (!view.available) {
+      flash(view.error ?? "网络优化组件不可用", true);
+      return;
+    }
+    const s = summarize(view);
+    if (!s.actionable) {
+      ui.toast("info", "网络配置已是最优", `${s.headline}，没有需要修复的项`);
+      return;
+    }
+    inlineConfirm(
+      `${s.headline}，将执行：${planPreview(s)}。需要一次管理员授权（${os.AUTH_HINT}）`,
+      "优化",
+      () =>
+        run(btn, async () => {
+          const r = await api.netoptOptimize();
+          if (r.ok) ui.toast("info", "网络优化完成", r.message);
+          else ui.showReport(r, "网络优化结果");
+        }),
+    );
+  } catch (e) {
+    flash(errText(e), true);
+  } finally {
+    busy = false;
+    if (btn) {
+      btn.removeAttribute("aria-busy");
+      btn.disabled = false;
+    }
+    await api.quickSetPinned(false).catch(() => undefined);
+  }
 }
 
 async function run<T>(el: HTMLElement | null, fn: () => Promise<T>): Promise<void> {
