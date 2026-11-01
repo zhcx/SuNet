@@ -54,7 +54,15 @@ def log(msg: str) -> None:
 def run(argv, timeout=15):
     """执行外部命令，返回 (returncode, stdout, stderr)。绝不经过 shell。"""
     try:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        # 固定按 UTF-8 解码：调用方（SuNet）用 PYTHONUTF8=1 启动，
+        # 而 Windows 上外部命令的输出编码并不统一（PowerShell 跟随控制台
+        # 代码页，中文系统是 GBK）。按 UTF-8 解码遇到 GBK 中文会抛
+        # UnicodeDecodeError，一次编码问题就让整节检查失败。
+        # errors="replace" 保证最坏也只是少量非 ASCII 文本变替换符，
+        # ASCII 状态位（ON/OFF、true/false、IP 地址）仍可正常解析。
+        # Windows 后端的 PowerShell 输出已显式切成 UTF-8（见 backend_windows）。
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                           encoding="utf-8", errors="replace")
         return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
     except FileNotFoundError:
         return 127, "", "command not found: %s" % argv[0]

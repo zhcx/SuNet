@@ -15,6 +15,8 @@ from netopt_core import dns_probe, finding, op, run, section, status_from
 
 class Backend:
     id = "linux"
+    # capabilities 用：stub 仍保留（能给出具体原因），但不算"已实现"
+    UNIMPLEMENTED = ("power",)
 
     def __init__(self, config=None):
         self.config = config or {}

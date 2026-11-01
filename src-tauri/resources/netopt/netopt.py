@@ -117,7 +117,8 @@ def main(argv=None):
         for sid in core.SECTION_ORDER:
             if only and sid not in only:
                 continue
-            implemented = hasattr(backend, "audit_" + sid)
+            implemented = (hasattr(backend, "audit_" + sid)
+                           and sid not in getattr(backend, "UNIMPLEMENTED", ()))
             caps.append({"id": sid, "title": core.TITLES[sid],
                          "supported": implemented,
                          "restorable": hasattr(backend, "restore_" + sid)})

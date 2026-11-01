@@ -8,3 +8,7 @@ src-tauri/gen/
 # 本机噪音：Finder 元数据与本地工具（pi）的任务目录，都不该进版本库
 .DS_Store
 .pi/
+
+# Python 工具（netopt）的字节码缓存
+__pycache__/
+*.pyc

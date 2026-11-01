@@ -122,8 +122,10 @@ const PYTHON_CANDIDATES: &[&str] = &[
     "python3",
 ];
 
+// py.exe 在 C:\Windows，提权子进程的 PATH 里也一定找得到；python / python3
+// 可能只是 WindowsApps 的应用执行别名（未安装 Python 时会拉起商店），排后面
 #[cfg(target_os = "windows")]
-const PYTHON_CANDIDATES: &[&str] = &["python3", "python", "py"];
+const PYTHON_CANDIDATES: &[&str] = &["py", "python", "python3"];
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 const PYTHON_CANDIDATES: &[&str] = &["python3", "python"];
