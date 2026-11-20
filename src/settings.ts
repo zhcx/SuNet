@@ -136,10 +136,13 @@ export async function openSettingsModal(): Promise<void> {
       silentHint.textContent = v.detail || "本平台不支持";
       return;
     }
-    // 状态优先级：装好且在跑 > 装了没跑（BTM 拦截）> 未安装
+    // 状态优先级：装好且在跑 > 版本过旧需重装 > 装了没跑（BTM 拦截）> 未安装
     if (v.installed && v.running) {
       silentBadge.textContent = `已生效 · 切换不再输密码`;
       silentBadge.className = "badge ok";
+    } else if (v.installed && v.outdated) {
+      silentBadge.textContent = `版本过旧 · 需重装`;
+      silentBadge.className = "badge warn";
     } else if (v.installed) {
       silentBadge.textContent = `已安装 · 未运行`;
       silentBadge.className = "badge warn";

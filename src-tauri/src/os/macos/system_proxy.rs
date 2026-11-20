@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{dns_client, net};
 
-pub const DEFAULT_BYPASS: &str = "localhost;127.*;<local>";
+pub const DEFAULT_BYPASS: &str = "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;169.254.*;<local>;::1";
 
 /// 代理快照（与 Windows 同形，便于配置文件互通）
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
@@ -248,32 +248,87 @@ struct ServiceSnapshot {
 // ---------------------------------------------------------------------------
 
 /// Windows 风格分号列表 → macOS 例外域名列表
+///
+/// macOS 的 `networksetup -setproxybypassdomains` 只认三类写法：
+///   - 主机名 / 域名：`example.com`（精确）、`*.example.com`（子域）
+///   - 裸 IP 地址：`127.0.0.1`
+///   - CIDR 网段：`10.0.0.0/8`、`192.168.0.0/16`、`169.254.0.0/16`
+///
+/// Windows 的 `10.*` / `172.16.*` / `192.168.*` **不是**合法写法，原样写下去会被
+/// 静默丢弃 —— 于是局域网地址（包括代理服务器自己）不再绕过代理。一旦 SOCKS 也开着，
+/// macOS 会把"连到 HTTP 代理"的那条 TCP 也塞进 SOCKS 隧道，形成代理套代理：慢到
+/// 不可用，或者直接连不上。所以这里必须把通配网段翻译成 CIDR。
 fn to_mac_exceptions(bypass: &str) -> Vec<String> {
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     for raw in bypass.split(';') {
         let item = raw.trim();
         if item.is_empty() {
             continue;
         }
-        match item {
-            // macOS 没有 <local> 这个写法，对应"不含点的主机名"，即 .local 域
-            "<local>" => out.push(".local".to_string()),
-            // "127.*" 不是合法域名；退化为环回地址
-            "127.*" => out.push("127.0.0.1".to_string()),
-            _ => {
-                if item.contains('*') && !item.starts_with("*.") {
-                    // 通配符位置不合法：去掉通配部分（macOS 只认 *.example.com 或 .example.com）
-                    let cleaned = item.replace('*', "");
-                    if !cleaned.is_empty() {
-                        out.push(cleaned);
-                    }
-                } else {
-                    out.push(item.to_string());
+        // macOS 没有 <local>：对应"不含点的主机名"，即 *.local 域
+        if item == "<local>" || item == ".local" {
+            push_unique(&mut out, "*.local");
+            continue;
+        }
+        // `10.*` / `172.16.*` / `192.168.1.*` 这类 IPv4 通配 → CIDR 网段
+        if let Some(cidr) = ipv4_wildcard_to_cidr(item) {
+            push_unique(&mut out, &cidr);
+            continue;
+        }
+        // 已经是合法的 macOS 通配写法，原样保留
+        if item.starts_with("*.") {
+            push_unique(&mut out, item);
+            continue;
+        }
+        // `*zhihu.com` 这类 Windows 后缀通配 → `*.zhihu.com`；`*.zhihu.com` 不匹配裸域，
+        // 故同时补一条裸域，语义才与 Windows 的"以 zhihu.com 结尾"一致
+        if let Some(rest) = item.strip_prefix('*') {
+            if !rest.is_empty() && rest.contains('.') {
+                let dom = rest.trim_start_matches('.');
+                if !dom.is_empty() {
+                    push_unique(&mut out, &format!("*.{dom}"));
+                    push_unique(&mut out, dom);
+                    continue;
                 }
             }
         }
+        // 已经合规的裸域名、裸 IP、CIDR 原样保留
+        push_unique(&mut out, item);
     }
     out
+}
+
+/// 忽略大小写去重地追加；空串不追加
+fn push_unique(out: &mut Vec<String>, s: &str) {
+    if !s.is_empty() && !out.iter().any(|x| x.eq_ignore_ascii_case(s)) {
+        out.push(s.to_string());
+    }
+}
+
+/// `10.*` → `10.0.0.0/8`、`172.16.*` → `172.16.0.0/16`、`192.168.1.*` → `192.168.1.0/24`。
+/// 不是 IPv4 通配模式（必须以 `.*` 结尾、前段是 1~3 节的十进制八位组）就返回 `None`。
+fn ipv4_wildcard_to_cidr(item: &str) -> Option<String> {
+    let head = item.strip_suffix(".*")?;
+    let parts: Vec<&str> = head.split('.').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    let mut octets = [0u16; 4];
+    for (i, p) in parts.iter().enumerate() {
+        if p.is_empty() || !p.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let v = p.parse::<u16>().ok()?;
+        if v > 255 {
+            return None;
+        }
+        octets[i] = v;
+    }
+    let prefix = parts.len() * 8;
+    Some(format!(
+        "{}.{}.{}.{}/{}",
+        octets[0], octets[1], octets[2], octets[3], prefix
+    ))
 }
 
 /// macOS 例外域名列表 → Windows 风格分号列表
@@ -530,8 +585,13 @@ pub fn write_manual(p: &crate::os::ManualProxy) -> Result<()> {
         };
         snapshot_services(&services, still_ours)?; // 先留还原点
     }
+    // 兜底：代理服务器自己的 host 一定直连。不开 SOCKS 时连到代理本来就不会被再代理；
+    // 但 SOCKS 一旦也开着，macOS 会把"连到 HTTP 代理"的那条 TCP 也塞进 SOCKS ——
+    // 若代理地址不在绕过名单里就会代理套代理（慢到不可用 / 连不上）。这里不信任用户
+    // 的绕过名单，逐协议把落点 host 补进去。
+    let bypass = bypass_with_proxy_hosts(&plan, &p.bypass);
     for svc in &services {
-        write_service_manual(svc, &plan, &p.bypass)?;
+        write_service_manual(svc, &plan, &bypass)?;
     }
     if p.enable {
         // 写成功之后才记「我们写下去的是什么」：下次据此判断旧还原点还成不成立。
@@ -623,6 +683,12 @@ pub fn hard_clear() -> Result<()> {
             svc.clone(),
             "off".to_string(),
         ]);
+        // WPAD（自动发现代理）也是代理来源之一，单独清一次，否则"清除"后仍可能自动走代理
+        let _ = net::networksetup_soft(&[
+            "-setproxyautodiscovery".to_string(),
+            svc.clone(),
+            "off".to_string(),
+        ]);
     }
     // 清零之后系统里已经没有"我们接管前的样子"可还原了；留着还原点只会让
     // 下一次 restore（例如「撤销清除」）优先吃这份更早的配置（见 [`take_snapshot`]）。
@@ -649,6 +715,100 @@ fn ordered_actions(plan: &ManualPlan) -> Vec<(Proto, Option<(String, u16)>)> {
         .collect();
     out.extend(plan.per_proto.iter().filter(|(_, t)| t.is_none()).cloned());
     out
+}
+
+/// 把本次要写入的代理落点 host 补进绕过名单。
+///
+/// 原因见 [`write_manual`]：SOCKS 与 HTTP/HTTPS 同时开启时，连到代理服务器本身的那条
+/// TCP 也会被塞进 SOCKS，只有把代理 host 排除在代理之外才不会代理套代理。
+/// 若该 host 已以任意等价形式覆盖（精确名、`*.host`、或覆盖它的通配网段），就不重复加。
+fn bypass_with_proxy_hosts(plan: &ManualPlan, bypass: &str) -> String {
+    let mut hosts: Vec<String> = Vec::new();
+    for (_, target) in plan.per_proto.iter() {
+        if let Some((host, _)) = target {
+            let h = host.trim();
+            if !h.is_empty() && !hosts.iter().any(|x| x.eq_ignore_ascii_case(h)) {
+                hosts.push(h.to_string());
+            }
+        }
+    }
+    if hosts.is_empty() {
+        return bypass.to_string();
+    }
+    let mut parts: Vec<String> = bypass
+        .split(';')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    for h in hosts {
+        let covered = parts.iter().any(|p| bypass_token_covers(p, &h));
+        if !covered {
+            parts.push(h);
+        }
+    }
+    parts.join(";")
+}
+
+/// 绕过名单里的单个 token 是否已覆盖（直连）host。
+fn bypass_token_covers(token: &str, host: &str) -> bool {
+    if token.eq_ignore_ascii_case(host) {
+        return true;
+    }
+    // `*.example.com` 覆盖 `a.example.com`（但不覆盖裸域 itself，裸域另有精确 token）
+    if let Some(suffix) = token.strip_prefix("*.") {
+        if let Some(rest) = host.strip_suffix(suffix) {
+            return rest.ends_with('.');
+        }
+        return false;
+    }
+    // `10.*` 这类 Windows 通配，或 CIDR 网段，覆盖其内的 IP host
+    if let Some(net) = ipv4_wildcard_to_cidr(token) {
+        return cidr_contains(&net, host);
+    }
+    if token.contains('/') {
+        return cidr_contains(token, host);
+    }
+    false
+}
+
+/// host（IPv4 字面量）是否落在 CIDR 网段内。非 IPv4 或解析失败一律 false。
+fn cidr_contains(cidr: &str, host: &str) -> bool {
+    let Some((net, bits)) = cidr.split_once('/') else {
+        return false;
+    };
+    let (Ok(bits), Some(net_ip), Some(host_ip)) = (
+        bits.trim().parse::<u32>(),
+        parse_ipv4(net.trim()),
+        parse_ipv4(host.trim()),
+    ) else {
+        return false;
+    };
+    if bits > 32 {
+        return false;
+    }
+    if bits == 0 {
+        return true;
+    }
+    let mask = u32::MAX << (32 - bits);
+    (net_ip & mask) == (host_ip & mask)
+}
+
+fn parse_ipv4(s: &str) -> Option<u32> {
+    let mut acc: u32 = 0;
+    let mut count = 0;
+    for part in s.split('.') {
+        let v: u32 = part.parse().ok()?;
+        if v > 255 {
+            return None;
+        }
+        acc = (acc << 8) | v;
+        count += 1;
+    }
+    if count == 4 {
+        Some(acc)
+    } else {
+        None
+    }
 }
 
 /// 按计划写一个服务：逐协议「写地址 + 打开」或「显式关闭」。
@@ -1070,20 +1230,97 @@ mod tests {
     }
 
     #[test]
-    fn exceptions_mapping_roundtrip() {
+    fn exceptions_mapping_translates_wildcards_to_cidr() {
         let mac = to_mac_exceptions(DEFAULT_BYPASS);
+        // 关键：Windows 通配必须翻成 macOS 认的 CIDR，绝不能留 `10.` 这种非法串
+        assert!(mac.iter().any(|s| s == "10.0.0.0/8"), "{mac:?}");
+        assert!(mac.iter().any(|s| s == "192.168.0.0/16"), "{mac:?}");
+        assert!(mac.iter().any(|s| s == "169.254.0.0/16"), "{mac:?}");
+        assert!(mac.iter().any(|s| s == "172.16.0.0/16"), "{mac:?}");
+        assert!(mac.iter().any(|s| s == "172.31.0.0/16"), "{mac:?}");
+        assert!(mac.iter().any(|s| s == "127.0.0.0/8"), "{mac:?}");
+        assert!(mac.iter().any(|s| s == "*.local"), "{mac:?}");
+        assert!(mac.iter().any(|s| s == "::1"), "{mac:?}");
+        assert!(mac.iter().any(|s| s == "localhost"), "{mac:?}");
+        // 没有任何残留的非法通配（以点结尾，或星号不在 `*.` 位置）
+        for tok in &mac {
+            assert!(!tok.ends_with('.'), "非法 token：{tok}");
+            assert!(
+                !tok.contains('*') || tok.starts_with("*."),
+                "非法 token：{tok}"
+            );
+        }
+        // 去重
+        let mut sorted = mac.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), mac.len(), "存在重复项：{mac:?}");
+        // 回读仍是稳定、可再写入的分号列表（幂等）
+        let back = from_mac_exceptions(&mac);
+        assert_eq!(to_mac_exceptions(&back), mac);
+    }
+
+    #[test]
+    fn ipv4_wildcard_to_cidr_cases() {
         assert_eq!(
-            mac,
-            vec![
-                "localhost".to_string(),
-                "127.0.0.1".to_string(),
-                ".local".to_string()
-            ]
+            ipv4_wildcard_to_cidr("10.*").as_deref(),
+            Some("10.0.0.0/8")
         );
         assert_eq!(
-            from_mac_exceptions(&mac),
-            "localhost;127.0.0.1;.local".to_string()
+            ipv4_wildcard_to_cidr("172.16.*").as_deref(),
+            Some("172.16.0.0/16")
         );
+        assert_eq!(
+            ipv4_wildcard_to_cidr("192.168.1.*").as_deref(),
+            Some("192.168.1.0/24")
+        );
+        assert_eq!(
+            ipv4_wildcard_to_cidr("127.*").as_deref(),
+            Some("127.0.0.0/8")
+        );
+        assert_eq!(ipv4_wildcard_to_cidr("localhost"), None);
+        assert_eq!(ipv4_wildcard_to_cidr("*.local"), None);
+        assert_eq!(ipv4_wildcard_to_cidr("10.0.0.0/8"), None);
+    }
+
+    #[test]
+    fn exceptions_maps_suffix_wildcard_and_keeps_valid() {
+        let mac = to_mac_exceptions("*zhihu.com;*.example.com;1.2.3.4;foo.local");
+        assert!(mac.iter().any(|s| s == "*.zhihu.com"), "{mac:?}");
+        assert!(mac.iter().any(|s| s == "zhihu.com"), "{mac:?}");
+        assert!(mac.iter().any(|s| s == "*.example.com"), "{mac:?}");
+        // 已有 `*.` 前缀的不要再补裸域
+        assert!(!mac.iter().any(|s| s == "example.com"), "{mac:?}");
+        assert!(mac.iter().any(|s| s == "1.2.3.4"), "{mac:?}");
+        assert!(mac.iter().any(|s| s == "foo.local"), "{mac:?}");
+    }
+
+    #[test]
+    fn bypass_always_includes_proxy_host() {
+        let plan = ManualPlan {
+            per_proto: [
+                (Proto::Web, Some(("10.0.0.10".to_string(), 20173))),
+                (Proto::Secure, Some(("10.0.0.10".to_string(), 20173))),
+                (Proto::Socks, Some(("10.0.0.10".to_string(), 20172))),
+            ],
+        };
+        // 默认绕过名单没有代理 host → 必须补进去（否则 SOCKS 会把连代理的那条也代理掉）
+        let out = bypass_with_proxy_hosts(&plan, "localhost;127.*;<local>");
+        assert!(out.split(';').any(|t| t == "10.0.0.10"), "{out}");
+        // 已被通配网段覆盖时不再重复
+        let out2 = bypass_with_proxy_hosts(&plan, "localhost;10.*");
+        assert_eq!(out2.matches("10.0.0.10").count(), 0, "{out2}");
+        // host 已精确存在时不重复
+        let out3 = bypass_with_proxy_hosts(&plan, "localhost;10.0.0.10");
+        assert_eq!(out3.matches("10.0.0.10").count(), 1, "{out3}");
+    }
+
+    #[test]
+    fn cidr_contains_cases() {
+        assert!(cidr_contains("10.0.0.0/8", "10.0.0.10"));
+        assert!(cidr_contains("192.168.0.0/16", "192.168.5.7"));
+        assert!(!cidr_contains("192.168.0.0/16", "10.0.0.1"));
+        assert!(!cidr_contains("10.0.0.0/8", "::1"));
     }
 
     #[test]

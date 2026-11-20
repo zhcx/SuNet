@@ -21,9 +21,34 @@ pub struct HostsView {
     pub preview: String,
 }
 
+/// 托管区块实际会写入的条目 = 当前方案的展开结果（手工条目 + 订阅条目）。
+///
+/// 关键点：`/etc/hosts` 的托管区块是全局唯一的一份，而订阅同步出来的条目存在
+/// `source_entries`，手工编辑的条目存在 `hosts_entries`。如果这里只取
+/// `hosts_entries`，就会出现两个致命现象：
+///   1) 订阅同步了 33 条，但 hosts 页「没有数据可写」；
+///   2) 系统里已由方案写入 33 条，草稿却是 0 条 → `pending=true` 反复提示待写入，
+///      一点「写入系统 hosts」就用空草稿把托管区块整个删掉 → 33 条凭空消失。
+/// 因此统一改用方案展开结果，保证「显示 / 预览 / 写入」三者一致。
+fn resolved_entries(cfg: &crate::config::Config) -> Vec<HostsEntry> {
+    cfg.resolved_hosts_entries_active()
+}
+
+/// 把手工条目挂到当前方案（若有），保证「按方案展开」能看到并写入它。
+fn attach_to_active_profile(c: &mut crate::config::Config, id: &str) {
+    if let Some(pid) = c.active_profile_id.clone() {
+        if let Some(p) = c.profiles.iter_mut().find(|p| p.id == pid) {
+            if !p.hosts.entry_ids.iter().any(|x| x == id) {
+                p.hosts.entry_ids.push(id.to_string());
+            }
+            p.hosts.enabled = true;
+        }
+    }
+}
+
 fn build_view(state: &crate::state::AppState) -> Result<HostsView> {
     let cfg = state.cfg_clone()?;
-    let entries = cfg.hosts_entries.clone();
+    let entries = resolved_entries(&cfg);
     let stats = hosts_file::stats()?;
     let duplicates = hosts_file::find_duplicates(&entries);
     let preview = hosts_file::preview(&entries)?;
@@ -129,6 +154,9 @@ pub async fn hosts_clear(app: AppHandle, state: State<'_, SharedState>) -> Resul
             c.hosts_entries.clear();
             for p in c.profiles.iter_mut() {
                 p.hosts.entry_ids.clear();
+                // 托管区块现在跟随方案展开（含订阅条目），要真正清空必须同时解绑订阅源，
+                // 否则「清空后写入」会把订阅条目又写回来。
+                p.hosts.source_ids.clear();
             }
             Ok(())
         })?;
@@ -159,7 +187,9 @@ pub async fn hosts_batch_block(
         }
         s.with_cfg_mut(|c| {
             for e in created {
+                let id = e.id.clone();
                 c.hosts_entries.push(e);
+                attach_to_active_profile(c, &id);
             }
             Ok(())
         })?;
@@ -184,7 +214,7 @@ pub async fn hosts_apply(app: AppHandle, state: State<'_, SharedState>) -> Resul
     let report = crate::cmd::blocking(move || {
         let cfg = s.cfg_clone()?;
         let targets = crate::apply::ApplyTargets {
-            hosts: Some(cfg.hosts_entries.clone()),
+            hosts: Some(resolved_entries(&cfg)),
             strict_verify: false,
             ..Default::default()
         };
@@ -225,7 +255,9 @@ pub async fn hosts_import(app: AppHandle, state: State<'_, SharedState>) -> Resu
                     .iter()
                     .any(|x| x.hostname == e.hostname && x.ip == e.ip)
                 {
+                    let id = e.id.clone();
                     c.hosts_entries.push(e);
+                    attach_to_active_profile(c, &id);
                 }
             }
             Ok(())
@@ -248,4 +280,39 @@ pub async fn hosts_resolve(host: String) -> Result<crate::probe::ResolveResult> 
         Ok(crate::probe::resolve_host(host.trim()))
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, ProfileHosts};
+
+    #[test]
+    fn resolved_entries_includes_subscription_when_profile_active() {
+        let mut cfg = Config::default();
+        cfg.active_profile_id = Some(crate::config::BUILTIN_PROFILE_ID.into());
+        cfg.profiles[0].hosts = ProfileHosts {
+            enabled: true,
+            entry_ids: vec![],
+            source_ids: vec!["src-github".into()],
+        };
+        cfg.source_entries.push(crate::config::SourceEntries {
+            source_id: "src-github".into(),
+            entries: vec![
+                HostsEntry::new("1.1.1.1", "a.com"),
+                HostsEntry::new("2.2.2.2", "b.com"),
+            ],
+            ..Default::default()
+        });
+        // 订阅同步出来的条目必须进入托管区块视图，否则「没有数据可写」
+        assert_eq!(resolved_entries(&cfg).len(), 2);
+    }
+
+    #[test]
+    fn resolved_entries_falls_back_to_manual_without_profile() {
+        let mut cfg = Config::default();
+        cfg.active_profile_id = None;
+        cfg.hosts_entries.push(HostsEntry::new("1.1.1.1", "m.com"));
+        assert_eq!(resolved_entries(&cfg).len(), 1);
+    }
 }

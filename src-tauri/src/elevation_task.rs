@@ -381,7 +381,14 @@ mod macos_impl {
 
     pub fn set_enabled(_on: bool) {}
 
-    pub fn invalidate_cache() {}
+    /// 清掉「helper 是否与当前应用同版本」的进程内缓存。
+    ///
+    /// 安装/卸载真正发生在**提权子进程**（`--helper-install`）里，子进程的缓存随进程
+    /// 销毁；若父进程（界面进程）不清自己的缓存，就会一直沿用启动时的比对结果，
+    /// 表现为「重装成功后仍显示已安装·未运行」。
+    pub fn invalidate_cache() {
+        crate::helper::invalidate_current_cache();
+    }
 
     /// 免密执行的前提是守护进程真的在跑（socket 存在）
     pub fn usable() -> bool {
@@ -397,6 +404,14 @@ mod macos_impl {
             return Some(
                 "这次切换弹了系统授权框，之后每次写入都要再输一次密码。\
                  到「设置 → 提权」装一次免密提权助手（只需授权一次），之后的切换就不用再输密码了。"
+                    .to_string(),
+            );
+        }
+        if !crate::helper::is_current() {
+            // 升级应用后旧 helper 不会自动更新：它仍跑旧逻辑，也只能靠 osascript 兜底
+            return Some(
+                "免密提权助手是旧版本（应用升级后未重装），为了保证用最新的修复逻辑，\
+                 这次改用了系统授权框。请到「设置 → 提权」重新安装助手，之后又可以不输密码。"
                     .to_string(),
             );
         }
@@ -423,6 +438,9 @@ mod macos_impl {
         if !installed {
             return "未安装：每次写 hosts / DNS / 系统代理都会弹一次系统授权框".to_string();
         }
+        if !crate::helper::is_current() {
+            return "已安装旧版本助手（应用升级后未重装）：为保证用最新的修复逻辑，写入会改走系统授权框；请点「重新安装」恢复免密".to_string();
+        }
         if crate::helper::available() {
             "已安装：切换方案不再输密码（后台助手常驻；卸载后恢复逐次授权）".to_string()
         } else {
@@ -431,11 +449,14 @@ mod macos_impl {
         }
     }
 
-    /// 通道健康度：ok（装好且 socket 在跑）/ stalled（装了但守护进程没起来，
-    /// 常见原因是 BTM 拦截）/ missing（未安装）。给提示层区分文案用。
+    /// 通道健康度：ok（装好且 socket 在跑）/ outdated（装了但版本比应用旧，
+    /// 升级后未重装）/ stalled（装了但守护进程没起来，常见原因是 BTM 拦截）/
+    /// missing（未安装）。给提示层区分文案用。
     pub fn health() -> &'static str {
         if crate::helper::installed() {
-            if crate::helper::available() {
+            if !crate::helper::is_current() {
+                "outdated"
+            } else if crate::helper::available() {
                 "ok"
             } else {
                 "stalled"

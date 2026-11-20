@@ -226,19 +226,31 @@ pub fn run_elevated_raw(task: &str, payload: Value, timeout: Duration) -> Result
     }
 
     if crate::helper::available() {
-        let started = std::time::Instant::now();
-        match crate::helper::run_task(task, payload.clone(), timeout) {
-            Ok(out) => {
-                log::info!(
-                    target: "elevation",
-                    "helper 任务 {task}：ok={}，耗时 {}ms",
-                    out.ok,
-                    started.elapsed().as_millis()
-                );
-                return Ok(out);
-            }
-            Err(e) => {
-                log::warn!(target: "elevation", "helper 执行 {task} 失败，回退 osascript：{e}");
+        if !crate::helper::is_current() {
+            // 装了免密 helper，但它是旧版本（应用升级后未重装）：旧代码会继续跑旧逻辑，
+            // 例如旧的 macOS 代理绕过名单翻译 bug 一直生效。这里宁可让用户输一次密码，
+            // 也改用 osascript 走**当前版本**的 `--task` 代码，保证修复真正生效；
+            // 界面上「设置 → 提权」也会显示"需重装"。
+            log::warn!(
+                target: "elevation",
+                "免密 helper 与当前应用版本不一致（升级后未重装），本次改走 osascript 以保证用最新逻辑；\
+                 建议在「设置 → 提权」里重装 helper"
+            );
+        } else {
+            let started = std::time::Instant::now();
+            match crate::helper::run_task(task, payload.clone(), timeout) {
+                Ok(out) => {
+                    log::info!(
+                        target: "elevation",
+                        "helper 任务 {task}：ok={}，耗时 {}ms",
+                        out.ok,
+                        started.elapsed().as_millis()
+                    );
+                    return Ok(out);
+                }
+                Err(e) => {
+                    log::warn!(target: "elevation", "helper 执行 {task} 失败，回退 osascript：{e}");
+                }
             }
         }
     }

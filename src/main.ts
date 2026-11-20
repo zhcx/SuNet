@@ -453,8 +453,9 @@ function runNotifyAction(action: string, args?: unknown): void {
       break;
     case "silent":
       // 免密提示横幅里的直达安装（后端附带的 args = 触发时的通道健康度，
-      // missing → 首装文案；stalled → 重装，装完未跑再引导去系统设置放行）
-      if (arg === "install") void installSilentFromNotify(args === "stalled");
+      // missing → 首装文案；stalled/outdated → 重装，装完未跑再引导去系统设置放行）
+      if (arg === "install")
+        void installSilentFromNotify(args === "stalled" || args === "outdated");
       break;
     case "proxy":
       if (arg === "undo_clear") {

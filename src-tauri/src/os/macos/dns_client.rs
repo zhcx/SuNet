@@ -251,10 +251,22 @@ fn parse_service_order(text: &str) -> Vec<Service> {
             continue;
         }
         let num = inner.trim();
-        if num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) || name_part.is_empty() {
+        // `networksetup -listnetworkserviceorder` 里已停用的服务是 `(*) 名字`
+        // （不是 `(2) *名字`）。旧代码只认纯数字，`(*)` 被跳过，紧跟着的
+        // `(Hardware Port: …, Device: …)` 就落到 `out.last_mut()`（上一个服务，通常是
+        // Wi-Fi）上，把 Wi-Fi 的 device/guid 改成 bridge0 —— DNS 落点随之错乱。
+        let (valid_num, star_num) = if num == "*" {
+            (true, true)
+        } else {
+            (
+                !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()),
+                false,
+            )
+        };
+        if !valid_num || name_part.is_empty() {
             continue;
         }
-        let disabled = name_part.starts_with('*');
+        let disabled = star_num || name_part.starts_with('*');
         out.push(Service {
             name: name_part.trim_start_matches('*').trim().to_string(),
             disabled,
@@ -544,6 +556,30 @@ An asterisk (*) denotes that a network service is disabled.
         assert!(!s[0].disabled);
         assert_eq!(s[2].name, "iPhone USB");
         assert!(s[2].disabled);
+    }
+
+    #[test]
+    fn parse_order_disabled_star_paren_does_not_bleed_into_previous() {
+        // 真实 `networksetup -listnetworkserviceorder` 输出里，已停用服务行是 `(*) 名字`。
+        // 旧代码把 `(*)` 当非法跳过，紧跟着的 Hardware Port 行就盖到上一个服务（Wi-Fi）上，
+        // 把 Wi-Fi 的 device/guid 改成 bridge0 —— 这里锁死不再回归。
+        let text = "\
+An asterisk (*) denotes that a network service is disabled.
+(1) Wi-Fi
+(Hardware Port: Wi-Fi, Device: en0)
+
+(*) Thunderbolt Bridge
+(Hardware Port: Thunderbolt Bridge, Device: bridge0)
+";
+        let s = parse_service_order(text);
+        assert_eq!(s.len(), 2, "{s:?}");
+        assert_eq!(s[0].name, "Wi-Fi");
+        assert_eq!(s[0].device, "en0");
+        assert_eq!(s[0].hardware_port, "Wi-Fi");
+        assert!(!s[0].disabled);
+        assert_eq!(s[1].name, "Thunderbolt Bridge");
+        assert_eq!(s[1].device, "bridge0");
+        assert!(s[1].disabled);
     }
 
     #[test]

@@ -12,7 +12,7 @@ use crate::os::hosts_file::HostsEntry;
 use crate::paths;
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_BYPASS: &str = "localhost;127.*;<local>";
+pub const DEFAULT_BYPASS: &str = "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;169.254.*;<local>;::1";
 pub const BUILTIN_PROFILE_ID: &str = "builtin-direct";
 
 // ---------------------------------------------------------------------------
@@ -354,23 +354,52 @@ pub struct Config {
     pub initialized: bool,
 }
 
+/// 内置的公开 hosts 订阅源清单（新装默认 + schema 迁移补齐用）。
+/// 均为 https、直接可访问（CDN/官方）；主源不可达时订阅逻辑会自动切镜像。
+/// 新增/调整内置源时，请同步 bump migrate::CURRENT_SCHEMA 并补一次迁移，
+/// 否则老用户（配置文件已存在）看不到新增项。
+pub fn builtin_sources() -> Vec<Source> {
+    vec![
+        Source {
+            id: "src-github".into(),
+            name: "GitHub 加速（SteamHostSync）".into(),
+            url: "https://cdn.jsdelivr.net/gh/Clov614/SteamHostSync@main/Hosts_github".into(),
+            mirror: "https://cdn.statically.io/gh/Clov614/SteamHostSync@main/Hosts_github".into(),
+            interval_hours: 24,
+            enabled: true,
+            last_sync: None,
+            last_status: "never".into(),
+        },
+        Source {
+            id: "src-github520".into(),
+            name: "GitHub520".into(),
+            url: "https://raw.hellogithub.com/hosts".into(),
+            mirror: "https://cdn.jsdelivr.net/gh/521xueweihan/GitHub520@main/hosts".into(),
+            interval_hours: 24,
+            enabled: false,
+            last_sync: None,
+            last_status: "never".into(),
+        },
+        Source {
+            id: "src-ineo6".into(),
+            name: "ineo6 hosts（GitHub 加速）".into(),
+            url: "https://cdn.jsdelivr.net/gh/ineo6/hosts@master/hosts".into(),
+            mirror: "https://raw.githubusercontent.com/ineo6/hosts/master/hosts".into(),
+            interval_hours: 24,
+            enabled: false,
+            last_sync: None,
+            last_status: "never".into(),
+        },
+    ]
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             schema_version: CURRENT_SCHEMA,
             settings: Settings::default(),
             dns_presets: DnsPresetStore::default(),
-            sources: vec![Source {
-                id: "src-github".into(),
-                name: "GitHub 加速".into(),
-                url: "https://cdn.jsdelivr.net/gh/Clov614/SteamHostSync@main/Hosts_github".into(),
-                mirror: "https://cdn.statically.io/gh/Clov614/SteamHostSync@main/Hosts_github"
-                    .into(),
-                interval_hours: 24,
-                enabled: true,
-                last_sync: None,
-                last_status: "never".into(),
-            }],
+            sources: builtin_sources(),
             profiles: vec![builtin_profile()],
             active_profile_id: None,
             previous_profile_id: None,
@@ -428,6 +457,16 @@ impl Config {
             }
         }
         out
+    }
+
+    /// 当前方案展开的托管区块条目（手工 + 订阅）；无激活方案时回退手工草稿。
+    /// 这是「托管区块」的唯一真相来源：hosts 页的显示/预览/写入、快捷面板的
+    /// 「有草稿未写入」判定、get_app_state 都必须用它，否则会与订阅同步互相打架。
+    pub fn resolved_hosts_entries_active(&self) -> Vec<HostsEntry> {
+        match self.active_profile() {
+            Some(p) => self.resolve_hosts_entries(p),
+            None => self.hosts_entries.clone(),
+        }
     }
 
     pub fn source_entries_of(&self, source_id: &str) -> Vec<HostsEntry> {

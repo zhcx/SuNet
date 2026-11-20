@@ -137,6 +137,14 @@ fn hint_no_password(app: &AppHandle, report: &ApplyReport) {
             ),
             crate::notify::action("去设置", "open:settings"),
         ],
+        "outdated" => vec![
+            crate::notify::action_arg(
+                &format!("重新安装{}", crate::elevation_task::noun()),
+                "silent:install",
+                serde_json::json!("outdated"),
+            ),
+            crate::notify::action("去设置", "open:settings"),
+        ],
         _ => vec![crate::notify::action("去设置", "open:settings")],
     };
     crate::notify::send(

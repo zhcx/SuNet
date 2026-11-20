@@ -60,6 +60,8 @@ pub fn install() -> Result<String> {
             src.display()
         )));
     }
+    // 马上会覆盖 helper 二进制：清掉版本比对缓存，装完 is_current() 会重新比对
+    crate::helper::invalidate_current_cache();
 
     let bin = Path::new(crate::helper::HELPER_BIN);
     if let Some(dir) = bin.parent() {
@@ -133,6 +135,7 @@ pub fn uninstall() -> Result<String> {
     if !crate::os::privilege::is_elevated() {
         return Err(AppError::internal("卸载 helper 需要管理员权限"));
     }
+    crate::helper::invalidate_current_cache();
     let mut notes = Vec::new();
     if let Ok((ok, _, err)) = net::try_run(
         net::LAUNCHCTL,

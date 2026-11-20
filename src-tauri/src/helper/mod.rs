@@ -41,6 +41,58 @@ pub fn available() -> bool {
     std::path::Path::new(SOCKET_PATH).exists()
 }
 
+/// 「已安装的 helper 与当前应用是不是同一版本」的进程内缓存（首次比对后记住）。
+static CURRENT_CACHE: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+
+/// 已安装的 helper 与当前应用可执行文件是否**内容一致**。
+///
+/// 应用升级后 `/Library/PrivilegedHelperTools/com.sunet.helper` 不会自动更新，
+/// 它会继续用**旧代码**处理提权任务 —— 例如旧版 macOS 代理绕过名单翻译 bug 会一直
+/// 生效，看起来"代码改了却没修好"。这里按内容比对来识别这种"旧 helper"。
+///
+/// 判定保守：没装 helper 或读不到文件时返回 `true`（不误报为过期）。
+pub fn is_current() -> bool {
+    let mut guard = match CURRENT_CACHE.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if let Some(v) = *guard {
+        return v;
+    }
+    let v = compute_is_current();
+    *guard = Some(v);
+    v
+}
+
+/// 安装 / 卸载 helper 后清掉版本比对缓存
+pub fn invalidate_current_cache() {
+    match CURRENT_CACHE.lock() {
+        Ok(mut g) => *g = None,
+        Err(p) => *p.into_inner() = None,
+    }
+}
+
+fn compute_is_current() -> bool {
+    let helper = std::path::Path::new(HELPER_BIN);
+    let Ok(hmeta) = std::fs::metadata(helper) else {
+        return true; // 没装：无需刷新（是否安装由 installed() 判断）
+    };
+    let Ok(exe) = crate::paths::exe_path() else {
+        return true;
+    };
+    let Ok(emeta) = std::fs::metadata(&exe) else {
+        return true;
+    };
+    if hmeta.len() != emeta.len() {
+        return false;
+    }
+    // 大小一致时再比内容，避免同大小不同构建（例如只改了几处字节）
+    match (std::fs::read(helper), std::fs::read(&exe)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => true, // 读不到就别误判为过期
+    }
+}
+
 /// 回退通道是否可用（osascript 一定存在，这里只是给上层统一判断）
 pub fn osascript_available() -> bool {
     std::path::Path::new(crate::os::macos::net::OSASCRIPT).exists()

@@ -127,10 +127,15 @@ pub async fn get_app_state(app: AppHandle) -> Result<AppStateView> {
             proxy: proxy.unwrap_or_default(),
             hosts: hosts_stats,
             hosts_pending: {
+                // 与 hosts 页、写入逻辑同口径：托管区块 = 当前方案展开（手工 + 订阅），
+                // 不能用 cfg.hosts_entries（只含手工），否则订阅同步后永远显示「有草稿未写入」。
                 let mut file_lines: Vec<String> =
                     block_entries.iter().map(|e| e.to_line()).collect();
-                let mut draft_lines: Vec<String> =
-                    cfg.hosts_entries.iter().map(|e| e.to_line()).collect();
+                let mut draft_lines: Vec<String> = cfg
+                    .resolved_hosts_entries_active()
+                    .iter()
+                    .map(|e| e.to_line())
+                    .collect();
                 file_lines.sort();
                 draft_lines.sort();
                 file_lines != draft_lines
@@ -1222,6 +1227,9 @@ pub struct SilentElevationStatus {
     /// macOS 专属：装好了且守护进程在跑（socket 在）。装了但未跑 = 被 BTM 拦截；
     /// Windows 上恒等于 installed。前端拿这个字段显示状态徽标，不解析文案。
     pub running: bool,
+    /// macOS 专属：装好了但版本比当前应用旧（应用升级后未重装助手）。
+    /// 此时 running=false，但界面应提示「版本过旧·需重装」而不是「未运行」。
+    pub outdated: bool,
     /// 界面上这条通道叫什么（「静默提权通道」/「免密提权助手」）
     pub noun: String,
     /// 状态说明（直接给界面显示，平台差异由后端收口，前端不判断平台）
@@ -1229,6 +1237,10 @@ pub struct SilentElevationStatus {
 }
 
 fn silent_status() -> SilentElevationStatus {
+    // 状态查询时强制重新比对 helper 版本：安装/卸载发生在子进程，父进程若不清缓存，
+    // 升级并重装后会一直把「已是最新」误报成「版本过旧 / 未运行」。
+    #[cfg(target_os = "macos")]
+    crate::helper::invalidate_current_cache();
     let installed = crate::elevation_task::is_installed();
     let enabled = crate::elevation_task::enabled();
     let health = crate::elevation_task::health();
@@ -1237,6 +1249,7 @@ fn silent_status() -> SilentElevationStatus {
         enabled,
         installed,
         running: health == "ok",
+        outdated: health == "outdated",
         noun: crate::elevation_task::noun().to_string(),
         detail: crate::elevation_task::detail(installed, enabled),
     }

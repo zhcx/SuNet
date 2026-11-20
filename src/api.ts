@@ -373,6 +373,8 @@ export interface SilentElevationStatus {
   installed: boolean;
   /** macOS：装好了且守护进程在跑；装了未跑 = 被 BTM 拦截。Windows 恒等于 installed */
   running: boolean;
+  /** macOS：已安装但版本比当前应用旧（升级后未重装助手）。此字段为真时 running=false */
+  outdated: boolean;
   /** 界面上这条通道叫什么（「静默提权通道」/「免密提权助手」） */
   noun: string;
   /** 状态说明；平台差异由后端收口，前端不判断平台 */

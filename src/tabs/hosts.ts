@@ -92,7 +92,8 @@ export async function renderHosts(root: HTMLElement, ctx: TabCtx): Promise<void>
   `;
 
   const status = root.querySelector("#hs-status") as HTMLElement;
-  status.innerHTML = `${view.stats.exists ? "文件存在" : "文件不存在"} · 启用 ${view.stats.enabled_entries} 条 / 共 ${view.stats.total_entries} 条 · ${
+  const enabledCount = view.entries.filter((e) => e.enabled).length;
+  status.innerHTML = `${view.stats.exists ? "文件存在" : "文件不存在"} · 启用 ${enabledCount} 条 / 共 ${view.entries.length} 条 · ${
     view.pending
       ? `<span class="warn-text">草稿与系统文件不一致，需要点「写入系统 hosts」</span>`
       : `<span class="ok-text">已与系统文件同步</span>`
@@ -256,43 +257,47 @@ function renderTable(root: HTMLElement, view: HostsView, ctx: TabCtx): void {
   const dupSet = new Set(view.duplicates);
   for (const e of view.entries) {
     const tr = document.createElement("tr");
+    // 订阅条目由「远程订阅」同步而来，不在这里逐条编辑/删除（否则会被写回手工草稿，产生重复）
+    const isSource = !(e.origin === "manual" || e.origin === "file");
     const isDup = e.hostname
       .split(/\s+/)
       .some((h) => dupSet.has(h.toLowerCase()));
     if (isDup) tr.className = "dup";
     if (!e.enabled) tr.className = "disabled";
     tr.innerHTML = `
-      <td><input type="checkbox" ${e.enabled ? "checked" : ""} /></td>
+      <td><input type="checkbox" ${e.enabled ? "checked" : ""} ${isSource ? "disabled" : ""} /></td>
       <td class="ip">${ui.esc(e.ip)}</td>
       <td class="ip">${ui.esc(e.hostname)}</td>
       <td>${ui.esc(e.comment)}</td>
-      <td><span class="pill">${ui.esc(
-        e.origin === "manual" || e.origin === "file" ? "手工" : "订阅",
-      )}</span></td>
-      <td class="actions">
-        <button class="link" data-act="edit">编辑</button>
-        <button class="link danger" data-act="del">删除</button>
-      </td>`;
+      <td><span class="pill">${isSource ? "订阅" : "手工"}</span></td>
+      <td class="actions">${
+        isSource
+          ? `<span class="faint">由订阅源管理</span>`
+          : `<button class="link" data-act="edit">编辑</button>
+        <button class="link danger" data-act="del">删除</button>`
+      }</td>`;
 
-    (tr.querySelector("input") as HTMLInputElement).addEventListener("change", async (ev) => {
-      try {
-        await api.hostsUpsert({ ...e, enabled: (ev.target as HTMLInputElement).checked });
-        await ctx.refresh(true);
-      } catch (err) {
-        ui.toast("error", "修改失败", errText(err));
-      }
-    });
-    (tr.querySelector('[data-act="edit"]') as HTMLButtonElement).addEventListener("click", () => {
-      void editEntry(e, ctx);
-    });
-    (tr.querySelector('[data-act="del"]') as HTMLButtonElement).addEventListener("click", async () => {
-      try {
-        await api.hostsDelete(e.id);
-        await ctx.refresh(true);
-      } catch (err) {
-        ui.toast("error", "删除失败", errText(err));
-      }
-    });
+    if (!isSource) {
+      (tr.querySelector("input") as HTMLInputElement).addEventListener("change", async (ev) => {
+        try {
+          await api.hostsUpsert({ ...e, enabled: (ev.target as HTMLInputElement).checked });
+          await ctx.refresh(true);
+        } catch (err) {
+          ui.toast("error", "修改失败", errText(err));
+        }
+      });
+      (tr.querySelector('[data-act="edit"]') as HTMLButtonElement).addEventListener("click", () => {
+        void editEntry(e, ctx);
+      });
+      (tr.querySelector('[data-act="del"]') as HTMLButtonElement).addEventListener("click", async () => {
+        try {
+          await api.hostsDelete(e.id);
+          await ctx.refresh(true);
+        } catch (err) {
+          ui.toast("error", "删除失败", errText(err));
+        }
+      });
+    }
     tbody.appendChild(tr);
   }
 }

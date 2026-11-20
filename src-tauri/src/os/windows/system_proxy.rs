@@ -14,7 +14,7 @@ use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 use winreg::RegKey;
 
 const KEY_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
-pub const DEFAULT_BYPASS: &str = "localhost;127.*;<local>";
+pub const DEFAULT_BYPASS: &str = "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;169.254.*;<local>;::1";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
 pub struct ProxyState {
